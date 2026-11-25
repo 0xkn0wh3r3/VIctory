@@ -702,13 +702,24 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 }
 
 /// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
+/// is current, as [`view_at`] would find it (one lock for them all): a
+/// table entry at its own generation, a constant buffer view held whole, or
+/// a placed view held whole whose shape is known.
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     records
         .iter()
         .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+            tag == VIEW_TAG
+                && match generation >> KIND_SHIFT {
+                    0 => views.list.get(i as usize).is_some_and(|(_, at)| *at == generation),
+                    CONSTANT => true,
+                    PLACED => {
+                        ((payload(i, generation) >> PLACED_ADDRESS_BITS) as usize)
+                            < views.shapes.len()
+                    }
+                    _ => false,
+                }
         })
         .collect()
 }
@@ -1265,6 +1276,44 @@ pub(crate) mod tests {
         assert_eq!(view(at), None, "the released view's record is stale");
         let generation = VIEWS.lock().unwrap().list[i as usize].1;
         assert_eq!(generation, 1, "wrapped to 1, not into the kind bits");
+    }
+
+    /// Heap syncs ([`views_current`]) find current what [`view_at`] finds:
+    /// constant buffer and placed views held whole in their records as well
+    /// as live table entries; not released entries, unknown shapes or kinds,
+    /// nor records without the tag.
+    #[test]
+    fn views_held_whole_are_current_for_heap_syncs() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4 * 4];
+        let at = |k: usize| slots.as_ptr() as u64 + k as u64 * 32;
+        // SAFETY: slot `k` of the 32-byte slots above.
+        let words = |k: usize| unsafe { *(at(k) as *const [u32; 3]) };
+        create_cbv(null, &[0x9_0000, 6, 512, 0], at(0));
+        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee1_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a71_0000 + k as u32);
+        (desc[10], desc[11]) = (0x4940_0000, 0xd);
+        create_placed_srv(null, &resource, &desc, at(1));
+        let released = 0x7_7f00_0000_usize;
+        record(at(2), View::Shader(released, None));
+        record(at(3), View::Shader(0x7_7f10_0000, None));
+        let mut records: Vec<[u32; 3]> = (0..4).map(words).collect();
+        assert_eq!(records[0][2] >> KIND_SHIFT, CONSTANT, "held whole");
+        assert_eq!(records[1][2] >> KIND_SHIFT, PLACED, "held whole");
+        forget(released);
+        // A placed view of a shape never numbered, a kind there is not, and
+        // a record without the tag.
+        let unknown = placed_words(SHAPES as u32 - 1, 0x4940_0000);
+        records.push([VIEW_TAG, unknown[0], unknown[1]]);
+        records.push([VIEW_TAG, 0, 3 << KIND_SHIFT | 1]);
+        records.push([0, records[0][1], records[0][2]]);
+        let current = views_current(&records);
+        let found: Vec<bool> = records
+            .iter()
+            .map(|&[tag, i, generation]| tag == VIEW_TAG && view_at(i, generation).is_some())
+            .collect();
+        assert_eq!(current, found);
+        assert_eq!(current, [true, true, false, true, false, false, false]);
     }
 
     /// A released resource's views go stale; the same view of a new
