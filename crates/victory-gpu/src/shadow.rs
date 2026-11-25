@@ -889,7 +889,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() && in_place_enabled() {
+    if entry.shadow.is_none() && in_place_enabled() && entry.end - key.0 >= in_place_min() {
         // In place: from the 64 KiB boundary at or below the buffer (views
         // find their bytes by address, `Shadow::offset`), past its end by the
         // 256 bytes a view ending in its last bytes reads where the
@@ -970,6 +970,17 @@ fn allocation_extent(base: usize) -> Option<u64> {
         }
         at = info.BaseAddress as usize + info.RegionSize;
     }
+}
+
+/// The smallest title buffer that goes in place (`VICTORY_IN_PLACE_MIN_KB`,
+/// 1024 by default). Smaller ones keep their copies: shaders' atomics and
+/// small reads of host memory cross the bus each time, and a once-a-frame
+/// compute pass over a tiny buffer in host memory took 19–67 ms of GPU time
+/// instead of 1–6 ms (measured by sirrus98 on an RTX 4090 for the in-place
+/// work of fxceless/victory-fork#772, which keeps the same floor).
+fn in_place_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("VICTORY_IN_PLACE_MIN_KB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1024) << 10)
 }
 
 /// The share of an allocation's pages that must already be in memory
