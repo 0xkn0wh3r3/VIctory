@@ -17,6 +17,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod alias;
+#[cfg(windows)]
 mod bindless;
 #[cfg(windows)]
 mod budget;
