@@ -206,15 +206,21 @@ mod tests {
         w[16] = 0;
         w[5] = 2; // maximum reduction
         assert_eq!(console(&w, true).Filter.0, 0x1d4);
+        assert_eq!(console(&w, false).Filter.0, 0x1d5);
+        w[5] = 1; // minimum reduction
+        assert_eq!(console(&w, true).Filter.0, 0x154);
+        assert_eq!(console(&w, false).Filter.0, 0x155);
     }
 
     /// The host takes the anisotropic samplers it says it can filter: a
     /// point-mip one where it has the feature, made in a sampler heap of
-    /// ours, leaves the device as it was.
+    /// ours, leaves the device as it was. It says which it made (a run
+    /// without a device says it was skipped).
     #[test]
     fn the_host_takes_its_anisotropic_samplers() {
         let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+            eprintln!("skipped: no host GPU here");
+            return;
         };
         let supported = aniso_point_mip(&host.device);
         let mut w = [0u32; 27];
@@ -237,6 +243,7 @@ mod tests {
                 "point-mip support {supported}"
             );
         }
+        eprintln!("made an anisotropic sampler, filter {:#x}", desc.Filter.0);
     }
 
     #[test]
