@@ -18,7 +18,7 @@
 //! The benchmark is `#[ignore]`d (`cargo test -p victory-gpu --release --lib
 //! f16_bench -- --ignored --nocapture`); the other test checks the
 //! `narrow16` shader rounds to nearest even as the translator does, against
-//! a CPU reference. Both need the Windows SDK's `dxc.exe` and a GPU, or do
+//! a CPU reference. Both need the Windows SDK's `dxcompiler.dll` (loaded in this process) and a GPU, or do
 //! nothing.
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -112,12 +112,7 @@ impl Bench {
         let code: Vec<Vec<u8>> = (0..VARIANTS.len())
             .map(|v| {
                 let define = format!("-DVARIANT={v}");
-                compile_hlsl(
-                    &dxc,
-                    &format!("f16_{v}"),
-                    SOURCE,
-                    &[&define, "-enable-16bit-types"],
-                )
+                compile_hlsl(&dxc, SOURCE, &[&define, "-enable-16bit-types"])
             })
             .collect::<Option<_>>()?;
         // SAFETY: plain creation from compiled shaders with their signature.
@@ -280,7 +275,7 @@ fn narrow16_rounds_fused_results_to_nearest_even() {
     let threads = (cases.len() / 2) as u32;
     // One group of 64 threads: inputs repeat; check the first five.
     let Some(mut b) = Bench::new(64.max(threads), &inputs) else {
-        return; // no host GPU or no dxc.exe here
+        return; // no host GPU or no SDK compiler here
     };
     let (_, out) = b.run(0, 1, 1);
     for (t, pair) in cases.chunks(2).enumerate() {
@@ -304,7 +299,7 @@ fn narrow16_rounds_fused_results_to_nearest_even() {
 fn f16_bench() {
     let inputs = [0x3C00_3C01, 0x3BFF_3C00, 0x0001_8001];
     let Some(mut b) = Bench::new(GROUPS * 64, &inputs) else {
-        eprintln!("no host GPU or no dxc.exe: nothing measured");
+        eprintln!("no host GPU or no SDK compiler: nothing measured");
         return;
     };
     let steps = 1024;
