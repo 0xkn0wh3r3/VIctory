@@ -507,6 +507,10 @@ struct Call {
     /// provider's cleanup may wait for a thread completing the same call.
     claimed: AtomicBool,
     /// The status is published.
+    /// The queue the call runs on: the block's, or the process queue when
+    /// it began (a later change of the process queue does not move a call
+    /// in flight, as in Microsoft's libHttpClient `AsyncLib.cpp`).
+    queue: Arc<Queue>,
     done: Mutex<bool>,
     finished: Condvar,
 }
@@ -601,9 +605,9 @@ pub fn XAsyncBegin(
     // A null queue stands for the process queue, which the title may have
     // set to null: then the call has nowhere to run.
     // SAFETY: checked non-null; the title's block.
-    if queue(unsafe { (*block).queue }).is_none() {
+    let Some(queue) = queue(unsafe { (*block).queue }) else {
         return E_NO_TASK_QUEUE;
-    }
+    };
     let (status, size) = words(block);
     status.store(E_PENDING as u32 as usize, Ordering::Release);
     size.store(0, Ordering::Release);
@@ -612,6 +616,7 @@ pub fn XAsyncBegin(
         context: context as usize,
         identity: identity as usize,
         claimed: AtomicBool::new(false),
+        queue,
         done: Mutex::new(false),
         finished: Condvar::new(),
     });
@@ -651,11 +656,7 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     let Some(call) = call(block) else {
         return E_INVALIDARG;
     };
-    // SAFETY: a block in flight is valid.
-    let handle = unsafe { (*block).queue };
-    let Some(queue) = queue(handle) else {
-        return E_NO_TASK_QUEUE;
-    };
+    let queue = call.queue.clone();
     let context = Box::into_raw(Box::new(Work { call, block }));
     let hr = queue.submit(WORK, delay_ms, Task::new(context.cast(), work));
     if hr < 0 {
@@ -695,7 +696,7 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     // Read before publishing: once the status is set, the title may free
     // the block.
     // SAFETY: a block in flight is valid.
-    let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
+    let routine = unsafe { (*block).callback };
     let (status, size) = words(block);
     if result < 0 || required_size == 0 {
         release(block);
@@ -706,9 +707,8 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     call.finished.notify_all();
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
-        match queue(handle) {
-            Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
-            _ => task.run(true),
+        if call.queue.submit(COMPLETION, 0, task) != S_OK {
+            task.run(true);
         }
     }
 }
