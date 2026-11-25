@@ -3584,8 +3584,27 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
-/// Bytes of host copies in GPU upload heaps ([`Host::gpu_upload_buffer`]).
+/// Bytes of host copies in GPU upload heaps now ([`Host::gpu_upload_buffer`]):
+/// charged when one is made, given back when D3D12 destroys it
+/// ([`give_back_upload`]).
 static UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called by D3D12 when a host copy in a GPU upload heap is destroyed (its
+/// last reference gone: the copy's, lists', and descriptor tables' clones
+/// of the resource): its `size` (the callback's data) leaves
+/// [`UPLOAD_BYTES`]. Counted for the whole run, the budget ran out after
+/// enough buffers came and went and every later copy stayed in system
+/// memory (64 copies of 32 MiB on an RTX 3050 Laptop, #2120).
+unsafe extern "system" fn give_back_upload(size: *mut std::ffi::c_void) {
+    UPLOAD_BYTES.fetch_sub(size as u64, Ordering::Relaxed);
+}
+
+/// [`UPLOAD_BYTES`], for tests.
+#[cfg(test)]
+pub(crate) fn upload_bytes() -> u64 {
+    UPLOAD_BYTES.load(Ordering::Relaxed)
+}
+
 /// Video memory host copies may take in GPU upload heaps; the rest stay in
 /// system memory.
 /// shortcut: a fixed amount; ask DXGI for the adapter's budget if 8 GB
@@ -3650,11 +3669,33 @@ impl Host {
             });
             return None;
         }
-        let made = self.shared_mapped_buffer(size, true);
-        if made.is_none() {
+        let Some((buffer, data)) = self.shared_mapped_buffer(size, true) else {
             UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            return None;
+        };
+        // The charge goes back when the buffer is destroyed, not when the
+        // copy drops: lists and descriptor tables may hold it longer.
+        // SAFETY: a live buffer; the callback's data is the size alone.
+        let watched = unsafe {
+            buffer
+                .cast::<windows::Win32::Graphics::Direct3D::ID3DDestructionNotifier>()
+                .and_then(|n| {
+                    n.RegisterDestructionCallback(Some(give_back_upload), size as *const _)
+                })
+        };
+        if watched.is_err() {
+            // Not given back when destroyed, it would count for good.
+            drop(buffer);
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            static UNWATCHED: std::sync::Once = std::sync::Once::new();
+            UNWATCHED.call_once(|| {
+                tracing::info!(
+                    "no destruction callback on this host: host copies stay in system memory"
+                )
+            });
+            return None;
         }
-        made
+        Some((buffer, data))
     }
 
     /// Whether host copies that shaders only read go to GPU upload heaps:
