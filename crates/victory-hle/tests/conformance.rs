@@ -15,6 +15,11 @@ use victory_loader::{UnimplementedPolicy, prepare};
 /// test, so the list stays true.
 const KNOWN: &[(&str, &str)] = &[
     (
+        "xasync: an async call with no queue and no process queue is E_NO_TASK_QUEUE",
+        "VIctory runs the call anyway; XTaskQueueSetCurrentProcessTaskQueue's \
+         page says APIs needing a queue then fail with E_NO_TASK_QUEUE",
+    ),
+    (
         "xsystem: a retail console id is the documented zero id",
         "VIctory returns 38 digits ending in 1; the reference gives \
          00000000.00000000.00000000.00000000.00 for retail and PC",
@@ -26,11 +31,13 @@ const KNOWN: &[(&str, &str)] = &[
     ),
     (
         "xuser: XUserFindUserByLocalId of no user is HRESULT_FROM_WIN32(ERROR_NOT_FOUND)",
-        "VIctory returns E_GAMEUSER_USER_NOT_FOUND (0x89245104); the          XUserFindUserByLocalId page gives HRESULT_FROM_WIN32(ERROR_NOT_FOUND)",
+        "VIctory returns E_GAMEUSER_USER_NOT_FOUND (0x89245104); the \
+         XUserFindUserByLocalId page gives HRESULT_FROM_WIN32(ERROR_NOT_FOUND)",
     ),
     (
         "xuser: an invalid gamertag component is E_INVALIDARG",
-        "VIctory answers any component other than ModernSuffix with the          gamertag; the XUserGetGamertag page gives E_INVALIDARG",
+        "VIctory answers any component other than ModernSuffix with the \
+         gamertag; the XUserGetGamertag page gives E_INVALIDARG",
     ),
 ];
 
