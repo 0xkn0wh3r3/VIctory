@@ -1551,9 +1551,12 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
-    else {
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    let Some((shadow, own)) = crate::shadow::for_view(
+        start,
+        u64::from(buffer.NumElements) * element,
+        view_align(raw, element),
+    ) else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
@@ -1574,6 +1577,13 @@ fn buffer_srv(
             tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
         }
         once!(first, count, element, "buffer view empty or past its host copy");
+        return None;
+    }
+    if !raw_start_ok(raw, first) {
+        once!(
+            first,
+            "raw buffer view off a 16-byte boundary of its host copy: left null"
+        );
         return None;
     }
     let host = host()?;
@@ -1615,6 +1625,21 @@ fn host_buffer_format(format: DXGI_FORMAT, stride: u32, raw: bool) -> Option<DXG
     (f != 0 && !typeless).then_some(format)
 }
 
+/// The alignment a view's first byte needs in a shared host copy: its
+/// element's, and 16 bytes for a raw view, whose first element the host
+/// takes only at a multiple of 16 bytes (and removes the device for one
+/// that is not: "FirstElement (2) must be a multiple of 4"). The console
+/// takes any 4-byte offset; a view the copy cannot give it at gets a copy of
+/// its own bytes ([`crate::shadow::for_view`]), which starts at 0.
+fn view_align(raw: bool, element: u64) -> u64 {
+    if raw { 16 } else { element }
+}
+
+/// Whether a raw view (4-byte elements) may start at element `first`.
+fn raw_start_ok(raw: bool, first: u64) -> bool {
+    !raw || first.is_multiple_of(4)
+}
+
 fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
     count > 0 && first.saturating_add(u64::from(count)).saturating_mul(element) <= width
 }
@@ -1644,7 +1669,12 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    let (shadow, own) = crate::shadow::for_view(
+        start,
+        u64::from(buffer.NumElements) * element,
+        view_align(raw, element),
+    )?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1662,6 +1692,13 @@ fn buffer_uav(
     desc.Format = format;
     if !in_buffer(&shadow.buffer, first, count, element) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
+        return None;
+    }
+    if !raw_start_ok(raw, first) {
+        once!(
+            first,
+            "raw unordered buffer view off a 16-byte boundary of its host copy: left null"
+        );
         return None;
     }
     let host = host()?;
@@ -2560,6 +2597,72 @@ mod tests {
         assert!(!within(64, 0, 0, 16));
         assert!(!within(64, 3, 2, 16));
         assert!(!within(64, u64::MAX, 1, 16));
+    }
+
+    /// A raw view 8 bytes into a title buffer (its first element 2 there)
+    /// gets a copy of its own bytes, starting at 0, not a view of the
+    /// buffer's copy at element 2, which the host refuses ("FirstElement
+    /// (2) must be a multiple of 4") by removing the device. Views at 16
+    /// bytes share the buffer's copy; a structured view at 8 does too.
+    #[test]
+    fn raw_views_off_16_bytes_get_a_copy_of_their_own() {
+        assert_eq!((view_align(true, 4), view_align(false, 12)), (16, 12));
+        assert!(raw_start_ok(true, 4) && !raw_start_ok(true, 2) && raw_start_ok(false, 3));
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let pool = crate::watch::tests::pool(1);
+        let len = crate::watch::PAGE as u64;
+        crate::shadow::register(pool, pool as u64, len);
+        // SAFETY: a CPU-only heap of ours, alive through the test.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 4,
+                    ..Default::default()
+                })
+        }
+        .unwrap();
+        // SAFETY: a live heap.
+        let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        let view = |first: u64, stride: u32| {
+            let raw = stride == 0;
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: if raw {
+                    DXGI_FORMAT_R32_TYPELESS
+                } else {
+                    DXGI_FORMAT_UNKNOWN
+                },
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first,
+                        NumElements: 4,
+                        StructureByteStride: stride,
+                        Flags: if raw {
+                            D3D12_BUFFER_SRV_FLAG_RAW
+                        } else {
+                            D3D12_BUFFER_SRV_FLAG_NONE
+                        },
+                    },
+                },
+            };
+            buffer_srv(pool as u64, len, desc, at).expect("a view")
+        };
+        let own = |kept: &Kept| kept.as_ref().is_some_and(|(_, s)| s.is_some());
+        assert!(own(&view(2, 0)), "raw, 8 bytes in: a copy of its own");
+        assert!(!own(&view(4, 0)), "raw, 16 bytes in: the buffer's copy");
+        assert!(
+            !own(&view(2, 4)),
+            "structured (4 bytes), 8 bytes in: the buffer's copy"
+        );
+        // SAFETY: a plain query.
+        let removed = unsafe { host.device.GetDeviceRemovedReason() };
+        assert!(removed.is_ok(), "the device stays");
+        crate::shadow::unregister(pool, pool as u64);
+        crate::watch::tests::free(pool);
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
