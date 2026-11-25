@@ -225,6 +225,14 @@ impl Shader {
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+        // Wave and quad operations (`WaveIsFirstLane` .. `QuadOp`,
+        // `WaveMatch` .. `WaveMultiPrefixBitCount`) declare the module's wave
+        // operation flag where they are made: a flag raised before a lowering
+        // that then failed declared operations the module lacks, which the
+        // validator refuses ("Flags must match usage").
+        if matches!(opcode, 110..=123 | 165..=167) {
+            self.flags |= flags::WAVE_OPS;
+        }
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
         let choice = self
