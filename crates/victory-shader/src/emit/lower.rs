@@ -69,6 +69,10 @@ pub(crate) struct Lowered {
     /// Whether depth and stencil are tested before it runs.
     #[cfg(test)]
     pub early_depth: bool,
+    /// Whether relabelled threads take their ids by ticket
+    /// (`Lower::console_flat`).
+    #[cfg(test)]
+    pub ticket: bool,
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
@@ -117,6 +121,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+/// The host's group-shared memory for a compute program, in dwords (32 KiB;
+/// the validator refuses more).
+const GROUPSHARED_DWORDS: u32 = 32 * 1024 / 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
@@ -250,6 +257,8 @@ struct Lower<'a> {
     root_memory: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// The thread's console flat id once relabelled (`Lower::thread_id`).
+    console_flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -691,6 +700,7 @@ impl<'a> Lower<'a> {
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
             flat: None,
+            console_flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
@@ -1406,6 +1416,7 @@ impl<'a> Lower<'a> {
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
             early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
+            ticket: self.console_flat.is_some() && self.ticket(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2820,28 +2831,7 @@ impl<'a> Lower<'a> {
         }
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
-        let i32t = self.s.t.i32;
-        let flat = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
-        let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        let f = self.console_flat();
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
@@ -2852,6 +2842,112 @@ impl<'a> Lower<'a> {
             }
             _ => self.s.m.bin(e, Bin::UDiv, f, xy),
         })
+    }
+
+    /// The thread's console flat id, so that its host lane is its console
+    /// lane (`Lower::thread_id`); made once, in the entry block.
+    ///
+    /// A 1-D group: the wave's first flat id rounded down to the wave size,
+    /// plus the lane index, a bijection because hosts put a 1-D group's
+    /// threads into waves in order. Other groups: a host may put threads
+    /// of several rows into one wave (an RTX 5070 Ti does for 2-D groups
+    /// 24, 32 or 64 wide or not a power of two wide: 16 by 2 tiles; XCL's
+    /// notes report 2 by 2 quads on an RX 9070), where rounding gives two
+    /// waves one base (`lane_order_tests`). There each full wave takes the
+    /// next wave-sized run of ids from a group-shared ticket, and the one
+    /// partial wave (the group's last threads; hosts fill its lanes from 0)
+    /// the last run; where the ticket does not fit (`Lower::ticket`), the
+    /// rounding as for 1-D groups.
+    fn console_flat(&mut self) -> V {
+        if let Some(f) = self.console_flat {
+            return f;
+        }
+        let [x, y, z] = self.s.threads.expect("compute");
+        let e = self.s.entry;
+        let i32t = self.s.t.i32;
+        self.s.flags |= flags::WAVE_OPS;
+        let wave = self.s.wave_size.expect("set with console lanes");
+        let lane = self
+            .s
+            .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let base = if !self.ticket() {
+            let flat = self.s.op(
+                e,
+                "flattenedThreadIdInGroup.i32",
+                Attr::ReadNone,
+                i32t,
+                96,
+                &[],
+            );
+            let first = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[flat],
+            );
+            let mask = self.s.m.i32(!(wave - 1));
+            self.s.m.bin(e, Bin::And, first, mask)
+        } else {
+            let one = self.s.t.i1;
+            let arr = self.s.m.array(1, i32t);
+            let ticket = self.s.m.global("ticket", arr, 3);
+            let zero = self.s.m.i32(0);
+            let p = self.s.m.element(e, ticket, zero);
+            // Every thread zeroes it before any wave takes from it.
+            self.s.m.store(e, p, zero);
+            let mode = self.s.m.i32(1 | 8);
+            let void = self.s.t.void;
+            self.s
+                .op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            // The wave's live lanes, from its ballot.
+            let on = self.s.m.bool(true);
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self
+                .s
+                .op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+            let mut live = zero;
+            for word in 0..wave.div_ceil(32) {
+                let w = self.s.m.extract(e, ballot, word);
+                let n = self
+                    .s
+                    .op(e, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[w]);
+                live = self.s.m.bin(e, Bin::Add, live, n);
+            }
+            let wk = self.s.m.i32(wave);
+            let full = self.s.m.cmp(e, pred::EQ, live, wk);
+            let first = self
+                .s
+                .op(e, "waveIsFirstLane", Attr::NoUnwind, one, 110, &[]);
+            let takes = self.s.m.bin(e, Bin::And, first, full);
+            let add = self.s.m.select(e, takes, wk, zero);
+            let old = self.s.m.atomic(e, super::bitcode::Rmw::Add, p, add);
+            let taken = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[old],
+            );
+            let last = self.s.m.i32((x * y * z) / wave * wave);
+            self.s.m.select(e, full, taken, last)
+        };
+        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        self.console_flat = Some(f);
+        f
+    }
+
+    /// Whether relabelled threads take their ids by ticket
+    /// (`Lower::console_flat`): in groups that are not 1-D, unless the
+    /// program's LDS already takes all the host's group-shared memory, where
+    /// the ticket's dword would make it fail validation.
+    // shortcut: such programs keep the rounding, and with it the ids two
+    // waves share on hosts that put several rows into one wave.
+    fn ticket(&self) -> bool {
+        let [_, y, z] = self.s.threads.expect("compute");
+        (y, z) != (1, 1) && self.s.lds_dwords < GROUPSHARED_DWORDS
     }
 
     /// Mesh: the counts and the primitives no lane exports. The console's
