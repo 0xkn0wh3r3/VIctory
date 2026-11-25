@@ -1413,7 +1413,12 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         // Its address, for the lifetime notes (`life`) of a freed one.
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
-    crate::host::keep_resident(&texture, crate::host::Residency::of_texture(d.flags));
+    // A committed texture takes its own priority. A placed one takes its
+    // heap's (`keep_resident`): the normal one, as heaps of textures hold
+    // no render target, depth or unordered access (`crate::placement`).
+    if placement.is_none() {
+        crate::host::keep_resident(&texture, crate::host::Residency::of_texture(d.flags));
+    }
     let initial = crate::host::legal_state(&texture, initial);
     let mut t = HostTexture::new(texture, initial, castable_formats);
     t.placement = placement;
@@ -2551,7 +2556,9 @@ mod tests {
         let target = make_texture(&target, 0, std::ptr::null()).expect("a render target");
         assert_eq!(kept(&target.texture), Some(Residency::Frame));
         let streamed = make_texture(&desc, 0, std::ptr::null()).expect("a texture");
-        assert_eq!(kept(&streamed.texture), Some(Residency::Streamed));
+        // Placed in a heap of textures, it takes the heap's priority.
+        let want = if streamed.placement.is_some() { None } else { Some(Residency::Streamed) };
+        assert_eq!(kept(&streamed.texture), want);
         assert!(crate::texture::title_written(&streamed.texture));
     }
 
