@@ -885,10 +885,14 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
+/// gets copies of the aligned windows it touches. A window is 256 KiB:
+/// lookups while Grand Theft Auto VI loads its world touched about 30% of
+/// the 4 MiB windows this used to copy, so most of their bytes (GBs of host
+/// memory) were never asked for; smaller windows cost more of them, each a
+/// host buffer and a page-table entry.
 /// shortcut: copies of windows are never freed; key them to the title's
 /// allocations if memory use grows.
-const WINDOW: u64 = 4 << 20;
+const WINDOW: u64 = 256 << 10;
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
