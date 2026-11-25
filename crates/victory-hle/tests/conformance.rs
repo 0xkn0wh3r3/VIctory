@@ -24,6 +24,14 @@ const KNOWN: &[(&str, &str)] = &[
         "VIctory submits once half the capacity is enqueued; the overview \
          says an Enqueue that fills more than half submits",
     ),
+    (
+        "xuser: XUserFindUserByLocalId of no user is HRESULT_FROM_WIN32(ERROR_NOT_FOUND)",
+        "VIctory returns E_GAMEUSER_USER_NOT_FOUND (0x89245104); the          XUserFindUserByLocalId page gives HRESULT_FROM_WIN32(ERROR_NOT_FOUND)",
+    ),
+    (
+        "xuser: an invalid gamertag component is E_INVALIDARG",
+        "VIctory answers any component other than ModernSuffix with the          gamertag; the XUserGetGamertag page gives E_INVALIDARG",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
@@ -63,12 +71,28 @@ fn call(name: &str) -> String {
         // Persistent local storage (game saves live beside it), as `victory
         // run` gives a title.
         let data = tempfile::tempdir().unwrap().keep();
+        // `victory run` makes the folder before the title starts.
+        std::fs::create_dir_all(data.join("storage")).unwrap();
         victory_hle::runtime::set_title(victory_hle::runtime::Title {
             id: 0x1234_5678,
             storage: data.join("storage"),
             storage_bytes: 64 << 20,
             ..Default::default()
         });
+        // The console's drives: the package at G: (holding the file the
+        // title checks), temporary storage at T:.
+        let package = data.join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("conformance.txt"),
+            b"conformance: public documentation only
+",
+        )
+        .unwrap();
+        let temp = data.join("temp");
+        std::fs::create_dir_all(&temp).unwrap();
+        victory_hle::modules::files::mount_at('G', &package);
+        victory_hle::modules::files::mount_at('T', &temp);
         let resolver = HleResolver::new(HostPolicy::default());
         let report = image
             .bind_imports(&resolver, UnimplementedPolicy::ReturnZero)

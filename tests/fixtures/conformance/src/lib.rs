@@ -18,12 +18,16 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod dstorage;
+mod files;
+mod pls;
 mod rt;
+mod system;
 mod tap;
 mod xasync;
 mod xgamesave;
 mod xmem;
 mod xsystem;
+mod xuser;
 
 /// Runs every test; returns the TAP report (valid until the next call).
 #[unsafe(no_mangle)]
@@ -35,6 +39,10 @@ pub extern "system" fn conformance_run(len: *mut usize) -> *const u8 {
     xmem::run(&mut t);
     dstorage::run(&mut t);
     xgamesave::run(&mut t);
+    xuser::run(&mut t);
+    system::run(&mut t);
+    files::run(&mut t);
+    pls::run(&mut t);
     let report = t.finish();
     // SAFETY: the harness passes room for the length.
     unsafe { len.write(report.len()) };
