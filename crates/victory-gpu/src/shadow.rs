@@ -52,6 +52,19 @@ pub(crate) struct Shadow {
     /// In a GPU upload heap ([`register_read_only`]): the CPU must not read
     /// it back.
     pub(crate) upload: std::sync::atomic::AtomicBool,
+    /// A copy shaders may write, in a GPU upload heap (`buffer`, `gpu`), with
+    /// `data` its mirror in system memory, where the CPU reads and writes:
+    /// what the CPU writes goes on into video memory ([`Shadow::push`]), what
+    /// the GPU wrote comes back before the CPU reads it ([`pull`]).
+    vram: Option<Vram>,
+}
+
+/// The video memory side of a mirrored copy.
+struct Vram {
+    /// The mirror's buffer (system memory), where [`pull`] copies to.
+    mirror: ID3D12Resource,
+    /// The copy in video memory, mapped (written, never read).
+    data: *mut u8,
 }
 
 /// The references `buffer` has besides the caller's.
@@ -140,6 +153,25 @@ impl Shadow {
         assert!(at + bytes.len() <= self.len as usize);
         // SAFETY: inside the mapping (checked).
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+        // As written on the GPU and pulled back.
+        self.push(at, bytes.len());
+    }
+
+    /// Whether it is in video memory with a mirror ([`Shadow::push`]).
+    #[cfg(test)]
+    pub(crate) fn mirrored(&self) -> bool {
+        self.vram.is_some()
+    }
+
+    /// The CPU wrote `[at, at + len)` (offsets) of the mirror: the same
+    /// bytes into the copy in video memory.
+    fn push(&self, at: usize, len: usize) {
+        if let Some(v) = &self.vram {
+            let len = len.min((self.len as usize).saturating_sub(at));
+            // SAFETY: inside both mappings (cut to the copy); the mirror is
+            // system memory, the video memory is only written.
+            unsafe { std::ptr::copy_nonoverlapping(self.data.add(at), v.data.add(at), len) };
+        }
     }
 
     /// Up to 64 bytes of the copy at title address `address`, as floats, and
@@ -225,6 +257,18 @@ impl Shadow {
         len: u64,
         spare: bool,
     ) -> Arc<Shadow> {
+        Self::with_vram(buffer, data, gpu, start, len, spare, None)
+    }
+
+    fn with_vram(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        spare: bool,
+        vram: Option<Vram>,
+    ) -> Arc<Shadow> {
         let tracked = crate::watch::track(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -239,6 +283,7 @@ impl Shadow {
             marks,
             spare,
             upload: std::sync::atomic::AtomicBool::new(false),
+            vram,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -427,6 +472,8 @@ impl Shadow {
                         written += n;
                     }
                     synced.push((start + at) / PAGE);
+                    // The copy took the title's bytes: so does video memory.
+                    self.push(at, n);
                 }
                 at += n;
             }
@@ -539,6 +586,7 @@ impl Shadow {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
         }
+        self.push(from - start, n);
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
@@ -671,6 +719,11 @@ impl Shadow {
     /// submission's refreshes ([`crate::copy_pool::queued`]): for copies
     /// nothing reads back before they are made.
     fn copy_queued(&self, from: usize, to: usize) -> usize {
+        // A copy in video memory pushes what it took on at once
+        // ([`Shadow::push`]), which a queued copy would not have made yet.
+        if self.vram.is_some() {
+            return self.copy(from, to);
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
@@ -686,6 +739,7 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        self.push(from - start, to - from);
         to - from
     }
 }
@@ -859,6 +913,12 @@ pub(crate) fn copy_back_marks(declared: &[(Arc<Shadow>, usize, usize, bool)]) {
             })
             .collect()
     };
+    pull(
+        &pages
+            .iter()
+            .map(|(copy, page)| (copy.clone(), *page, PAGE))
+            .collect::<Vec<_>>(),
+    );
     for (copy, page) in pages {
         // The declared ranges of this copy on the page, cut to it.
         let on_page = |back: bool| -> Vec<(usize, usize)> {
@@ -904,6 +964,50 @@ fn subtract(mut ranges: Vec<(usize, usize)>, minus: &[(usize, usize)]) -> Vec<(u
             .collect();
     }
     joined
+}
+
+/// Before the CPU reads what shaders may have written: the title address
+/// ranges `(copy, address, len)` of copies in video memory are copied into
+/// their mirrors, by the GPU, at once (one list for all; ranges of other
+/// copies are skipped).
+// shortcut: shaders' writes outside every declared range and marked page
+// (to the copy, not to title memory) stay in video memory: the mirror keeps
+// the bytes from before until a later range brings them.
+pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) {
+    use windows::core::Interface;
+    let mut regions = Vec::new();
+    for (copy, address, len) in ranges {
+        let Some(v) = &copy.vram else { continue };
+        let (from, to) = copy.inside(*address, *len);
+        if from < to {
+            regions.push((
+                &v.mirror,
+                from as u64,
+                &copy.buffer,
+                from as u64,
+                (to - from) as u64,
+            ));
+        }
+    }
+    if regions.is_empty() {
+        return;
+    }
+    regions.sort_by_key(|r| (r.0.as_raw() as usize, r.1));
+    // Overlapping or adjacent ranges of one copy as one region.
+    let mut merged: Vec<(&ID3D12Resource, u64, &ID3D12Resource, u64, u64)> = Vec::new();
+    for r in regions {
+        if let Some(last) = merged.last_mut()
+            && last.0.as_raw() == r.0.as_raw()
+            && r.1 <= last.1 + last.4
+        {
+            last.4 = last.4.max(r.1 + r.4 - last.1);
+            continue;
+        }
+        merged.push(r);
+    }
+    if let Some(host) = host() {
+        host.copy_now(&merged);
+    }
 }
 
 struct Entry {
@@ -993,9 +1097,26 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             .then(|| host.gpu_upload_buffer(size))
             .flatten();
         let in_upload = upload.is_some();
+        // A buffer shaders may write: in video memory too, with a mirror.
+        let mut vram = None;
         let (buffer, data) = match upload {
             Some(made) => made,
-            None => host.shared_buffer(size)?,
+            None => {
+                let mirror = host.shared_buffer(size)?;
+                match (!entry.read_only && host.gpu_upload_writes())
+                    .then(|| host.gpu_upload_buffer(size))
+                    .flatten()
+                {
+                    Some((video, video_data)) => {
+                        vram = Some(Vram {
+                            mirror: mirror.0,
+                            data: video_data,
+                        });
+                        (video, mirror.1)
+                    }
+                    None => mirror,
+                }
+            }
         };
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
@@ -1013,7 +1134,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        let shadow = Shadow::new(buffer, data, gpu, key.0, len, false);
+        let shadow = Shadow::with_vram(buffer, data, gpu, key.0, len, false, vram);
         shadow
             .upload
             .store(in_upload, std::sync::atomic::Ordering::Relaxed);
@@ -1231,10 +1352,11 @@ mod tests {
     use windows::Win32::Graphics::Direct3D12::*;
 
     /// Runs this binary's test `name` again in a child process with
-    /// `VICTORY_GPU_UPLOAD=1` (the switch is read once per process): true
+    /// `VICTORY_GPU_UPLOAD=1`, and `VICTORY_GPU_UPLOAD_WRITES=1` if `writes`
+    /// (the switches are read once per process): true
     /// in that child, where the test does its work; false in the parent,
     /// once the child passed.
-    fn rerun_with_gpu_upload(name: &str) -> bool {
+    fn rerun_with_gpu_upload(name: &str, writes: bool) -> bool {
         const CHILD: &str = "VICTORY_TEST_GPU_UPLOAD_CHILD";
         if std::env::var_os(CHILD).is_some() {
             return true;
@@ -1249,6 +1371,7 @@ mod tests {
             ])
             .env(CHILD, "1")
             .env("VICTORY_GPU_UPLOAD", "1")
+            .env("VICTORY_GPU_UPLOAD_WRITES", if writes { "1" } else { "0" })
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -1260,6 +1383,339 @@ mod tests {
         assert!(text.contains("1 passed"), "{name} did not run:\n{text}");
         eprintln!("{text}");
         false
+    }
+
+    /// A buffer shaders may write, its copy made (mirrored in video memory
+    /// when the switches are on), and title memory filled with a pattern
+    /// the copy then took. Returns the pool, its length and the copy.
+    fn mirrored_buffer(pages: usize) -> (usize, usize, Arc<Shadow>) {
+        let p = crate::watch::tests::pool(pages);
+        let len = pages * PAGE;
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).expect("a copy");
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, len) };
+        for (i, b) in title.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        copy.update(p, len);
+        (p, len, copy)
+    }
+
+    /// Records into `list` the GPU writing `bytes` into the copy at title
+    /// address `at` (a copy from a buffer of ours, as a shader would store).
+    fn gpu_store(list: &HostList, copy: &Shadow, at: usize, bytes: &[u8]) {
+        let host = host().unwrap();
+        let (src, data) = host.shared_buffer(bytes.len() as u64).unwrap();
+        // SAFETY: our mapped buffer of `bytes.len()` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
+        list.keep(&src);
+        // SAFETY: an open list; both buffers live and common.
+        unsafe {
+            list.list.CopyBufferRegion(
+                &copy.buffer,
+                copy.offset(at as u64),
+                &src,
+                0,
+                bytes.len() as u64,
+            )
+        };
+    }
+
+    /// The bytes of the copy as the GPU sees them (video memory, or the
+    /// system memory copy), copied out by the GPU.
+    fn gpu_bytes(copy: &Shadow, at: usize, n: usize) -> Vec<u8> {
+        let host = host().unwrap();
+        let (out, data) = host.shared_buffer(n as u64).unwrap();
+        host.copy_now(&[(&out, 0, &copy.buffer, copy.offset(at as u64), n as u64)]);
+        // SAFETY: our mapped buffer, the copy done.
+        unsafe { std::slice::from_raw_parts(data, n) }.to_vec()
+    }
+
+    /// With `VICTORY_GPU_UPLOAD_WRITES=1` too, the copy of a buffer shaders
+    /// may write is in a GPU upload heap, mirrored in system memory: the
+    /// GPU sees what a refresh wrote, and the mirror holds the same.
+    #[test]
+    fn written_buffers_copies_are_in_video_memory_with_a_mirror() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::written_buffers_copies_are_in_video_memory_with_a_mirror",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return; // no GPU upload heaps here
+        }
+        let (p, len, copy) = mirrored_buffer(2);
+        assert!(copy.mirrored());
+        assert_eq!(heap_type(&copy), D3D12_HEAP_TYPE_GPU_UPLOAD);
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        assert!(
+            gpu_bytes(&copy, p, len) == title,
+            "the GPU sees the refreshed bytes"
+        );
+        // SAFETY: the mirror's bytes.
+        let mirror = unsafe { std::slice::from_raw_parts(copy.data, len) };
+        assert!(mirror == title, "the mirror holds them too");
+        // The title writes again; the next refresh reaches video memory.
+        // SAFETY: our pool's bytes.
+        unsafe { ((p + PAGE + 100) as *mut u8).write_volatile(0xA5) };
+        copy.update(p, len);
+        assert_eq!(gpu_bytes(&copy, p + PAGE + 100, 1), [0xA5]);
+        unregister(p, p as u64);
+    }
+
+    /// End to end through a submission: the GPU writes the copy in video
+    /// memory, in a range a list declared (`marked`: and in a page shaders
+    /// marked as written), while the title writes another byte of the same
+    /// page; afterwards title memory holds both writes. Without the mirror
+    /// being brought up to date (`pull`) the GPU's bytes would never reach
+    /// it, nor title memory.
+    fn gpu_writes_reach_title_memory(marked: bool) {
+        let host = host().unwrap();
+        let (p, len, copy) = mirrored_buffer(2);
+        assert!(copy.mirrored());
+        let list = host.new_list().unwrap();
+        let (at, gpu) = (p + PAGE + 64, [0xC3u8; 16]);
+        copy.refresh(&list, p as u64, len as u64);
+        copy.gpu_writes(&list, p as u64, len as u64, marked);
+        gpu_store(&list, &copy, at, &gpu);
+        list.close();
+        // The title writes the same page meanwhile, past the GPU's bytes.
+        // SAFETY: our pool's bytes.
+        unsafe { ((p + PAGE + 200) as *mut u8).write_volatile(0x3C) };
+        if marked {
+            // The shaders' mark for the page (the GPU copy sets none).
+            let (bit, _) = copy.mark_entry(at as u64).expect("marked memory");
+            let words = bitmap().unwrap().data as *mut u32;
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *words.add(bit as usize / 32) |= 1 << (bit % 32) };
+        }
+        host.execute(&[&list]);
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        assert_eq!(
+            title[PAGE + 64..PAGE + 80],
+            gpu,
+            "the GPU's bytes (marked {marked})"
+        );
+        assert_eq!(
+            title[PAGE + 200],
+            0x3C,
+            "the title's byte (marked {marked})"
+        );
+        assert_eq!(
+            title[PAGE + 63],
+            ((PAGE + 63) % 251) as u8,
+            "the rest as it was"
+        );
+        assert_eq!(
+            gpu_bytes(&copy, p + PAGE + 64, 16),
+            gpu,
+            "video memory keeps them"
+        );
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn gpu_writes_to_mirrored_copies_reach_title_memory() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::gpu_writes_to_mirrored_copies_reach_title_memory",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return;
+        }
+        gpu_writes_reach_title_memory(false);
+        if bitmap().is_some() {
+            gpu_writes_reach_title_memory(true);
+        }
+    }
+
+    /// A list whose writes stay out of title memory (it read memory with no
+    /// copy): the copy keeps the GPU's bytes, and so does its mirror (the
+    /// CPU's next look at the range sees them), while title memory keeps
+    /// its own.
+    #[test]
+    fn withheld_writes_stay_in_the_copy_and_its_mirror() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::withheld_writes_stay_in_the_copy_and_its_mirror",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return;
+        }
+        let (p, len, copy) = mirrored_buffer(1);
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        copy.gpu_writes(&list, p as u64, len as u64, false);
+        gpu_store(&list, &copy, p + 8, &[0x99; 8]);
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: our pool's bytes, and the mirror's.
+        let (title, mirror) = unsafe {
+            (
+                std::slice::from_raw_parts(p as *const u8, len),
+                std::slice::from_raw_parts(copy.data, len),
+            )
+        };
+        assert_eq!(title[8], 8, "title memory keeps its byte");
+        assert_eq!(mirror[8..16], [0x99; 8], "the mirror has the GPU's");
+        unregister(p, p as u64);
+    }
+
+    /// A shader reading and writing 256 MiB of a written buffer's copy, in
+    /// system memory and (`VICTORY_GPU_UPLOAD_WRITES=1`) in video memory, and
+    /// what bringing 64 marked pages back to the mirror costs.
+    /// `cargo test --release -p victory-gpu --lib written_copies -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: run in release with --ignored --nocapture"]
+    fn written_copies_in_video_and_system_memory() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        if !rerun_with_gpu_upload(
+            "shadow::tests::written_copies_in_video_and_system_memory",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            eprintln!("no GPU upload heaps here");
+            return;
+        }
+        const SRC: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer b : register(u0);
+[RootSignature(RS)]
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    // Read 16 dwords, write them back incremented: 64 bytes read and
+    // written per thread.
+    for (uint k = 0; k < 16; k++) {
+        uint at = (id.x * 16 + k) * 4;
+        b.Store(at, b.Load(at) + 1);
+    }
+}"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source outlives the call.
+        unsafe {
+            D3DCompile(
+                SRC.as_ptr().cast(),
+                SRC.len(),
+                s!("b"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob's bytes; plain creation.
+        let (root, pso) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        const BYTES: usize = 256 << 20;
+        // The system memory copy: a mirrored copy's mirror, used by the GPU
+        // as the copies are without the switch.
+        let p = crate::watch::tests::pool(BYTES / PAGE);
+        register(p, p as u64, BYTES as u64);
+        let copy = find(p as u64, BYTES as u64).unwrap();
+        assert!(copy.mirrored());
+        copy.update(p, BYTES);
+        let mirror = &copy.vram.as_ref().unwrap().mirror;
+        for (label, buffer) in [
+            ("system memory (as without the switch)", mirror),
+            ("video memory (GPU upload heap)", &copy.buffer),
+        ] {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let list = host.new_list().unwrap();
+                // SAFETY: an open list, live objects.
+                unsafe {
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetPipelineState(&pso);
+                    list.list
+                        .SetComputeRootUnorderedAccessView(0, buffer.GetGPUVirtualAddress());
+                    list.list.Dispatch((BYTES / 4 / 16 / 256) as u32, 1, 1);
+                }
+                list.close();
+                let t = std::time::Instant::now();
+                host.execute(&[&list]);
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "a shader reading and writing 256 MiB of the copy in {label}: {:.2} ms ({:.1} GB/s each way)",
+                best * 1e3,
+                BYTES as f64 / best / 1e9
+            );
+        }
+        // Bringing written pages back: 64 scattered 64 KiB pages (4 MiB).
+        let pages: Vec<_> = (0..64)
+            .map(|k| (copy.clone(), p + k * 61 * PAGE % BYTES, PAGE))
+            .collect();
+        let mut best = f64::MAX;
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            pull(&pages);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "bringing 64 written 64 KiB pages back to the mirror: {:.3} ms",
+            best * 1e3
+        );
+        let one = [(copy.clone(), p, PAGE)];
+        let mut best = f64::MAX;
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            pull(&one);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "bringing 1 written page back (the fixed cost of a pull): {:.3} ms",
+            best * 1e3
+        );
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 
     /// The heap type a copy's buffer is in.
@@ -1283,6 +1739,7 @@ mod tests {
     fn read_only_buffers_get_their_copies_in_video_memory() {
         if !rerun_with_gpu_upload(
             "shadow::tests::read_only_buffers_get_their_copies_in_video_memory",
+            false,
         ) {
             return;
         }
@@ -1340,7 +1797,10 @@ mod tests {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::core::{Interface, s};
-        if !rerun_with_gpu_upload("shadow::tests::reading_copies_in_video_and_system_memory") {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::reading_copies_in_video_and_system_memory",
+            false,
+        ) {
             return;
         }
         let Some(host) = host() else {
