@@ -329,7 +329,10 @@ const VIEW_SIZE: u64 = 32;
 
 impl Gpu {
     fn heap(&self, t: &mut Tap, kind: u32, count: u32, visible: bool, what: &str) -> Obj {
-        let desc = [kind, count, u32::from(visible), 0];
+        // The description, then an empty placement: newer titles follow it
+        // with memory of their own for the descriptors (address, size), and
+        // the runtime reads those 16 bytes too.
+        let desc = [kind, count, u32::from(visible), 0, 0, 0, 0, 0];
         let mut heap = std::ptr::null_mut();
         let hr = call!(
             self.device,
