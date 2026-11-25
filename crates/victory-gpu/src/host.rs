@@ -2963,6 +2963,8 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// The debug overlay (Alt+Z), drawn into each frame it shows.
+    overlay: crate::overlay::Overlay,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3017,6 +3019,11 @@ impl Meter {
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+        });
+        crate::overlay::second(crate::overlay::Second {
+            draws,
+            prepare_ms: cpu,
+            gpu_wait_ms: gpu,
         });
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
@@ -3201,6 +3208,8 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            p.overlay
+                .record(self, list, &back, (width, height, format), p.hwnd);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -3274,6 +3283,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                overlay: crate::overlay::Overlay::default(),
             })
         }
     }
