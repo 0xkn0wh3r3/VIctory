@@ -2567,7 +2567,9 @@ fn native_16bit_operations_are_declared_where_used() {
 #[test]
 #[ignore = "a benchmark"]
 fn translated_f16_math_costs() {
-    const CHAIN: usize = 512;
+    // Instructions in each chain: long enough that a dispatch's fixed cost
+    // does not hide the arithmetic (at 512 it did on an RX 9070 XT).
+    const CHAIN: usize = 4096;
     const GROUPS: u32 = 4096;
     const TIMES: u32 = 10;
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -2579,9 +2581,11 @@ fn translated_f16_math_costs() {
         eprintln!("no native 16-bit operations; skipped");
         return;
     }
-    let chain = |step: &[u32]| -> Vec<u32> {
+    // `step`'s words make `insts` instructions (VOP3 and VOP3P take two
+    // words each): the chain holds CHAIN instructions whatever their size.
+    let chain = |step: &[u32], insts: usize| -> Vec<u32> {
         let mut b = vec![vop1(0x01, 5, v(1))];
-        for _ in 0..CHAIN / (step.len().max(1)) {
+        for _ in 0..CHAIN / insts.max(1) {
             b.extend_from_slice(step);
         }
         b
@@ -2590,11 +2594,11 @@ fn translated_f16_math_costs() {
     let fma = vop3(0x34B, 5, [v(5), v(2), v(3)], NONE);
     // (body, f16 operations per thread)
     let cases: [(&str, Vec<u32>, usize); 3] = [
-        ("v_pk_fma_f16", chain(&pk_fma), 2 * CHAIN),
-        ("v_fma_f16", chain(&fma), CHAIN),
+        ("v_pk_fma_f16", chain(&pk_fma, 1), 2 * CHAIN),
+        ("v_fma_f16", chain(&fma, 1), CHAIN),
         (
             "v_mul_f16 + v_add_f16",
-            chain(&[vop2(0x35, 5, v(5), 2), vop2(0x32, 5, v(5), 3)]),
+            chain(&[vop2(0x35, 5, v(5), 2), vop2(0x32, 5, v(5), 3)], 2),
             CHAIN,
         ),
     ];
