@@ -59,6 +59,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether it declares 64-bit integer operations.
+    #[cfg(test)]
+    pub int64: bool,
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
@@ -1329,6 +1332,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            int64: self.s.flags & flags::INT64 != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
             dxil: self.s.finish(),
@@ -5398,6 +5403,7 @@ impl<'a> Lower<'a> {
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
+                self.s.flags |= flags::INT64;
                 let i64t = self.s.m.int(64);
                 let k63 = self.s.m.i32(63);
                 let n = self.s.m.bin(c, Bin::And, n, k63);
@@ -5422,6 +5428,7 @@ impl<'a> Lower<'a> {
                 let signed = name == "v_mad_i64_i32";
                 let (a, bb) = (s(self, 0)?, s(self, 1)?);
                 let addend = self.src64(inst, 2)?;
+                self.s.flags |= flags::INT64;
                 let i64t = self.s.m.int(64);
                 let ext = if signed { Cast::SExt } else { Cast::ZExt };
                 let a = self.s.m.cast(c, ext, a, i64t);
@@ -6115,6 +6122,11 @@ impl<'a> Lower<'a> {
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).
+    /// The module's 64-bit integer flag is raised by the instructions that
+    /// make the value here, and by the caller's own 64-bit instruction: a
+    /// source that fails, or a constant, emits none, and a translation that
+    /// declares 64-bit operations it lacks fails validation ("Flags must
+    /// match usage").
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -6124,11 +6136,11 @@ impl<'a> Lower<'a> {
         }
         let c = self.cur;
         let i64t = self.s.m.int(64);
-        self.s.flags |= flags::INT64;
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
             let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            l.s.flags |= flags::INT64;
             let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
             let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
             let k32 = l.s.m.int_const(i64t, 32);
@@ -6153,6 +6165,7 @@ impl<'a> Lower<'a> {
                 // Literals (of unsigned and bit operands) and the null
                 // register: zero-extended.
                 let x = self.operand(inst, &op)?;
+                self.s.flags |= flags::INT64;
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
@@ -7333,6 +7346,7 @@ impl<'a> Lower<'a> {
                     "ge" => pred::IUGE,
                     _ => return Err("a 64-bit compare"),
                 };
+                self.s.flags |= flags::INT64;
                 self.s.m.cmp(c, p, a, b)
             }
             "u32" | "i32" | "u16" | "i16" => {
@@ -10439,6 +10453,34 @@ mod tests {
             // One image handle, from the join's per-lane heap index.
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
+        }
+    }
+
+    /// A 64-bit operation whose source has no DXIL form is left out (its
+    /// result is never read here), and the program then declares no 64-bit
+    /// integer operations: it has none, and the validator refuses a module
+    /// whose flags claim them ("Flags must match usage"). Read from a
+    /// thread id, the same shift and compare are made and declared.
+    #[test]
+    fn a_64_bit_operation_left_out_declares_no_64_bit_operations() {
+        // VOP3 `op vdst, src0, src1` (src1 a register pair).
+        let vop3 = |op: u32, vdst: u32, src0: u32, src1: u32| {
+            [0xD400_0000 | op << 16 | vdst, src0 | src1 << 9]
+        };
+        const LSHRREV_B64: u32 = 0x300;
+        const CMP_EQ_U64: u32 = 0xE2;
+        // s[0:1], user SGPRs no root parameter fills: no value.
+        for words in [vop3(LSHRREV_B64, 2, 128, 0), vop3(CMP_EQ_U64, 106, 128, 0)] {
+            let l = lower_with(&[words[0], words[1], S_ENDPGM], vec![], vec![]).unwrap();
+            assert!(!l.int64, "{words:08x?} left out");
+        }
+        // v[0:1]: the thread id and a register no one set (zero).
+        for words in [
+            vop3(LSHRREV_B64, 2, 128, 256),
+            vop3(CMP_EQ_U64, 106, 128, 256),
+        ] {
+            let l = lower_with(&[words[0], words[1], S_ENDPGM], vec![], vec![]).unwrap();
+            assert!(l.int64, "{words:08x?} made");
         }
     }
 
