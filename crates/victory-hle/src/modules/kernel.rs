@@ -375,7 +375,9 @@ fn title_priority(asked: i32) -> i32 {
     const LOWEST: i32 = -2;
     const BELOW_NORMAL: i32 = -1;
     match asked {
-        IDLE..=LOWEST => BELOW_NORMAL,
+        // Only these two: the values between them are not priorities; they
+        // go to the host unchanged, which refuses them.
+        IDLE | LOWEST => BELOW_NORMAL,
         other => other,
     }
 }
@@ -653,11 +655,11 @@ mod tests {
     /// it sets them.
     #[test]
     fn no_title_thread_waits_for_idle_processors() {
-        let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15]
+        let given: Vec<i32> = [-15, -14, -3, -2, -1, 0, 1, 2, 15]
             .into_iter()
             .map(title_priority)
             .collect();
-        assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
+        assert_eq!(given, [-1, -14, -3, -1, -1, 0, 1, 2, 15]);
     }
 
     /// The host is asked for the priority the title's is turned into.
