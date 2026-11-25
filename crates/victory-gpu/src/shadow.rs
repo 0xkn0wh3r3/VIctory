@@ -978,6 +978,10 @@ fn allocation_extent(base: usize) -> Option<u64> {
 /// frees some of its memory itself, unseen by us; what this cannot tell is
 /// an allocation released and made again at the same address and size.
 pub(crate) fn check_in_place() {
+    let pending = std::mem::take(&mut *STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()));
+    for (base, size) in pending {
+        let_go_in_place(base as u64, size);
+    }
     if !in_place_enabled() {
         return;
     }
@@ -994,6 +998,10 @@ pub(crate) fn check_in_place() {
         let_go_in_place(base as u64, size);
     }
 }
+
+/// Heaps found stale while a caller held `BUFFERS` or `LOOSE`: what is placed
+/// in them is let go at the next frame's check.
+static STALE_IN_PLACE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 
 /// Title memory `[at, at + len)` was mapped or unmapped: in-place windows
 /// and title buffers over it, and heaps opened over allocations it touches show the old pages
@@ -1114,10 +1122,16 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
             .and_then(|v| v.as_ref().map(|(_, size)| *size))
             .filter(|&size| extent != Some(size))
     };
-    if let Some(size) = stale {
-        let_go_in_place(base as u64, size);
-    }
+    // Only the heap goes here: the callers hold `BUFFERS` or `LOOSE`, which
+    // letting go of what is placed in it takes, so that waits for the next
+    // frame's check ([`check_in_place`]), outside those locks.
     let mut heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(size) = stale {
+        if let Some(h) = heaps.as_mut() {
+            h.remove(&base);
+        }
+        STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).push((base, size));
+    }
     let heap = heaps.get_or_insert_with(Default::default).entry(base).or_insert_with(|| {
         let dev3: ID3D12Device3 = host.device.cast().ok()?;
         // SAFETY: the base of a committed allocation of the title's.
@@ -1700,6 +1714,40 @@ mod tests {
             unsafe { VirtualFree(again as *mut _, 0, MEM_RELEASE) };
         }
         let_go_in_place(base as u64, 2 << 20);
+    }
+
+
+    /// A stale heap found while a caller holds `LOOSE` and `BUFFERS` (as
+    /// `loose` and `find` do) does not take those locks again.
+    #[test]
+    fn a_stale_heap_is_replaced_under_the_callers_locks() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if host().is_none() {
+            return;
+        }
+        // SAFETY: our own allocation.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        if in_place_buffer(base as u64, 64 << 10).is_none() {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // no heaps from process memory on this host
+        }
+        // The cached heap's size no longer matches: decommit the last page.
+        // SAFETY: a page of our allocation.
+        unsafe { VirtualFree((base + (1 << 20) - 4096) as *mut _, 4096, windows_sys::Win32::System::Memory::MEM_DECOMMIT) };
+        {
+            let _loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            let _buffers = buffers();
+            // Would wait on the locks above forever if it let go of what is
+            // placed in the heap here.
+            let _ = in_place_buffer(base as u64, 64 << 10);
+        }
+        assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(b, _)| b == base));
+        check_in_place();
+        assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "let go at the frame's check");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
 }
