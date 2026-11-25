@@ -76,6 +76,10 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// marks"), after the written pages in the same bitmap: one bit per
 /// resource-heap index, [`HEAP_VIEWS`] of them.
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
+/// The first bit of the read marks of view heap pages (`emit`, "Read
+/// marks"; with [`super::Options::view_pages`]), after the slots' read
+/// marks: one bit per page of [`VIEW_PAGE_SLOTS`] heap indices.
+pub const VIEW_PAGE_READS: u32 = VIEW_READS + HEAP_VIEWS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -176,6 +180,18 @@ pub(crate) struct Shader {
     /// View heap indices go through the view-page table
     /// ([`super::Options::view_pages`]).
     view_pages: bool,
+    /// Paged view heaps: per heap handle, the heap page it is in and the
+    /// block that computed it (`emit`, "Read marks").
+    pub page_index: std::collections::HashMap<V, (V, usize)>,
+    /// The pages of the handles the instruction being lowered reads, marked
+    /// once it is (`Lower::inst`).
+    pub page_reads: Vec<V>,
+    /// Pages marked so far, by console block: a page marked in a block is
+    /// not marked again later in it.
+    pub pages_marked: std::collections::HashSet<(usize, V)>,
+    /// Guarded code open where lowering is (`Lower::begin_guarded`): values
+    /// made inside are not seen past it.
+    pub guards: u32,
 }
 
 impl Shader {
@@ -237,6 +253,10 @@ impl Shader {
             lds_dwords: 0,
             lds: None,
             view_pages: VIEW_PAGES.with(std::cell::Cell::get),
+            page_index: std::collections::HashMap::new(),
+            page_reads: Vec::new(),
+            pages_marked: std::collections::HashSet::new(),
+            guards: 0,
             main,
             entry,
         }
@@ -575,10 +595,12 @@ impl Shader {
         let index = self.m.select(block, over, last, index);
         // Paged view heaps: the host slot is the slot's page's place in the
         // host heap, from the page table, and its offset in the page.
+        let mut page_of = None;
         let host_index = if self.view_pages && !sampler {
             let table = self.root_srv_handle(VIEW_STRIDES);
             let shift = self.m.i32(VIEW_PAGE_SLOTS.trailing_zeros());
             let page = self.m.bin(block, Bin::LShr, index, shift);
+            page_of = Some(page);
             let four = self.m.i32(4);
             let at = self.m.bin(block, Bin::Mul, page, four);
             let base = self.m.i32(VIEW_PAGE_TABLE);
@@ -620,6 +642,9 @@ impl Shader {
         // Texture shader views (kinds 1-9).
         if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&kind) {
             self.texture_index.insert(h, index);
+        }
+        if let Some(page) = page_of {
+            self.page_index.insert(h, (page, block));
         }
         h
     }

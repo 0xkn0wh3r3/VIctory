@@ -101,6 +101,10 @@ impl Colors {
         let blue = texture([0.0, 0.0, 1.0, 1.0]);
         list.close();
         host.execute(&[&list]);
+        Self::from_textures(red, blue)
+    }
+
+    pub(super) fn from_textures(red: ID3D12Resource, blue: ID3D12Resource) -> Self {
         let (root, pipeline) = pipeline();
         Self {
             red,
@@ -151,10 +155,21 @@ impl Colors {
         heap: &HostHeap,
         slots: [u32; 3],
     ) -> (HostList, Readback) {
+        self.record_with(host, heap, slots, |_| {})
+    }
+
+    pub(super) fn record_with(
+        &self,
+        host: &Host,
+        heap: &HostHeap,
+        slots: [u32; 3],
+        record: impl FnOnce(&HostList),
+    ) -> (HostList, Readback) {
         let bytes = size_of::<[Sample; 3]>();
         let (buffer, mapped) = host.shared_buffer(bytes as u64).unwrap();
         let readback = Readback { buffer, mapped };
         let list = host.new_list().unwrap();
+        record(&list);
         let table = heap.strides().expect("a paged heap has a view-page table");
         // SAFETY: list is open. The test keeps the heap, textures, pipeline and
         // mapped result alive through the fence. Every group writes one Sample.

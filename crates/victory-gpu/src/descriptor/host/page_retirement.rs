@@ -1,8 +1,11 @@
-//! Exercise the runtime's page table with owned RGBA8 textures. Only the number
-//! of available title pages is reduced. Null, scratch, and dynamic pages keep
-//! their normal layout, and the sampled textures live through every submission.
+//! Exercise the runtime's page table with owned RGBA8 textures. The small
+//! controls cap the available title pages. The reclamation test fills a real
+//! registered title heap and runs the production policy at its normal limits.
 
 mod colors;
+mod reclaim;
+mod registered_textures;
+mod translated_reads;
 
 use super::{HostHeap, PAGE, view_pages};
 use crate::host::test_submission::while_pending;
@@ -26,9 +29,7 @@ const SLOTS: [u32; 3] = [A, B, CONTROL];
 fn fixture(available: u32) -> HostHeap {
     let mut heap = HostHeap::new(false, TITLE_SLOTS).expect("a live D3D12 view heap");
     let pages = heap.pages.as_mut().expect("paged heap");
-    let next = pages.placed.lock().unwrap().next;
-    assert!(available <= pages.end - next);
-    pages.end = next + available;
+    pages.limit_unused_pages(available);
     heap
 }
 
@@ -170,4 +171,14 @@ fn two_colors_across_a_submission_fence() {
     check_control(host, &textures);
     let reclaimed = check_under_pressure(host, &textures);
     eprintln!("automatic page reuse observed: {reclaimed}");
+}
+
+#[test]
+#[ignore = "requires a paged D3D12 device and a runtime that recycles descriptor pages"]
+fn expect_reuse_after_submission_fence() {
+    victory_core::logging::init("victory_gpu::descriptor::pages=info");
+    let host = host().expect("D3D12 device required to verify page reuse");
+    assert!(view_pages(), "set VICTORY_VIEW_PAGES=1 to exercise paging");
+    report_adapter(host);
+    reclaim::check(host);
 }

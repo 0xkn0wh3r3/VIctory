@@ -444,6 +444,74 @@ pub(crate) mod tests {
         assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
     }
 
+    /// Paged view heaps: a page no shader used lately is taken back where
+    /// room runs low (its slot holds nothing, its table entry names the null
+    /// page); a shader's read mark of it places it again after the
+    /// submission, with its slot made from the title's record, and the
+    /// texture viewed there made once a shader reads the slot.
+    #[test]
+    fn view_heap_pages_taken_back_are_placed_again_when_read() {
+        let Some(host) = host() else { return };
+        let null = std::ptr::null();
+        let page = victory_shader::emit::VIEW_PAGE_SLOTS;
+        let heap_desc: [u32; 8] = [0, 3 * page, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        // A 4x1 RGBA8 texture, linear, in memory of its own, viewed in page 1.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let slot = page + 5;
+        let at = title_heap.start + u64::from(slot) * 32;
+        crate::descriptor::create_placed_srv(null, &words, &view, at);
+        let heap_host = title_heap.host().expect("a host view heap");
+        if heap_host.host_page_of(slot).is_none() {
+            eprintln!("view heaps are not paged here (VICTORY_VIEW_PAGES=1 pages them); skipped");
+            return;
+        }
+        assert!(heap_host.mirror(slot, at, true).is_some());
+        assert!(heap_host.kept(slot), "made for the draw");
+        let placed = heap_host.host_page_of(slot).unwrap();
+        assert_ne!(placed, 0, "placed on the write");
+        assert_eq!(heap_host.page_table_entry(1), placed);
+        // No submission meanwhile.
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        heap_host.set_page_water(u32::MAX, u32::MAX);
+        let mut t = std::time::Instant::now();
+        for _ in 0..400 {
+            t += std::time::Duration::from_secs(1);
+            heap_host.take_back_pages(t);
+        }
+        heap_host.set_page_water(0, 0);
+        assert_eq!(heap_host.host_page_of(slot), Some(0), "taken back");
+        assert_eq!(heap_host.page_table_entry(1), 0, "the null page");
+        assert!(!heap_host.kept(slot), "the slot holds nothing");
+        assert!(heap_host.made_from(slot, at), "its record stays noted");
+        heap_host.sync_slots(page, 2 * page, title_heap.start, 32);
+        assert_eq!(heap_host.host_page_of(slot), Some(0), "heap syncs pass it by");
+        // A shader reads the page.
+        crate::shadow::tests::mark_page_read(false, 1);
+        let read = crate::shadow::take_page_reads();
+        assert!(read.contains(&1), "its read mark");
+        assert!(!crate::shadow::take_page_reads().contains(&1), "cleared");
+        crate::descriptor::turn_pages(&read, t + std::time::Duration::from_secs(1));
+        let again = heap_host.host_page_of(slot).unwrap();
+        assert_ne!(again, 0, "placed again");
+        assert_eq!(heap_host.page_table_entry(1), again);
+        assert!(heap_host.made_from(slot, at), "made from the title's record");
+        // Read: its texture is made, as for any placed texture's view (once
+        // its record is new to the read marks).
+        crate::shadow::take_reads();
+        crate::shadow::tests::mark_read(false, slot);
+        crate::descriptor::make_read(&crate::shadow::take_reads());
+        assert!(heap_host.kept(slot), "its texture made");
+    }
+
     /// The textures shaders read through the heap since the last eviction
     /// pass are named again at each pass (a slot's read is reported as new
     /// only once), and the marks are cleared for the next.
@@ -1393,6 +1461,9 @@ impl Host {
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
+        // Paged view heaps: pages read are kept (placed again if taken back),
+        // pages unused lately taken back where room runs low.
+        crate::descriptor::turn_pages(&crate::shadow::take_page_reads(), std::time::Instant::now());
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
