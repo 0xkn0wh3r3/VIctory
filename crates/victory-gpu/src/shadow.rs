@@ -46,6 +46,21 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
+    /// A copy of a single view's bytes ([`exact`]): its buffer goes to
+    /// [`SPARE`] when the copy dies.
+    spare: bool,
+}
+
+/// The references `buffer` has besides the caller's.
+fn others(buffer: &ID3D12Resource) -> u32 {
+    use windows::core::Interface;
+    // SAFETY: a live COM object; one reference taken and given back.
+    unsafe {
+        let raw = buffer.as_raw();
+        let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+        ((**unknown).AddRef)(raw);
+        ((**unknown).Release)(raw).saturating_sub(1)
+    }
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -199,7 +214,14 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
+    fn new(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        spare: bool,
+    ) -> Arc<Shadow> {
         let tracked = crate::watch::track(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -212,6 +234,7 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
+            spare,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -607,6 +630,11 @@ impl Drop for Shadow {
             m.owners.remove(&base);
             m.give_back(base, pages(self.start, self.len));
         }
+        // Only a buffer nothing else holds (a list that kept it may not be
+        // submitted yet) is handed to the next copy.
+        if self.spare && others(&self.buffer) == 0 {
+            give_spare(self.buffer.clone(), self.data);
+        }
     }
 }
 
@@ -858,7 +886,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len, false));
         changed();
     }
     entry.shadow.clone()
@@ -890,7 +918,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         len,
         "loose memory copied to the host"
     );
-    let shadow = Shadow::new(buffer, data, gpu, start, len);
+    let shadow = Shadow::new(buffer, data, gpu, start, len, false);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -963,11 +991,21 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         map.retain(|_, w| w.strong_count() > 0);
         *prune_at = (2 * map.len()).max(1024);
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let width = len.next_multiple_of(256);
+    let (buffer, data) = match take_spare(width) {
+        Some((buffer, data)) => {
+            // As a new buffer: what the last copy left is not this view's.
+            // SAFETY: the buffer's persistent mapping, `width` bytes; no
+            // list holds the buffer (`Shadow::drop`).
+            unsafe { std::ptr::write_bytes(data, 0, len as usize) };
+            (buffer, data)
+        }
+        None => host()?.shared_buffer(width)?,
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Shadow::new(buffer, data, gpu, address, len);
+    let shadow = Shadow::new(buffer, data, gpu, address, len, true);
     map.insert((address, len), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {
@@ -977,6 +1015,44 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         VIEWS[3].fetch_max(len, Relaxed);
     }
     Some(shadow)
+}
+
+/// Buffers of dead copies of single views ([`exact`]), by width, for the
+/// next ones of that width, and their bytes in all: ring positions move
+/// every frame (views of the same sizes), so copies die and are made by the
+/// hundred, and a committed buffer made and mapped for each is a driver
+/// call and fresh pages every time.
+static SPARE: Mutex<(u64, BTreeMap<u64, Vec<Spare>>)> = Mutex::new((0, BTreeMap::new()));
+
+/// A spare buffer and its persistent mapping.
+struct Spare(ID3D12Resource, usize);
+
+// SAFETY: D3D12 resources are free-threaded; the mapping is written only by
+// the copy that takes the buffer.
+unsafe impl Send for Spare {}
+
+/// Spare buffers' bytes kept at most.
+const SPARE_BYTES: u64 = 256 << 20;
+
+fn take_spare(width: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let mut guard = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let (bytes, map) = &mut *guard;
+    let Spare(buffer, data) = map.get_mut(&width)?.pop()?;
+    *bytes -= width;
+    Some((buffer, data as *mut u8))
+}
+
+fn give_spare(buffer: ID3D12Resource, data: *mut u8) {
+    // SAFETY: a live buffer.
+    let width = unsafe { buffer.GetDesc() }.Width;
+    let mut guard = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let (bytes, map) = &mut *guard;
+    if *bytes + width <= SPARE_BYTES {
+        *bytes += width;
+        map.entry(width)
+            .or_default()
+            .push(Spare(buffer, data as usize));
+    }
 }
 
 /// Every host copy of title memory made so far (buffers and windows).
@@ -1157,5 +1233,46 @@ mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+    /// A copy of a single view's bytes takes the buffer of one that died
+    /// (zeroed), not a new one; one a list still holds is not handed on.
+    #[test]
+    fn view_copies_reuse_the_buffers_of_dead_ones_nothing_holds() {
+        use windows::core::Interface;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        register(p, p as u64, len as u64);
+        // 456-byte views of 12-byte elements, off the buffer's elements.
+        let view = |at: usize| for_view((p + at) as u64, 456, 12);
+        let Some((first, true)) = view(4) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let raw = first.buffer.as_raw() as usize;
+        first.write_host((p + 4) as u64, &[7; 456]);
+        drop(first);
+        let (second, own) = view(PAGE + 4).unwrap();
+        assert!(own);
+        assert_eq!(
+            second.buffer.as_raw() as usize,
+            raw,
+            "the dead copy's buffer"
+        );
+        assert_eq!(
+            second.read_host((p + PAGE + 4) as u64, 114),
+            vec![0; 114],
+            "zeroed"
+        );
+        // A list keeps the buffer: it is not anyone's spare.
+        let kept = second.buffer.clone();
+        drop(second);
+        let (third, _) = view(2 * PAGE + 4).unwrap();
+        assert_ne!(
+            third.buffer.as_raw() as usize,
+            raw,
+            "a buffer a list still holds"
+        );
+        drop((kept, third));
+        unregister(p, p as u64);
     }
 }
