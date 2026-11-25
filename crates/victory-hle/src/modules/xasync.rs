@@ -4,9 +4,10 @@
 //! As documented for the public API: a queue has a work port and a
 //! completion port, each dispatched manually (the title calls dispatch),
 //! on a thread pool, serialised on one thread, or immediately on the
-//! submitting thread. A null queue handle means the process queue. An
-//! async block's system area holds its status and result size, so both
-//! stay readable after our state for the call is gone.
+//! submitting thread. A null queue handle means the process queue; once
+//! the title sets that to null, a call given no queue fails with
+//! `E_NO_TASK_QUEUE`. An async block's system area holds its status and
+//! result size, so both stay readable after our state for the call is gone.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -32,6 +33,9 @@ pub const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 pub const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
 pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007A_u32 as i32;
 pub const E_ILLEGAL_METHOD_CALL: HRESULT = 0x8000_000E_u32 as i32;
+/// `HRESULT_FROM_WIN32(ERROR_NO_TASK_QUEUE)`: a null queue with no process
+/// queue to stand in for it.
+pub const E_NO_TASK_QUEUE: HRESULT = 0x8007_01AB_u32 as i32;
 
 const WORK: u32 = 0;
 const COMPLETION: u32 = 1;
@@ -384,6 +388,7 @@ pub fn XTaskQueueSubmitDelayedCallback(
 ) -> HRESULT {
     match (queue(handle), callback) {
         (Some(queue), Some(callback)) => queue.submit(port, delay_ms, Task::new(context, callback)),
+        (None, _) => E_NO_TASK_QUEUE,
         _ => E_INVALIDARG,
     }
 }
@@ -397,7 +402,7 @@ pub fn XTaskQueueTerminate(
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
     let Some(queue) = queue(handle) else {
-        return E_INVALIDARG;
+        return E_NO_TASK_QUEUE;
     };
     queue.terminated.store(true, Ordering::Release);
     for port in &queue.ports {
@@ -428,7 +433,10 @@ pub fn XTaskQueueRegisterMonitor(
     callback: Option<MonitorCallback>,
     token: *mut u64,
 ) -> HRESULT {
-    let (Some(queue), Some(callback)) = (queue(handle), callback) else {
+    let Some(queue) = queue(handle) else {
+        return E_NO_TASK_QUEUE;
+    };
+    let Some(callback) = callback else {
         return E_INVALIDARG;
     };
     if token.is_null() {
@@ -495,6 +503,10 @@ struct Call {
     provider: Provider,
     context: usize,
     identity: usize,
+    /// The queue the call runs on: the block's, or the process queue when
+    /// it began (a later change of the process queue does not move a call
+    /// in flight, as in Microsoft's libHttpClient `AsyncLib.cpp`).
+    queue: Arc<Queue>,
     done: Mutex<bool>,
     finished: Condvar,
 }
@@ -586,6 +598,12 @@ pub fn XAsyncBegin(
         }
         release(block);
     }
+    // A null queue stands for the process queue, which the title may have
+    // set to null: then the call has nowhere to run.
+    // SAFETY: checked non-null; the title's block.
+    let Some(queue) = queue(unsafe { (*block).queue }) else {
+        return E_NO_TASK_QUEUE;
+    };
     let (status, size) = words(block);
     status.store(E_PENDING as u32 as usize, Ordering::Release);
     size.store(0, Ordering::Release);
@@ -593,6 +611,7 @@ pub fn XAsyncBegin(
         provider,
         context: context as usize,
         identity: identity as usize,
+        queue,
         done: Mutex::new(false),
         finished: Condvar::new(),
     });
@@ -632,11 +651,7 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     let Some(call) = call(block) else {
         return E_INVALIDARG;
     };
-    // SAFETY: a block in flight is valid.
-    let handle = unsafe { (*block).queue };
-    let Some(queue) = queue(handle) else {
-        return E_INVALIDARG;
-    };
+    let queue = call.queue.clone();
     let context = Box::into_raw(Box::new(Work { call, block }));
     let hr = queue.submit(WORK, delay_ms, Task::new(context.cast(), work));
     if hr < 0 {
@@ -677,7 +692,7 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     // Read before publishing: once the status is set, the title may free
     // the block.
     // SAFETY: a block in flight is valid.
-    let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
+    let routine = unsafe { (*block).callback };
     let (status, size) = words(block);
     if result < 0 || required_size == 0 {
         release(block);
@@ -689,9 +704,8 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     drop(done);
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
-        match queue(handle) {
-            Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
-            _ => task.run(true),
+        if call.queue.submit(COMPLETION, 0, task) != S_OK {
+            task.run(true);
         }
     }
 }
