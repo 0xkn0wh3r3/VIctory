@@ -306,7 +306,8 @@ fn poke(base: usize, size: usize) {
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
-    !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+    !host.allows(dll)
+        && (victory_hle::wraps(dll) || !victory_hle::registry().iter().any(|m| m.serves(dll)))
 }
 
 /// The DLLs among `imported` (the main image's static imports) that must

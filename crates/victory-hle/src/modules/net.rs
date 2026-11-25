@@ -9,10 +9,14 @@
 //! * Forward lookups other than `localhost` and IP literals fail with
 //!   `WSAHOST_NOT_FOUND`; reverse lookups of other addresses come back
 //!   numeric, or fail if a name is required, as with no network.
-//! * `WinHttpConnect` to a host that is not loopback fails with
-//!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
-//!   exist for one. Proxies are off and proxy auto-detection (WPAD, PAC
-//!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
+//! * `WinHttpConnect` to a host that is not loopback connects to our own
+//!   server on loopback instead (`net_server`), which logs every request and
+//!   WebSocket message with its full URL and payload and answers as a
+//!   service that is down, or forwards where `VICTORY_NET_FORWARD` says;
+//!   requests on such a connection carry their origin in the path. Without
+//!   that server the connect fails with `ERROR_WINHTTP_CANNOT_CONNECT`.
+//!   Proxies are off and proxy auto-detection (WPAD, PAC downloads) fails
+//!   with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
 //!   network can connect in.
 #![allow(non_snake_case)]
@@ -133,7 +137,7 @@ fn loopback(ip: IpAddr) -> bool {
 }
 
 /// `localhost` or a loopback literal (bracketed IPv6 too).
-fn loopback_name(name: &str) -> bool {
+pub(super) fn loopback_name(name: &str) -> bool {
     let bare = name.trim_start_matches('[').trim_end_matches(']');
     bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
 }
@@ -724,25 +728,90 @@ pub extern "system" fn GetNameInfoW(
 
 // WinHTTP.
 
+/// Connections to hosts that are not loopback, made to our server instead:
+/// the host and port the title named, by connection handle.
+static REDIRECTED: Mutex<Vec<(usize, String, u16)>> = Mutex::new(Vec::new());
+
+fn redirected() -> std::sync::MutexGuard<'static, Vec<(usize, String, u16)>> {
+    REDIRECTED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The one door to a server: requests, uploads and WebSockets all hang off
-/// the handle this returns.
+/// the handle this returns. For a host that is not loopback, a connection
+/// to our server (`net_server`).
 pub extern "system" fn WinHttpConnect(
     session: Handle,
     server: *const u16,
     port: u16,
     reserved: u32,
 ) -> Handle {
+    let connect = host!("winhttp.dll", "WinHttpConnect": extern "system" fn(Handle, *const u16, u16, u32) -> Handle);
     if let Some(name) = wide(server)
         && !loopback_name(&name)
     {
-        once("HTTP connection blocked", format!("{name}:{port}"));
-        // SAFETY: no pointers.
-        unsafe { SetLastError(ERROR_WINHTTP_CANNOT_CONNECT) };
-        return std::ptr::null_mut();
+        let Some(ours) = super::net_server::port() else {
+            once("HTTP connection blocked", format!("{name}:{port}"));
+            // SAFETY: no pointers.
+            unsafe { SetLastError(ERROR_WINHTTP_CANNOT_CONNECT) };
+            return std::ptr::null_mut();
+        };
+        once("HTTP connection to our server", format!("{name}:{port}"));
+        let loopback: Vec<u16> = "127.0.0.1".encode_utf16().chain(Some(0)).collect();
+        let handle = connect(session, loopback.as_ptr(), ours, reserved);
+        if !handle.is_null() {
+            let mut r = redirected();
+            r.retain(|(h, ..)| *h != handle as usize);
+            r.push((handle as usize, name, port));
+        }
+        return handle;
     }
-    host!("winhttp.dll", "WinHttpConnect": extern "system" fn(Handle, *const u16, u16, u32) -> Handle)(
-        session, server, port, reserved,
+    connect(session, server, port, reserved)
+}
+
+/// A request on a connection to our server carries its origin in its path,
+/// and goes in plain HTTP (the TLS would be ours with ourselves).
+pub extern "system" fn WinHttpOpenRequest(
+    connect: Handle,
+    verb: *const u16,
+    object: *const u16,
+    version: *const u16,
+    referrer: *const u16,
+    accept: *const *const u16,
+    flags: u32,
+) -> Handle {
+    const SECURE: u32 = 0x0080_0000;
+    let open = host!("winhttp.dll", "WinHttpOpenRequest": extern "system" fn(Handle, *const u16, *const u16, *const u16, *const u16, *const *const u16, u32) -> Handle);
+    let origin = redirected()
+        .iter()
+        .find(|(h, ..)| *h == connect as usize)
+        .map(|(_, n, p)| (n.clone(), *p));
+    let Some((name, port)) = origin else {
+        return open(connect, verb, object, version, referrer, accept, flags);
+    };
+    let scheme = if flags & SECURE != 0 { "https" } else { "http" };
+    let path = super::net_server::redirected(
+        scheme,
+        &name,
+        port,
+        &wide(object).unwrap_or_else(|| "/".into()),
+    );
+    let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    open(
+        connect,
+        verb,
+        path.as_ptr(),
+        version,
+        referrer,
+        accept,
+        flags & !SECURE,
     )
+}
+
+/// Forgets a connection to our server as it closes (its handle value may
+/// come again).
+pub extern "system" fn WinHttpCloseHandle(handle: Handle) -> i32 {
+    redirected().retain(|(h, ..)| *h != handle as usize);
+    host!("winhttp.dll", "WinHttpCloseHandle": extern "system" fn(Handle) -> i32)(handle)
 }
 
 /// Sessions never use a proxy: only loopback is reachable, and a proxy
@@ -868,6 +937,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(getnameinfo),
             hle_export!(GetNameInfoW),
             hle_export!(WinHttpConnect),
+            hle_export!(WinHttpOpenRequest),
+            hle_export!(WinHttpCloseHandle),
             hle_export!(WinHttpOpen),
             hle_export!(WinHttpSetOption),
             hle_export!(WinHttpDetectAutoProxyConfigUrl),
@@ -1074,11 +1145,8 @@ mod tests {
         );
         assert!(gethostbyaddr(AWAY.as_ptr().cast(), 4, 2).is_null());
 
-        // WinHTTP.
-        assert!(WinHttpConnect(null, name.as_ptr(), 443, 0).is_null());
-        // SAFETY: no arguments.
-        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        assert_eq!(error, ERROR_WINHTTP_CANNOT_CONNECT);
+        // WinHTTP (connections to the network go to our server:
+        // `winhttp_requests_for_the_network_reach_our_server`).
         assert_eq!(
             WinHttpGetProxyForUrlEx(null, name.as_ptr(), std::ptr::null(), 0),
             ERROR_WINHTTP_AUTODETECTION_FAILED
@@ -1118,5 +1186,80 @@ mod tests {
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
+    }
+
+    /// A title's WinHTTP request for a host on the network, as libHttpClient
+    /// makes one (synchronous here): it reaches our server, which logs its
+    /// full URL and body, and answers 503 over plain HTTP although the
+    /// request asked for TLS.
+    #[test]
+    fn winhttp_requests_for_the_network_reach_our_server() {
+        let w = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let session = WinHttpOpen(
+            w("title").as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!session.is_null());
+        let connect = WinHttpConnect(session, w("services.example.com").as_ptr(), 443, 0);
+        assert!(!connect.is_null(), "a connection to our server");
+        const SECURE: u32 = 0x0080_0000;
+        let request = WinHttpOpenRequest(
+            connect,
+            w("POST").as_ptr(),
+            w("/v1/telemetry?build=1").as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SECURE,
+        );
+        assert!(!request.is_null());
+        let body = br#"{"event":"boot"}"#;
+        let headers = w("Content-Type: application/json\r\n");
+        let send = host!("winhttp.dll", "WinHttpSendRequest": extern "system" fn(Handle, *const u16, u32, *const c_void, u32, u32, usize) -> i32);
+        assert_ne!(
+            send(
+                request,
+                headers.as_ptr(),
+                u32::MAX,
+                body.as_ptr().cast(),
+                body.len() as u32,
+                body.len() as u32,
+                0
+            ),
+            0
+        );
+        let receive = host!("winhttp.dll", "WinHttpReceiveResponse": extern "system" fn(Handle, *mut c_void) -> i32);
+        assert_ne!(receive(request, std::ptr::null_mut()), 0);
+        let query = host!("winhttp.dll", "WinHttpQueryHeaders": extern "system" fn(Handle, u32, *const u16, *mut c_void, *mut u32, *mut u32) -> i32);
+        const STATUS_CODE_NUMBER: u32 = 19 | 0x2000_0000;
+        let (mut status, mut len) = (0u32, 4u32);
+        assert_ne!(
+            query(
+                request,
+                STATUS_CODE_NUMBER,
+                std::ptr::null(),
+                (&raw mut status).cast(),
+                &mut len,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(status, 503);
+        assert!(
+            super::super::net_server::tests::seen_has(
+                r#"POST https://services.example.com/v1/telemetry?build=1 {"event":"boot"}"#
+            ),
+            "logged with its full URL and body"
+        );
+        for h in [request, connect, session] {
+            assert_ne!(WinHttpCloseHandle(h), 0);
+        }
+        assert!(
+            redirected().iter().all(|(h, ..)| *h != connect as usize),
+            "forgotten on close"
+        );
     }
 }
