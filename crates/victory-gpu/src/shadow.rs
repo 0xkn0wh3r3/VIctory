@@ -972,6 +972,83 @@ fn allocation_extent(base: usize) -> Option<u64> {
     }
 }
 
+/// The share of an allocation's pages that must already be in memory
+/// before it is opened as a heap (percent; `VICTORY_IN_PLACE_DENSITY`).
+fn density_wanted() -> u64 {
+    static WANTED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *WANTED.get_or_init(|| {
+        std::env::var("VICTORY_IN_PLACE_DENSITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90)
+            .min(100)
+    })
+}
+
+/// Whether most of the allocation at `base` (`size` bytes) is already in
+/// memory. Opening a heap over an allocation makes all of it resident:
+/// importing it as host memory pins every page, also committed pages the
+/// title never touched, which cost nothing until then (Grand Theft Auto VI
+/// on Linux: 1.9 GB more anonymous memory against 1.4 GB fewer copies, so
+/// in place cost more than the copies it replaced). A sparse allocation
+/// keeps its copies. Asked again after 10 s, as the title fills its
+/// allocations.
+fn dense(base: usize, size: Option<u64>) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    type Decided = std::collections::HashMap<usize, (bool, std::time::Instant)>;
+    static DECIDED: Mutex<Option<Decided>> = Mutex::new(None);
+    let Some(size) = size else { return false };
+    if let Some(&(dense, when)) = DECIDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|d| d.get(&base))
+        && when.elapsed() < std::time::Duration::from_secs(10)
+    {
+        return dense;
+    }
+    // At most 64Ki pages asked, evenly spread over the allocation.
+    let pages = (size / 4096).max(1);
+    let step = pages.div_ceil(1 << 16);
+    let mut asked: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = (0..pages.div_ceil(step))
+        .map(|i| PSAPI_WORKING_SET_EX_INFORMATION {
+            VirtualAddress: (base as u64 + i * step * 4096) as *mut _,
+            ..Default::default()
+        })
+        .collect();
+    // SAFETY: our own process and an array of the size given.
+    let ok = unsafe {
+        K32QueryWorkingSetEx(
+            GetCurrentProcess(),
+            asked.as_mut_ptr().cast(),
+            (asked.len() * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+        )
+    } != 0;
+    // SAFETY: the union's flags word; bit 0 is "valid" (in memory).
+    let resident = asked
+        .iter()
+        .filter(|a| unsafe { a.VirtualAttributes.Flags } & 1 != 0)
+        .count() as u64;
+    let dense = ok && resident * 100 >= asked.len() as u64 * density_wanted();
+    tracing::debug!(
+        base = format_args!("{base:#x}"),
+        size,
+        resident,
+        asked = asked.len(),
+        dense,
+        "title allocation density"
+    );
+    DECIDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(base, (dense, std::time::Instant::now()));
+    dense
+}
+
 /// Once a frame: heaps opened over allocations the title has released or
 /// changed since (another size, or not all committed) are let go with the
 /// in-place windows and title buffers over them, as on a remap. The title
@@ -1131,6 +1208,9 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
             h.remove(&base);
         }
         STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).push((base, size));
+    }
+    if !heaps.as_ref().is_some_and(|h| h.contains_key(&base)) && !dense(base, extent) {
+        return refuse("sparse");
     }
     let heap = heaps.get_or_insert_with(Default::default).entry(base).or_insert_with(|| {
         let dev3: ID3D12Device3 = host.device.cast().ok()?;

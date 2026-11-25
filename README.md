@@ -111,9 +111,12 @@ unset, window sizing is unchanged.
 Set `VICTORY_IN_PLACE=1` (experimental) to let the host GPU read title
 memory in place instead of from host copies (title buffers and memory
 outside them): the title's allocation is opened as a host heap, which saves
-the copies' host memory (GBs while the world loads) and their refreshes.
-Memory that is not one committed allocation (a buffer over many separately
-mapped pages, say) is still copied. Unset, nothing changes.
+the copies' host memory and their refreshes. Opening an allocation makes
+all of it resident, so only allocations already mostly in memory go in
+place (90% by default; `VICTORY_IN_PLACE_DENSITY` sets the percentage);
+sparse ones, and memory that is not one committed allocation (a buffer over
+many separately mapped pages, say), are still copied. Unset, nothing
+changes.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
