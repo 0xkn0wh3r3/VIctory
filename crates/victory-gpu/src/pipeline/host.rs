@@ -298,8 +298,29 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
+/// Why stages `shaders` get no host pipeline whatever they translate to:
+/// only vertex, mesh and pixel stages, or one compute stage, are
+/// translated, and graphics needs a vertex or mesh stage.
+pub(super) fn unsupported(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if let [cs] = shaders
+        && cs.stage == "compute"
+    {
+        return None;
+    }
+    if shaders
+        .iter()
+        .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+    {
+        return Some("only vertex, mesh, pixel and compute stages are translated");
+    }
+    if !shaders.iter().any(|s| matches!(s.stage, "vertex" | "mesh")) {
+        return Some("no vertex or mesh shader");
+    }
+    None
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+pub(super) fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
@@ -318,15 +339,8 @@ impl HostPipeline {
             [cs] if cs.stage == "compute" => Some(cs),
             _ => None,
         };
-        if compute.is_none()
-            && shaders
-                .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
-        {
-            return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
-                shaders,
-            );
+        if let Some(reason) = unsupported(shaders) {
+            return refuse(reason, shaders);
         }
         let mesh = find("mesh");
         let stages = if let Some(cs) = compute {

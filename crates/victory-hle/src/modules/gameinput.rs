@@ -121,36 +121,26 @@ trait Source: Send {
 }
 
 /// The debug overlay (Alt+Z, `victory_gpu::overlay`) shows the pad the
-/// title reads (the first connected one, else the keyboard's stand-in);
-/// while it shows, the title reads neutral pads (still connected) and no
-/// keys.
-fn overlay(
-    mut pads: [Option<PadState>; PADS],
-    mut keys: Vec<KeyState>,
-) -> ([Option<PadState>; PADS], Vec<KeyState>) {
+/// title reads (the first connected one, else the keyboard's stand-in).
+/// The title keeps its input while it shows.
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn overlay(pads: &[Option<PadState>; PADS], keys: &[KeyState]) {
     #[cfg(windows)]
     {
-        use victory_gpu::overlay::{Pad, captured, show_pad};
+        use victory_gpu::overlay::{Pad, show_pad};
         let read = pads
             .iter()
             .flatten()
             .next()
             .copied()
-            .unwrap_or_else(|| fallback(&keys));
+            .unwrap_or_else(|| fallback(keys));
         show_pad(Some(Pad {
             buttons: read.buttons,
             triggers: [read.left_trigger, read.right_trigger],
             left: [read.left_x, read.left_y],
             right: [read.right_x, read.right_y],
         }));
-        if captured() {
-            pads.iter_mut()
-                .flatten()
-                .for_each(|p| *p = PadState::default());
-            keys.clear();
-        }
     }
-    (pads, keys)
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -478,7 +468,7 @@ impl Hub {
             let _ = &mut pads;
             (pads, source.keys())
         };
-        let (pads, keys) = overlay(pads, keys);
+        overlay(&pads, &keys);
         let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
     }

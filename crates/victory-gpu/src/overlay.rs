@@ -6,9 +6,11 @@
 //! frames and the 1% low), the presenter's last second (draws per frame,
 //! time preparing submissions and waiting for the GPU), the process's CPU
 //! use and memory, video memory against its budget, and the controller as
-//! the title last read it. Keys 1-4, while it shows, leave kinds of GPU
-//! work out ([`skip`]), to see what draws what. While it shows the title
-//! gets no keyboard or controller input ([`captured`]).
+//! the title last read it. Alt+1-4, while it shows, leave kinds of GPU
+//! work out ([`skip`]), to see what draws what, and Alt+5 turns console
+//! shaders off ([`console_shaders_off`]): none is translated or compiled,
+//! and draws and dispatches that need one are left out. The title keeps
+//! its keyboard and controller input meanwhile.
 //!
 //! The panel is drawn on the CPU (our own 5x7 font) into upload memory in
 //! the back buffer's format, and copied into its top left corner after the
@@ -30,8 +32,8 @@ use crate::host::Host;
 
 static VISIBLE: AtomicBool = AtomicBool::new(false);
 
-/// Whether the overlay shows: the title gets no input meanwhile.
-pub fn captured() -> bool {
+/// Whether the overlay shows.
+pub fn shown() -> bool {
     VISIBLE.load(Relaxed)
 }
 
@@ -56,6 +58,24 @@ const WORK: [&str; 4] = [
 #[inline]
 pub(crate) fn skip(work: Work) -> bool {
     SKIPPED[work as usize].load(Relaxed)
+}
+
+static SHADERS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether console shaders are off: no title shader is translated and no
+/// host pipeline made, and draws and dispatches without one are left out
+/// (`crate::pipeline::make::ready`). Turned on again, the next use of a
+/// pipeline makes it.
+#[inline]
+pub(crate) fn console_shaders_off() -> bool {
+    SHADERS_OFF.load(Relaxed)
+}
+
+/// Turns console shaders off (or on again), as Alt+5 does.
+pub(crate) fn set_console_shaders_off(off: bool) {
+    if SHADERS_OFF.swap(off, Relaxed) != off {
+        tracing::warn!(off, "overlay toggle: console shaders");
+    }
 }
 
 /// A controller as the title reads it: GameInput's buttons, triggers and
@@ -105,7 +125,7 @@ const MARGIN: u32 = 6;
 /// The presenter's overlay state.
 pub(crate) struct Overlay {
     enabled: bool,
-    /// Keys down at the last frame: Alt+Z, then 1-4.
+    /// Keys down at the last frame: Alt+Z, then Alt+1-5.
     down: u8,
     last: Option<Instant>,
     times: VecDeque<f32>,
@@ -171,7 +191,7 @@ impl Overlay {
             self.times.push_back((now - last).as_secs_f32() * 1000.0);
         }
         self.poll_keys(hwnd);
-        if !captured() {
+        if !shown() {
             self.drawn = None;
             return;
         }
@@ -251,8 +271,9 @@ impl Overlay {
         unsafe { list.CopyTextureRegion(&dst, margin, margin, 0, &src, None) };
     }
 
-    /// Alt+Z shows and hides the panel; 1-4 toggle work while it shows.
-    /// Only while our window has focus, on the frame a key goes down.
+    /// Alt+Z shows and hides the panel; Alt+1-5 flip its checkboxes
+    /// while it shows. Only while our window has focus, on the frame a key
+    /// goes down. The keys still reach the title: it keeps its input.
     fn poll_keys(&mut self, hwnd: HWND) {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         // SAFETY: plain queries.
@@ -260,9 +281,10 @@ impl Overlay {
         // SAFETY: a plain query.
         let held = |vk: i32| focused && unsafe { GetAsyncKeyState(vk) } < 0;
         const ALT: i32 = 0x12;
-        let mut down = u8::from(held(ALT) && held(i32::from(b'Z')));
-        for (k, key) in (b'1'..=b'4').enumerate() {
-            down |= u8::from(held(i32::from(key))) << (k + 1);
+        let alt = held(ALT);
+        let mut down = u8::from(alt && held(i32::from(b'Z')));
+        for (k, key) in (b'1'..=b'5').enumerate() {
+            down |= u8::from(alt && held(i32::from(key))) << (k + 1);
         }
         let pressed = down & !self.down;
         self.down = down;
@@ -270,13 +292,17 @@ impl Overlay {
             let shown = !VISIBLE.fetch_xor(true, Relaxed);
             tracing::info!(shown, "overlay");
         }
-        if captured() {
+        if shown() {
             for (k, skipped) in SKIPPED.iter().enumerate() {
                 if pressed >> (k + 1) & 1 != 0 {
                     let off = !skipped.fetch_xor(true, Relaxed);
                     tracing::warn!(work = WORK[k], left_out = off, "overlay toggle");
                     self.drawn = None;
                 }
+            }
+            if pressed >> 5 & 1 != 0 {
+                set_console_shaders_off(!console_shaders_off());
+                self.drawn = None;
             }
         }
     }
@@ -471,9 +497,13 @@ fn lines(times: &VecDeque<f32>, second: &Second, s: &System, pad: Option<&Pad>) 
         }
         None => out.push(("PAD NONE".to_owned(), Colour::Dim)),
     }
-    out.push(("KEYS 1-4 LEAVE WORK OUT:".to_owned(), Colour::Dim));
-    for (k, name) in WORK.iter().enumerate() {
-        let off = SKIPPED[k].load(Relaxed);
+    out.push(("ALT+1-5 TURN WORK OFF:".to_owned(), Colour::Dim));
+    let names = WORK.iter().chain(["CONSOLE SHADERS"].iter());
+    let offs = SKIPPED
+        .iter()
+        .map(|s| s.load(Relaxed))
+        .chain([console_shaders_off()]);
+    for (k, (name, off)) in names.zip(offs).enumerate() {
         out.push((
             format!(" {} [{}] {}", k + 1, if off { " " } else { "X" }, name),
             if off { Colour::Bad } else { Colour::Text },
@@ -794,6 +824,11 @@ mod tests {
                 );
             }
         }
+        assert!(
+            lines
+                .iter()
+                .any(|(text, _)| text == " 5 [X] CONSOLE SHADERS")
+        );
         let image = Image::panel(2, &lines, &times);
         assert_eq!(image.pixels.len(), (image.width * image.height) as usize);
         assert!(image.pixels.contains(&Colour::Text) && image.pixels.contains(&Colour::Good));
