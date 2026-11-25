@@ -929,7 +929,7 @@ fn wave64_split_cost() {
         ("64 v_readlane back to back", 64, 0, Cross::ReadLane),
     ];
     'adapters: for (name, host) in &hosts {
-        let (min, max) = host.wave_lanes();
+        let (min, max) = host.wave_lanes().unwrap_or((0, 0));
         // Groups for about 0.4 ms per dispatch of the first program, at most
         // GROUPS: an integrated GPU's list of 51 dispatches of GROUPS groups
         // ran past the timeout that removes the device.
