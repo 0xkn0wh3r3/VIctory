@@ -889,6 +889,25 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
+    if entry.shadow.is_none() && in_place_enabled() {
+        // In place: from the 64 KiB boundary at or below the buffer (views
+        // find their bytes by address, `Shadow::offset`), past its end by the
+        // 256 bytes a view ending in its last bytes reads where the
+        // allocation has them, else to its end.
+        const G: u64 = 64 << 10;
+        let lo = key.0 / G * G;
+        let part = [entry.end + 256, entry.end].into_iter().find_map(|end| {
+            let hi = end.next_multiple_of(G);
+            committed_part(lo, hi - lo, key.0, end)
+        });
+        if let Some((s0, l0)) = part
+            && let Some((buffer, gpu)) = in_place_buffer(s0, l0)
+        {
+            crate::host::name(&buffer, || format!("title buffer in place {:#x}+{:#x}", key.0, entry.end - key.0));
+            entry.shadow = Some(Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, true));
+            changed();
+        }
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -916,8 +935,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
-/// `VICTORY_IN_PLACE=1` (experimental, #880): loose windows are the title's
-/// memory itself, opened as a host heap, instead of copies.
+/// `VICTORY_IN_PLACE=1` (experimental, #880): title buffers and loose
+/// windows are the title's memory itself, opened as a host heap, instead of
+/// copies.
 fn in_place_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_IN_PLACE").is_some_and(|v| v == "1"))
@@ -932,7 +952,7 @@ type OpenedHeap = Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)
 static IN_PLACE_HEAPS: Mutex<Option<std::collections::HashMap<usize, OpenedHeap>>> = Mutex::new(None);
 
 /// Title memory `[at, at + len)` was mapped or unmapped: in-place windows
-/// over it and heaps opened over allocations it touches show the old pages
+/// and title buffers over it, and heaps opened over allocations it touches show the old pages
 /// (pinned while a list still holds them), so lookups get new ones.
 pub(crate) fn in_place_remapped(at: u64, len: u64) {
     if !in_place_enabled() {
@@ -942,8 +962,14 @@ pub(crate) fn in_place_remapped(at: u64, len: u64) {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let before = map.len();
     map.retain(|&(s, l), sh| !(sh.in_place && s < end && at < s + l));
-    let gone = before - map.len();
+    let mut gone = before - map.len();
     drop(map);
+    for e in buffers().values_mut() {
+        if e.shadow.as_ref().is_some_and(|sh| sh.in_place && sh.start < end && at < sh.start + sh.len) {
+            e.shadow = None;
+            gone += 1;
+        }
+    }
     let mut heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(h) = heaps.as_mut() {
         h.retain(|&base, v| match v {
@@ -989,8 +1015,10 @@ fn committed_part(start: u64, len: u64, address: u64, end: u64) -> Option<(u64, 
             _ => break,
         }
     }
+    // A placed buffer starts at a multiple of 64 KiB; its end only needs to
+    // be committed pages.
     let lo = lo.max(start).next_multiple_of(G);
-    let hi = (hi.min(start + len)) / G * G;
+    let hi = (hi.min(start + len)) / 4096 * 4096;
     (lo <= address && end <= hi).then(|| (lo, hi - lo))
 }
 

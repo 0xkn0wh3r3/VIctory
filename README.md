@@ -109,10 +109,11 @@ console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
 Set `VICTORY_IN_PLACE=1` (experimental) to let the host GPU read title
-memory outside buffer objects in place instead of from host copies: the
-title's allocation is opened as a host heap, which saves the copies' host
-memory (GBs while the world loads) and their refreshes. Memory that is not
-one committed allocation is still copied. Unset, nothing changes.
+memory in place instead of from host copies (title buffers and memory
+outside them): the title's allocation is opened as a host heap, which saves
+the copies' host memory (GBs while the world loads) and their refreshes.
+Memory that is not one committed allocation (a buffer over many separately
+mapped pages, say) is still copied. Unset, nothing changes.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
