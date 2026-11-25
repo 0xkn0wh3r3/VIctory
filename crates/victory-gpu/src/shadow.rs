@@ -166,6 +166,7 @@ impl Shadow {
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
         if self.in_place {
+            self.landed(page, PAGE);
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -362,6 +363,20 @@ impl Shadow {
         segments.insert(first, (start, grown));
     }
 
+    /// After the submission ran, for a buffer in place: its shaders may have
+    /// written `[address, address + len)` of title memory directly, which
+    /// no guard or write watch sees. Other copies holding those pages (a
+    /// title buffer under the in-place floor, a view's own copy, a texture)
+    /// would keep their older bytes: the pages are marked changed, as a
+    /// copy-back marks the pages it writes.
+    pub(crate) fn landed(&self, address: usize, len: usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if self.in_place && from < to {
+            drop(crate::watch::writing(from, to - from));
+        }
+    }
+
     /// After the submission ran: copies the bytes its shaders wrote back
     /// into title memory (unmapped pages left alone), and only those: the
     /// title's threads write the same buffers while the GPU runs (its
@@ -371,6 +386,7 @@ impl Shadow {
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
         if self.in_place {
+            self.landed(address, len);
             return 0;
         }
         self.copy_back_or_not(address, len, true)
@@ -381,6 +397,8 @@ impl Shadow {
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
         if self.in_place {
+            // Written into title memory already: nothing can keep them out.
+            self.landed(address, len);
             return;
         }
         self.copy_back_or_not(address, len, false);
@@ -2072,6 +2090,41 @@ mod tests {
         let_go_in_place(base as u64, 1 << 20);
         // SAFETY: our allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+
+    /// What shaders wrote through a buffer in place went into title memory
+    /// unseen by the guards: other copies holding the page see it changed,
+    /// as after a copy-back.
+    #[test]
+    fn writes_in_place_mark_other_copies_of_the_page_changed() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::watch::tests::{free, pool};
+        if host().is_none() {
+            return;
+        }
+        let p = pool(2);
+        touch(p, 2 * PAGE);
+        let Some((buffer, gpu, heap)) = in_place_buffer(p as u64, PAGE as u64) else {
+            free(p);
+            return; // no heaps from process memory on this host
+        };
+        let in_place = Shadow::new_with(buffer, p as *mut u8, gpu, p as u64, PAGE as u64, Some(heap));
+        let other = crate::watch::track(p, 2 * PAGE, true).expect("pool memory is tracked");
+        other.take(p, p + 2 * PAGE);
+        // Windows does not guard memory a heap was opened over: such a page
+        // stays changed, so copies of it are always copied again.
+        let guarded = !other.changed(p / PAGE);
+        in_place.copy_back(p + 8, 4);
+        let marked = other.changed(p / PAGE);
+        let beside = other.changed(p / PAGE + 1);
+        drop((other, in_place));
+        let_go_in_place(p as u64, 2 * PAGE as u64);
+        free(p);
+        if guarded {
+            assert!(marked, "the page written in place is changed for other copies");
+            assert!(!beside, "and only that page");
+        }
     }
 
 
