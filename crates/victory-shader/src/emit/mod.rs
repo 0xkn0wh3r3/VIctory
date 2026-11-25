@@ -173,7 +173,16 @@
 //!   the host makes for the draw) also sets bit
 //!   [`VIEW_READS`] + the view's heap index in the same bitmap, after the
 //!   written pages, where still clear: the host makes views it left null
-//!   until a shader reads them (textures the title placed itself).
+//!   until a shader reads them (textures the title placed itself). With
+//!   [`Options::view_pages`] too, every instruction that reads or writes
+//!   through a view it takes from the heap (the heap itself or a table)
+//!   also sets bit [`VIEW_PAGE_READS`] + the index's page (index /
+//!   [`VIEW_PAGE_SLOTS`]), after the slots' read marks, where still clear:
+//!   the host takes back pages no shader used lately and places them again
+//!   when read. A page is marked once per console block, at the end of the
+//!   first instruction there using a handle of it; a handle first used
+//!   inside guarded code made for an instruction is marked there, with an
+//!   atomic and no test.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -238,7 +247,8 @@ pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
     USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_PAGE_SLOTS, VIEW_PAGE_TABLE,
-    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    VIEW_PAGE_READS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS,
+    VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.
