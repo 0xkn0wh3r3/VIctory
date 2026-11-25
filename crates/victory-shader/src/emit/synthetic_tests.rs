@@ -127,7 +127,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
     })
 }
 
-fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
+pub(super) fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
     lowered_with(native, Vec::new())
 }
 
