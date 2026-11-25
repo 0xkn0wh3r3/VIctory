@@ -1097,7 +1097,6 @@ impl<'a> Lower<'a> {
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 let x = self.s.m.select(c, on, x, id);
-                self.s.flags |= flags::WAVE_OPS;
                 // shortcut: the f16 sum is taken in f32 and rounded once; the
                 // console rounds each step, in its own order.
                 let low = self.s.m.i32(0xFFFF);
@@ -1161,7 +1160,6 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
-        self.s.flags |= flags::WAVE_OPS;
         let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
         let arg = if float { self.as_float(x) } else { x };
@@ -1755,7 +1753,6 @@ impl<'a> Lower<'a> {
                 let r = self
                     .s
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
                 let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
                 self.ballots.insert(lo, xy);
                 xy
@@ -2469,7 +2466,6 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        self.s.flags |= flags::WAVE_OPS;
         let lane = self.s.op(
             at,
             "waveGetLaneIndex",
@@ -2728,7 +2724,6 @@ impl<'a> Lower<'a> {
             return Err("a cross-lane operation outside compute");
         }
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
-        self.s.flags |= flags::WAVE_OPS;
         Ok(())
     }
 
@@ -2765,7 +2760,6 @@ impl<'a> Lower<'a> {
         let base = self.s.m.bin(e, Bin::And, first, mask);
         let lane = self.lane_index();
         let f = self.s.m.bin(e, Bin::Add, base, lane);
-        self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
             0 => self.s.m.bin(e, Bin::URem, f, xk),
@@ -2862,7 +2856,6 @@ impl<'a> Lower<'a> {
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
-        self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
@@ -6059,9 +6052,7 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
-                    self.s.flags |= flags::WAVE_OPS;
-                } else {
+                if self.mask_data != MaskData::Host || matches!(lane, V::Const(_)) {
                     self.cross_lane(false)?;
                 }
                 let r = self.read_lane(a, lane);
@@ -6095,7 +6086,6 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
-                self.s.flags |= flags::WAVE_OPS;
                 let r = self.s.op(
                     c,
                     "waveReadLaneFirst.i32",
@@ -7177,7 +7167,6 @@ impl<'a> Lower<'a> {
                     if !host {
                         return Err("v_mbcnt of a mask that is no ballot (console lane layout)");
                     }
-                    self.s.flags |= flags::WAVE_OPS;
                 } else if self.s.mesh.is_none() {
                     self.cross_lane(false)?;
                 }
@@ -10440,6 +10429,22 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    /// A cross-lane operation whose source has no DXIL form is left out
+    /// (its result is never read here), and the program then declares no
+    /// wave operations: it has none, and the validator refuses a module
+    /// whose flags claim them ("Flags must match usage"). Of the thread id,
+    /// the same swizzle is made and declared.
+    #[test]
+    fn a_cross_lane_operation_left_out_declares_no_wave_operations() {
+        // ds_swizzle_b32 v5, v<src> offset:0x1f
+        let swizzle = |src: u32| [0xD8D4_001F, 0x0500_0000 | src];
+        // v_mov_b32 v12, s0: user SGPRs no root parameter fills, no value.
+        let words = [0x7E18_0200, swizzle(12)[0], swizzle(12)[1], S_ENDPGM];
+        assert!(!lower_with(&words, vec![], vec![]).unwrap().wave_ops);
+        let words = [swizzle(0)[0], swizzle(0)[1], S_ENDPGM];
+        assert!(lower_with(&words, vec![], vec![]).unwrap().wave_ops);
     }
 
     #[test]
