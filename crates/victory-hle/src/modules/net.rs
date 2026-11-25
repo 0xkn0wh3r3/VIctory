@@ -12,8 +12,8 @@
 //! * `WinHttpConnect` to a host that is not loopback connects to our own
 //!   server on loopback instead (`net_server`), which logs every request and
 //!   WebSocket message with its full URL and payload and answers as a
-//!   service that is down, or forwards where `VICTORY_NET_FORWARD` says;
-//!   requests on such a connection carry their origin in the path. Without
+//!   service that is down; requests on such a connection carry their origin
+//!   in the path. Without
 //!   that server the connect fails with `ERROR_WINHTTP_CANNOT_CONNECT`.
 //!   Proxies are off and proxy auto-detection (WPAD, PAC downloads) fails
 //!   with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
