@@ -1982,6 +1982,10 @@ mod tests {
         assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).contains(&stale));
         check_in_place();
         assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "let go at the frame's check");
+        // The heap opened in place of the stale one stays cached (only the
+        // stale one is let go): let go of it before the memory, or a later
+        // test given this address finds it.
+        let_go_in_place(base as u64, 1 << 20);
         // SAFETY: our allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
@@ -2222,6 +2226,16 @@ mod tests {
             )
         } as usize;
         assert_ne!(base, 0);
+        // What the cache holds at this base (left by a test that had the
+        // address before, if anything): the sub-range path adds nothing.
+        let cached = || {
+            IN_PLACE_HEAPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|h| h.get(&base).map(|v| v.as_ref().map(|(_, _, id)| *id)))
+        };
+        let before = cached();
         let Some((buffer, gpu, _)) = in_place_buffer((base + (1 << 20)) as u64, 128 << 10) else {
             // SAFETY: our allocation.
             unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
@@ -2230,13 +2244,7 @@ mod tests {
         assert_ne!(gpu, 0);
         // SAFETY: a plain query on a live buffer.
         assert_eq!(unsafe { buffer.GetDesc() }.Width, 128 << 10);
-        assert!(
-            IN_PLACE_HEAPS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .is_none_or(|h| !h.contains_key(&base))
-        );
+        assert_eq!(cached(), before, "no whole-allocation heap opened");
         drop(buffer);
         // SAFETY: our allocation; the heap went with the buffer.
         assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
