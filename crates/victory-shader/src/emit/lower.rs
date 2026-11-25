@@ -7983,6 +7983,10 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
+            // DXIL compares samples of every kind of texture but 3D.
+            if cmp && kind == 4 {
+                return Err("a comparison sample of a 3D image");
+            }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
@@ -10458,10 +10462,12 @@ mod tests {
     /// operations the validator rejects: a gather from a 1D (array) image
     /// ("gather requires resource declared as texture/2D/Cube/2DArray/
     /// CubeArray"), a gather with offsets from a cube ("out of bound offset
-    /// must be undef"), and a load at a mip level from a UAV ("uav load
-    /// don't support mipLevel/sampleIndex"). Each result is written to LDS,
-    /// so the refusal ends the translation. The 2D gather and the plain UAV
-    /// load lower.
+    /// must be undef"), a comparison sample of a 3D image ("samplec
+    /// requires resource declared as texture1D/2D/Cube/1DArray/2DArray/
+    /// CubeArray"), and a load at a mip level from a UAV ("uav load don't
+    /// support mipLevel/sampleIndex"). Each result is written to LDS, so the
+    /// refusal ends the translation. The 2D gather and comparison sample and
+    /// the plain UAV load lower.
     #[test]
     fn image_instructions_dxil_lacks_are_refused() {
         // The view table's first eight dwords (s[12:19]) and the sampler
@@ -10490,6 +10496,9 @@ mod tests {
         const GATHER_2D: [u32; 2] = [0xF11C_0808, 0x40A3_0400]; // image_gather4_lz dmask:0x8 dim:2D
         const GATHER_O_CUBE: [u32; 2] = [0xF15C_0818, 0x40A3_0400]; // image_gather4_lz_o dmask:0x8 dim:CUBE
         const LOAD_MIP_2D: [u32; 2] = [0xF004_0808, 0x40A3_0400]; // image_load_mip dmask:0x8 dim:2D
+        // image_sample_c_lz dmask:0x1, 32-bit addresses.
+        const SAMPLE_C_LZ_2D: [u32; 2] = [0xF0BC_0108, 0x00A3_0400];
+        const SAMPLE_C_LZ_3D: [u32; 2] = [0xF0BC_0110, 0x00A3_0400];
         const LOAD_2D: [u32; 2] = [0xF000_0808, 0x40A3_0400]; // image_load dmask:0x8 dim:2D
         let refused = |words: &[u32], layout, used, why: &str| {
             let e = lower_with(words, layout, used)
@@ -10508,9 +10517,16 @@ mod tests {
         );
         refused(
             &program(GATHER_O_CUBE),
+            layout.clone(),
+            used.clone(),
+            "a gather with offsets from a cube",
+        );
+        assert!(lower_with(&program(SAMPLE_C_LZ_2D), layout.clone(), used.clone()).is_ok());
+        refused(
+            &program(SAMPLE_C_LZ_3D),
             layout,
             used,
-            "a gather with offsets from a cube",
+            "a comparison sample of a 3D image",
         );
         // The image as a UAV.
         let (layout, mut used) = texture_tables();
