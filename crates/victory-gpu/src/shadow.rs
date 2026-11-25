@@ -1626,6 +1626,7 @@ mod tests {
     /// The committed part around a range, of one allocation, cut to 64 KiB.
     #[test]
     fn the_committed_part_of_a_window_holds_the_range_or_is_none() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         const K: u64 = 64 << 10;
         // SAFETY: our own reservation; the middle 4 x 64 KiB committed.
@@ -1648,6 +1649,7 @@ mod tests {
     /// what the CPU wrote there is what the buffer holds.
     #[test]
     fn committed_memory_opens_as_a_buffer_in_place() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         if host().is_none() {
             return;
@@ -1680,6 +1682,7 @@ mod tests {
     /// with another size is not handed out again.
     #[test]
     fn a_heap_over_a_released_allocation_is_let_go() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         if host().is_none() {
             return;
@@ -1721,6 +1724,7 @@ mod tests {
     /// `loose` and `find` do) does not take those locks again.
     #[test]
     fn a_stale_heap_is_replaced_under_the_callers_locks() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         if host().is_none() {
             return;
@@ -1733,9 +1737,13 @@ mod tests {
             unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
             return; // no heaps from process memory on this host
         }
-        // The cached heap's size no longer matches: decommit the last page.
-        // SAFETY: a page of our allocation.
-        unsafe { VirtualFree((base + (1 << 20) - 4096) as *mut _, 4096, windows_sys::Win32::System::Memory::MEM_DECOMMIT) };
+        // The cached heap no longer matches its allocation (as after the
+        // title released it and allocated again with another size). Made so
+        // in the cache itself: Windows does not change memory a heap was
+        // opened over while the heap lives.
+        if let Some(Some((_, size))) = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|h| h.get_mut(&base)) {
+            *size += 64 << 10;
+        }
         {
             let _loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
             let _buffers = buffers();
@@ -1749,5 +1757,10 @@ mod tests {
         // SAFETY: our allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
+
+
+    /// The in-place tests share the heap cache and the queue of stale heaps
+    /// (and may get each other's addresses back): one at a time.
+    static IN_PLACE_TESTS: Mutex<()> = Mutex::new(());
 
 }
