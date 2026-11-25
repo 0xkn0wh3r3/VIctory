@@ -151,6 +151,11 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+Host copies of title buffers are in video memory where the GPU has GPU
+upload heaps (resizable BAR), in every build. `VICTORY_GPU_UPLOAD=0` keeps
+them all in system memory, `VICTORY_GPU_UPLOAD_WRITES=0` those of buffers
+shaders write ([GPU memory](docs/gpu-memory.md)).
+
 ### Windows shader-test validator
 
 The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
