@@ -122,7 +122,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
     })
 }
 
-fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
+pub(super) fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
     lowered_with(native, Vec::new())
 }
 
