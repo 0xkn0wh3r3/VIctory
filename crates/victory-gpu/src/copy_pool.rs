@@ -59,6 +59,20 @@ fn serial() -> bool {
     false
 }
 
+/// Tests: the submitting thread leaves every piece to the workers, and the
+/// pieces they copied.
+#[cfg(test)]
+static WORKERS_ALONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static WORKER_PIECES: AtomicUsize = AtomicUsize::new(0);
+
+fn caller_helps() -> bool {
+    #[cfg(test)]
+    return !WORKERS_ALONE.load(Ordering::Relaxed);
+    #[cfg(not(test))]
+    true
+}
+
 /// Makes the copies [`queued`] returned, on several threads where they are
 /// many bytes; returns once all are made.
 pub(crate) fn run(pieces: Vec<Piece>) {
@@ -90,14 +104,19 @@ struct Job {
 }
 
 impl Job {
-    /// Copies pieces until none are left to take.
-    fn work(&self) {
+    /// Copies pieces until none are left to take (`worker`: on a worker).
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn work(&self, worker: bool) {
         loop {
             let i = self.next.fetch_add(1, Ordering::Relaxed);
             let Some(&(dst, src, len)) = self.pieces.get(i) else {
                 return;
             };
             crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            #[cfg(test)]
+            if worker {
+                WORKER_PIECES.fetch_add(1, Ordering::Relaxed);
+            }
             self.done.fetch_add(1, Ordering::Release);
         }
     }
@@ -128,7 +147,9 @@ impl Pool {
             slot.1 = Some(job.clone());
         }
         self.wake.notify_all();
-        job.work();
+        if caller_helps() {
+            job.work(false);
+        }
         let mut slot = self.job.lock().unwrap_or_else(|e| e.into_inner());
         while job.done.load(Ordering::Acquire) < n {
             slot = self.finished.wait(slot).unwrap_or_else(|e| e.into_inner());
@@ -151,7 +172,7 @@ impl Pool {
                     slot = self.wake.wait(slot).unwrap_or_else(|e| e.into_inner());
                 }
             };
-            job.work();
+            job.work(true);
             // Under the lock, so the waiting thread cannot miss it.
             let _slot = self.job.lock().unwrap_or_else(|e| e.into_inner());
             self.finished.notify_all();
@@ -184,6 +205,34 @@ fn pool() -> Option<&'static Pool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Past the threshold the workers copy: with the submitting thread
+    /// leaving them every piece, they copy all of a run's pieces, and every
+    /// byte lands where it belongs.
+    #[test]
+    fn the_workers_take_the_pieces_past_the_threshold() {
+        let len = 8 << 20;
+        let src: Vec<u8> = (0..len).map(|i| (i * 13 + i / 65536) as u8).collect();
+        let mut dst = vec![0u8; len];
+        let (s, d) = (src.as_ptr(), dst.as_mut_ptr());
+        // 128 pieces of 64 KiB, in another order than in memory.
+        let ((), pieces) = queued(|| {
+            for k in 0..128usize {
+                let at = (k * 37 % 128) * (64 << 10);
+                // SAFETY: (both) inside the two buffers.
+                copy(unsafe { d.add(at) }, unsafe { s.add(at) }, 64 << 10);
+            }
+        });
+        assert!(pool().is_some(), "workers started");
+        WORKERS_ALONE.store(true, Ordering::Relaxed);
+        let before = WORKER_PIECES.load(Ordering::Relaxed);
+        run(pieces);
+        let copied = WORKER_PIECES.load(Ordering::Relaxed) - before;
+        WORKERS_ALONE.store(false, Ordering::Relaxed);
+        // At least: runs of other tests meanwhile count too.
+        assert!(copied >= 128, "pieces the workers copied: {copied}");
+        assert!(dst == src, "every byte where it belongs");
+    }
 
     /// Queued copies are made by `run`, on the workers past the threshold,
     /// one big copy cut into pieces too, each byte where it belongs.
