@@ -3,8 +3,8 @@
 //! still loads and does the work (the module wraps it, [`crate::wraps`]):
 //! only the URL a request is given is ours to see. One for a host that is
 //! not loopback becomes a plain HTTP URL on our server (`net_server`), its
-//! origin in the path, where it is logged with its body and answered or
-//! forwarded; curl's sockets then reach loopback only, as `net` allows.
+//! origin in the path, where it is logged with its body and answered;
+//! curl's sockets then reach loopback only, as `net` allows.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CStr, CString, c_char, c_void};

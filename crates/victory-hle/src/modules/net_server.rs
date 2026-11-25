@@ -4,27 +4,14 @@
 //! origin (scheme, host and port) carried in the path ([`redirected`]).
 //!
 //! Every request is logged with its full URL, headers and body, every
-//! WebSocket message too (`victory_hle::net` target). The server then
-//! answers as a console without a network would see a service that is down
-//! (HTTP 503; WebSockets are accepted and get nothing), or, where
-//! `VICTORY_NET_FORWARD` says so, relays to a real server through the
-//! host's WinHTTP:
-//!
-//! * `origin`: each request to the host the title named;
-//! * `http://host:port` or `https://host:port`: every request to that one
-//!   server (the title's path kept, its host in `X-Victory-Origin`), e.g. a
-//!   server of your own or a recording proxy.
-//!
-//! Forwarding sends what the title sends, from this machine, to whichever
-//! server is named: off unless set.
-#![allow(non_snake_case)]
+//! WebSocket message too (`victory_hle::net` target). The server answers
+//! as a console without a network would see a service that is down: HTTP
+//! 503; WebSockets are accepted and get nothing. Nothing leaves the
+//! machine.
 
-use std::ffi::c_void;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::OnceLock;
-
-use crate::modules::files::host;
 
 /// The path prefix that carries a request's origin.
 const PREFIX: &str = "/__victory/";
@@ -42,7 +29,7 @@ pub(crate) fn port() -> Option<u16> {
             }
         };
         let port = listener.local_addr().ok()?.port();
-        tracing::info!(port, forward = ?forward(), "the title's HTTP requests and WebSockets go to a loopback server");
+        tracing::info!(port, "the title's HTTP requests and WebSockets go to a loopback server");
         std::thread::Builder::new()
             .name("victory net server".into())
             .spawn(move || {
@@ -65,57 +52,6 @@ pub(crate) fn redirected(scheme: &str, host: &str, port: u16, path: &str) -> Str
         format!("/{path}")
     };
     format!("{PREFIX}{scheme}/{host}:{port}{path}")
-}
-
-/// Where requests go on from the server.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Forward {
-    /// Nowhere: the server answers (HTTP 503; WebSockets get nothing).
-    None,
-    /// The host the title named.
-    Origin,
-    /// One server: scheme, host, port.
-    To(String, String, u16),
-}
-
-/// Where `request` goes on: [`forward`] (tests name it per request).
-fn forward_for(request: &Request) -> Forward {
-    #[cfg(test)]
-    if let Some(v) = request.header(TEST_FORWARD) {
-        return parse_forward(v);
-    }
-    let _ = request;
-    forward()
-}
-
-/// Tests: a request's own forward target.
-#[cfg(test)]
-const TEST_FORWARD: &str = "X-Victory-Test-Forward";
-
-/// `VICTORY_NET_FORWARD`, read once.
-pub(crate) fn forward() -> Forward {
-    static FORWARD: OnceLock<Forward> = OnceLock::new();
-    FORWARD
-        .get_or_init(|| parse_forward(&std::env::var("VICTORY_NET_FORWARD").unwrap_or_default()))
-        .clone()
-}
-
-fn parse_forward(value: &str) -> Forward {
-    let value = value.trim();
-    match value {
-        "" | "off" | "0" => Forward::None,
-        "origin" => Forward::Origin,
-        url => match split_url(url) {
-            Some((scheme, host, port, _)) => Forward::To(scheme, host, port),
-            None => {
-                tracing::warn!(
-                    value = url,
-                    "VICTORY_NET_FORWARD: not origin or a URL; not forwarding"
-                );
-                Forward::None
-            }
-        },
-    }
 }
 
 /// `scheme://host[:port][path]`: its parts, the port defaulted by scheme.
@@ -148,10 +84,6 @@ pub(crate) struct Request {
     pub method: String,
     /// The origin's URL: scheme, host, port, path and query.
     pub url: String,
-    pub scheme: String,
-    pub host: String,
-    pub port: u16,
-    pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
@@ -229,30 +161,9 @@ fn serve(stream: TcpStream) {
             websocket_session(&request, reader, out);
             return;
         }
-        let target = forward_for(&request);
-        let (status, reason, headers, body) = match target.clone() {
-            Forward::None => (
-                503,
-                "Service Unavailable".to_owned(),
-                vec![("X-Victory".to_owned(), "offline".to_owned())],
-                Vec::new(),
-            ),
-            target => match forward_http(&request, &target) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(target: "victory_hle::net", url = %request.url, error = %e, "forwarding failed");
-                    (
-                        502,
-                        "Bad Gateway".to_owned(),
-                        vec![("X-Victory".to_owned(), "forward failed".to_owned())],
-                        Vec::new(),
-                    )
-                }
-            },
-        };
-        if target != Forward::None {
-            tracing::info!(target: "victory_hle::net", url = %request.url, status, bytes = body.len(), body = %shown(&body), "the server's response");
-        }
+        let (status, reason) = (503, "Service Unavailable");
+        let headers = [("X-Victory", "offline")];
+        let body: &[u8] = &[];
         let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
         for (n, v) in &headers {
             if !["content-length", "transfer-encoding", "connection"]
@@ -264,7 +175,7 @@ fn serve(stream: TcpStream) {
         head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
         if out
             .write_all(head.as_bytes())
-            .and_then(|()| out.write_all(&body))
+            .and_then(|()| out.write_all(body))
             .is_err()
         {
             return;
@@ -366,10 +277,6 @@ fn read_request(reader: &mut impl BufRead) -> Option<Request> {
     Some(Request {
         method,
         url: format!("{shown_scheme}://{host}{shown_port}{path}"),
-        scheme,
-        host,
-        port,
-        path,
         headers,
         body,
     })
@@ -410,17 +317,6 @@ fn websocket_session(request: &Request, mut reader: BufReader<TcpStream>, mut ou
     let Some(key) = request.header("Sec-WebSocket-Key") else {
         return;
     };
-    let upstream = match forward_for(request) {
-        Forward::None => None,
-        target => match Upstream::open(request, &target) {
-            Ok(u) => Some(u),
-            Err(e) => {
-                tracing::warn!(target: "victory_hle::net", url = %request.url, error = %e, "WebSocket forwarding failed");
-                let _ = out.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
-                return;
-            }
-        },
-    };
     let mut head = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n",
         accept_key(key)
@@ -436,33 +332,12 @@ fn websocket_session(request: &Request, mut reader: BufReader<TcpStream>, mut ou
         return;
     }
     let url = request.url.clone();
-    // The server's messages to the title.
-    if let Some(up) = &upstream {
-        let (up, mut to_title, url) = (up.clone(), out.try_clone().ok(), url.clone());
-        std::thread::spawn(move || {
-            while let Some((text, data)) = up.receive() {
-                log_message(&url, "from the server", text, &data);
-                let Some(t) = to_title.as_mut() else { return };
-                if t.write_all(&frame(if text { 1 } else { 2 }, &data))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            if let Some(t) = to_title.as_mut() {
-                let _ = t.write_all(&frame(8, &[]));
-            }
-        });
-    }
     // The title's messages.
     let mut message: Option<(bool, Vec<u8>)> = None;
     while let Some((fin, opcode, data)) = read_frame(&mut reader) {
         match opcode {
             0x8 => {
                 let _ = out.write_all(&frame(8, &data[..data.len().min(2)]));
-                if let Some(up) = &upstream {
-                    up.close();
-                }
                 tracing::info!(target: "victory_hle::net", %url, "the title closed a WebSocket");
                 return;
             }
@@ -478,9 +353,6 @@ fn websocket_session(request: &Request, mut reader: BufReader<TcpStream>, mut ou
                 bytes.extend_from_slice(&data);
                 if fin {
                     log_message(&url, "from the title", text, &bytes);
-                    if let Some(up) = &upstream {
-                        up.send(text, &bytes);
-                    }
                 } else {
                     message = Some((text, bytes));
                 }
@@ -619,275 +491,6 @@ fn base64(data: &[u8]) -> String {
     s
 }
 
-// Forwarding, through the host's WinHTTP (the title's own WinHTTP calls are
-// vetted by `net`; these are ours).
-
-type Handle = *mut c_void;
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
-
-fn last_error() -> String {
-    std::io::Error::last_os_error().to_string()
-}
-
-/// Where `request` goes for `target`: scheme, host, port.
-fn destination(request: &Request, target: &Forward) -> (String, String, u16) {
-    match target {
-        Forward::To(s, h, p) => (s.clone(), h.clone(), *p),
-        _ => (request.scheme.clone(), request.host.clone(), request.port),
-    }
-}
-
-/// A host WinHTTP session, connection and request; closed on drop.
-struct Winhttp(Vec<Handle>);
-
-impl Drop for Winhttp {
-    fn drop(&mut self) {
-        for &h in self.0.iter().rev() {
-            if !h.is_null() {
-                host!("winhttp.dll", "WinHttpCloseHandle": extern "system" fn(Handle) -> i32)(h);
-            }
-        }
-    }
-}
-
-// SAFETY: WinHTTP handles are usable from any thread.
-unsafe impl Send for Winhttp {}
-// SAFETY: as above; calls on one handle are not made at once.
-unsafe impl Sync for Winhttp {}
-
-/// Opens a request to where `request` goes, sends it (with its body, or
-/// set to upgrade to a WebSocket) and receives the response head.
-fn send(request: &Request, target: &Forward, websocket: bool) -> Result<Winhttp, String> {
-    let (scheme, host, port) = destination(request, target);
-    let secure = matches!(scheme.as_str(), "https" | "wss");
-    let open = host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle);
-    let connect = host!("winhttp.dll", "WinHttpConnect": extern "system" fn(Handle, *const u16, u16, u32) -> Handle);
-    let open_request = host!("winhttp.dll", "WinHttpOpenRequest": extern "system" fn(Handle, *const u16, *const u16, *const u16, *const u16, *const *const u16, u32) -> Handle);
-    let mut h = Winhttp(Vec::new());
-    // Default proxy settings: the machine's own.
-    let session = open(
-        wide("VIctory").as_ptr(),
-        0,
-        std::ptr::null(),
-        std::ptr::null(),
-        0,
-    );
-    h.0.push(session);
-    if session.is_null() {
-        return Err(format!("WinHttpOpen: {}", last_error()));
-    }
-    let c = connect(session, wide(&host).as_ptr(), port, 0);
-    h.0.push(c);
-    if c.is_null() {
-        return Err(format!("WinHttpConnect {host}:{port}: {}", last_error()));
-    }
-    const SECURE: u32 = 0x0080_0000;
-    let r = open_request(
-        c,
-        wide(&request.method).as_ptr(),
-        wide(&request.path).as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-        std::ptr::null(),
-        if secure { SECURE } else { 0 },
-    );
-    h.0.push(r);
-    if r.is_null() {
-        return Err(format!("WinHttpOpenRequest: {}", last_error()));
-    }
-    if websocket {
-        const UPGRADE: u32 = 114;
-        let set = host!("winhttp.dll", "WinHttpSetOption": extern "system" fn(Handle, u32, *const c_void, u32) -> i32);
-        if set(r, UPGRADE, std::ptr::null(), 0) == 0 {
-            return Err(format!("WebSocket upgrade option: {}", last_error()));
-        }
-    }
-    let skip = |n: &str| {
-        let n = n.to_ascii_lowercase();
-        [
-            "host",
-            "connection",
-            "content-length",
-            "transfer-encoding",
-            "upgrade",
-            "x-victory-test-forward",
-        ]
-        .contains(&n.as_str())
-            || n.starts_with("sec-websocket-")
-    };
-    let mut headers: String = request
-        .headers
-        .iter()
-        .filter(|(n, _)| !skip(n))
-        .map(|(n, v)| format!("{n}: {v}\r\n"))
-        .collect();
-    if matches!(target, Forward::To(..)) {
-        headers.push_str(&format!(
-            "X-Victory-Origin: {}://{}:{}\r\n",
-            request.scheme, request.host, request.port
-        ));
-    }
-    let headers = wide(&headers);
-    let send_request = host!("winhttp.dll", "WinHttpSendRequest": extern "system" fn(Handle, *const u16, u32, *const c_void, u32, u32, usize) -> i32);
-    let body = &request.body;
-    let len = u32::try_from(body.len()).map_err(|_| "a body over 4 GiB")?;
-    if send_request(
-        r,
-        headers.as_ptr(),
-        u32::MAX,
-        body.as_ptr().cast(),
-        len,
-        len,
-        0,
-    ) == 0
-    {
-        return Err(format!(
-            "WinHttpSendRequest to {scheme}://{host}:{port}: {}",
-            last_error()
-        ));
-    }
-    let receive = host!("winhttp.dll", "WinHttpReceiveResponse": extern "system" fn(Handle, *mut c_void) -> i32);
-    if receive(r, std::ptr::null_mut()) == 0 {
-        return Err(format!("WinHttpReceiveResponse: {}", last_error()));
-    }
-    Ok(h)
-}
-
-/// The status, reason and headers of a received response.
-fn response_head(r: Handle) -> (u16, String, Vec<(String, String)>) {
-    let query = host!("winhttp.dll", "WinHttpQueryHeaders": extern "system" fn(Handle, u32, *const u16, *mut c_void, *mut u32, *mut u32) -> i32);
-    const RAW_HEADERS_CRLF: u32 = 22;
-    let mut len = 0u32;
-    query(
-        r,
-        RAW_HEADERS_CRLF,
-        std::ptr::null(),
-        std::ptr::null_mut(),
-        &mut len,
-        std::ptr::null_mut(),
-    );
-    let mut buffer = vec![0u16; len as usize / 2 + 1];
-    if query(
-        r,
-        RAW_HEADERS_CRLF,
-        std::ptr::null(),
-        buffer.as_mut_ptr().cast(),
-        &mut len,
-        std::ptr::null_mut(),
-    ) == 0
-    {
-        return (502, "Bad Gateway".into(), Vec::new());
-    }
-    let text = String::from_utf16_lossy(&buffer[..len as usize / 2]);
-    let mut lines = text.split("\r\n");
-    let status_line = lines.next().unwrap_or_default();
-    let mut parts = status_line.splitn(3, ' ');
-    let _version = parts.next();
-    let status = parts.next().and_then(|s| s.parse().ok()).unwrap_or(502);
-    let reason = parts.next().unwrap_or("").to_owned();
-    let headers = lines
-        .filter_map(|l| l.split_once(':'))
-        .map(|(n, v)| (n.trim().to_owned(), v.trim().to_owned()))
-        .collect();
-    (status, reason, headers)
-}
-
-/// A response: status, reason, headers, body.
-type Response = (u16, String, Vec<(String, String)>, Vec<u8>);
-
-fn forward_http(request: &Request, target: &Forward) -> Result<Response, String> {
-    let h = send(request, target, false)?;
-    let r = h.0[2];
-    let (status, reason, headers) = response_head(r);
-    let read = host!("winhttp.dll", "WinHttpReadData": extern "system" fn(Handle, *mut c_void, u32, *mut u32) -> i32);
-    let mut body = Vec::new();
-    let mut chunk = vec![0u8; 64 << 10];
-    loop {
-        let mut n = 0u32;
-        if read(r, chunk.as_mut_ptr().cast(), chunk.len() as u32, &mut n) == 0 {
-            return Err(format!("WinHttpReadData: {}", last_error()));
-        }
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..n as usize]);
-    }
-    Ok((status, reason, headers, body))
-}
-
-/// A forwarded WebSocket: the host's WebSocket handle, and its request's
-/// handles (kept until it closes).
-#[derive(Clone)]
-struct Upstream(std::sync::Arc<(Winhttp, Winhttp)>);
-
-impl Upstream {
-    fn open(request: &Request, target: &Forward) -> Result<Upstream, String> {
-        let h = send(request, target, true)?;
-        let (status, _, _) = response_head(h.0[2]);
-        if status != 101 {
-            return Err(format!("the server answered {status}, not 101"));
-        }
-        let complete = host!("winhttp.dll", "WinHttpWebSocketCompleteUpgrade": extern "system" fn(Handle, usize) -> Handle);
-        let ws = complete(h.0[2], 0);
-        if ws.is_null() {
-            return Err(format!("WinHttpWebSocketCompleteUpgrade: {}", last_error()));
-        }
-        Ok(Upstream(std::sync::Arc::new((Winhttp(vec![ws]), h))))
-    }
-
-    fn ws(&self) -> Handle {
-        self.0.0.0[0]
-    }
-
-    fn send(&self, text: bool, data: &[u8]) {
-        let send = host!("winhttp.dll", "WinHttpWebSocketSend": extern "system" fn(Handle, u32, *const c_void, u32) -> u32);
-        const BINARY: u32 = 0;
-        const UTF8: u32 = 2;
-        send(
-            self.ws(),
-            if text { UTF8 } else { BINARY },
-            data.as_ptr().cast(),
-            data.len() as u32,
-        );
-    }
-
-    /// The next whole message: whether it is text, and its bytes; None once
-    /// closed.
-    fn receive(&self) -> Option<(bool, Vec<u8>)> {
-        let receive = host!("winhttp.dll", "WinHttpWebSocketReceive": extern "system" fn(Handle, *mut c_void, u32, *mut u32, *mut u32) -> u32);
-        let mut message = Vec::new();
-        let mut chunk = vec![0u8; 64 << 10];
-        loop {
-            let (mut n, mut kind) = (0u32, 0u32);
-            if receive(
-                self.ws(),
-                chunk.as_mut_ptr().cast(),
-                chunk.len() as u32,
-                &mut n,
-                &mut kind,
-            ) != 0
-            {
-                return None;
-            }
-            message.extend_from_slice(&chunk[..n as usize]);
-            match kind {
-                0 => return Some((false, message)),
-                2 => return Some((true, message)),
-                1 | 3 => {}
-                _ => return None,
-            }
-        }
-    }
-
-    fn close(&self) {
-        let close = host!("winhttp.dll", "WinHttpWebSocketClose": extern "system" fn(Handle, u16, *const c_void, u32) -> u32);
-        close(self.ws(), 1000, std::ptr::null(), 0);
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -913,12 +516,6 @@ pub(crate) mod tests {
             Some("wss chat.example.com 9000 /s")
         );
         assert_eq!(s("ftp://example.com"), None);
-        assert_eq!(parse_forward(""), Forward::None);
-        assert_eq!(parse_forward("origin"), Forward::Origin);
-        assert_eq!(
-            parse_forward("http://127.0.0.1:9"),
-            Forward::To("http".into(), "127.0.0.1".into(), 9)
-        );
     }
 
     /// RFC 6455's example handshake.
@@ -953,98 +550,6 @@ pub(crate) mod tests {
                 .any(|l| l == "POST https://api.example.com/v1/session?x=1 {\"user\":\"offline\"}"),
             "{:?}",
             seen()
-        );
-    }
-
-    /// Forwarded to a server of one's own: the title's path and body reach
-    /// it, with the origin in `X-Victory-Origin`, and its answer comes back.
-    #[test]
-    fn requests_forward_to_a_server_and_its_answer_comes_back() {
-        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let up = upstream.local_addr().unwrap().port();
-        let got = std::thread::spawn(move || {
-            let (s, _) = upstream.accept().unwrap();
-            let mut out = s.try_clone().unwrap();
-            let request = read_request(&mut BufReader::new(s)).unwrap();
-            out.write_all(
-                b"HTTP/1.1 200 OK
-Content-Type: text/plain
-Content-Length: 5
-
-hello",
-            )
-            .unwrap();
-            request
-        });
-        let mut s = connect();
-        let path = redirected("https", "api.example.com", 443, "/v1/thing");
-        write!(
-            s,
-            "POST {path} HTTP/1.1
-{TEST_FORWARD}: http://127.0.0.1:{up}
-Content-Length: 3
-Connection: close
-
-abc"
-        )
-        .unwrap();
-        let mut answer = String::new();
-        s.read_to_string(&mut answer).unwrap();
-        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
-        assert!(answer.ends_with("hello"), "{answer}");
-        let request = got.join().unwrap();
-        assert_eq!(
-            (
-                request.method.as_str(),
-                request.path.as_str(),
-                request.body.as_slice()
-            ),
-            ("POST", "/v1/thing", b"abc".as_slice())
-        );
-        assert_eq!(
-            request.header("X-Victory-Origin"),
-            Some("https://api.example.com:443")
-        );
-        assert_eq!(request.header(TEST_FORWARD), None, "not passed on");
-    }
-
-    /// A WebSocket forwarded: the title's messages go on to the server (here
-    /// our own, unforwarded, which logs them as it would the title's).
-    #[test]
-    fn websocket_messages_forward_to_the_server() {
-        let ours = port().unwrap();
-        let mut s = connect();
-        let path = redirected("https", "chat.example.com", 443, "/relay");
-        write!(
-            s,
-            "GET {path} HTTP/1.1
-{TEST_FORWARD}: http://127.0.0.1:{ours}
-Upgrade: websocket
-Connection: Upgrade
-Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
-Sec-WebSocket-Version: 13
-
-"
-        )
-        .unwrap();
-        let mut reader = BufReader::new(s.try_clone().unwrap());
-        let mut status = String::new();
-        reader.read_line(&mut status).unwrap();
-        assert!(status.starts_with("HTTP/1.1 101"), "{status}");
-        let mask = [9u8, 8, 7, 6];
-        let mut f = vec![0x81, 0x80 | 5];
-        f.extend_from_slice(&mask);
-        f.extend(b"relay".iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
-        s.write_all(&f).unwrap();
-        let wanted = format!("ws from the title ws://127.0.0.1:{ours}/relay relay");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !seen_has(&wanted) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(seen_has(&wanted), "{:?}", seen());
-        assert!(
-            seen_has("ws from the title wss://chat.example.com/relay relay"),
-            "logged as the title's too"
         );
     }
 
