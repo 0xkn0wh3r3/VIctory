@@ -110,11 +110,14 @@ unset, window sizing is unchanged.
 
 Set `VICTORY_IN_PLACE=1` (experimental) to let the host GPU read title
 memory in place instead of from host copies (title buffers and memory
-outside them): the title's allocation is opened as a host heap, which saves
-the copies' host memory and their refreshes. Opening an allocation makes
-all of it resident, so only allocations already mostly in memory go in
-place (90% by default; `VICTORY_IN_PLACE_DENSITY` sets the percentage);
-sparse ones, and memory that is not one committed allocation (a buffer over
+outside them), which saves the copies' host memory and their refreshes.
+Where the host opens part of an allocation as a heap
+(`OpenExistingHeapFromAddress1`), only a buffer's own pages are opened.
+Elsewhere (vkd3d-proton) the whole allocation is opened, which makes all of
+it resident, so only allocations already mostly in memory go in place: 90%
+by default, `VICTORY_IN_PLACE_DENSITY` sets the percentage (lower values
+have hung the GPU while Grand Theft Auto VI loads its world). Sparse
+allocations, and memory that is not one committed allocation (a buffer over
 many separately mapped pages, say), are still copied. Unset, nothing
 changes.
 

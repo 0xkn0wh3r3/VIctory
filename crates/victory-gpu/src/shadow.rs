@@ -985,6 +985,11 @@ fn density_wanted() -> u64 {
     })
 }
 
+/// Density decisions by allocation (base and size: an allocation made
+/// again at the same address is a new one), and when they were made.
+type Decided = std::collections::HashMap<(usize, u64), (bool, std::time::Instant)>;
+static DECIDED: Mutex<Option<Decided>> = Mutex::new(None);
+
 /// Whether most of the allocation at `base` (`size` bytes) is already in
 /// memory. Opening a heap over an allocation makes all of it resident:
 /// importing it as host memory pins every page, also committed pages the
@@ -998,14 +1003,12 @@ fn dense(base: usize, size: Option<u64>) -> bool {
         K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    type Decided = std::collections::HashMap<usize, (bool, std::time::Instant)>;
-    static DECIDED: Mutex<Option<Decided>> = Mutex::new(None);
     let Some(size) = size else { return false };
     if let Some(&(dense, when)) = DECIDED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .and_then(|d| d.get(&base))
+        .and_then(|d| d.get(&(base, size)))
         && when.elapsed() < std::time::Duration::from_secs(10)
     {
         return dense;
@@ -1045,7 +1048,7 @@ fn dense(base: usize, size: Option<u64>) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(Default::default)
-        .insert(base, (dense, std::time::Instant::now()));
+        .insert((base, size), (dense, std::time::Instant::now()));
     dense
 }
 
@@ -1188,6 +1191,21 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
         return refuse("offset");
     }
     let host = host()?;
+    // Where the host opens a sub-range, only the buffer's own pages become
+    // a heap: nothing else of the allocation is pinned, and the placed
+    // buffer holds its heap, so the heap goes with the buffer.
+    if !whole_allocations_only()
+        && let Ok(dev13) = host.device.cast::<ID3D12Device13>()
+    {
+        let size = len.next_multiple_of(4096) as usize;
+        // SAFETY: committed pages of one allocation of the title's, from
+        // a 64 KiB boundary of it.
+        if let Ok(heap) =
+            unsafe { dev13.OpenExistingHeapFromAddress1::<ID3D12Heap>(start as *const _, size) }
+        {
+            return place_in(&host.device, &heap, 0, len).or_else(|| refuse("placement refused"));
+        }
+    }
     // A heap opened earlier over an allocation the title has released or
     // changed since goes first, with what is placed in it.
     let extent = allocation_extent(base);
@@ -1228,6 +1246,31 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
     if offset + len > size {
         return refuse("past the heap");
     }
+    place_in(&host.device, &heap, offset, len).or_else(|| refuse("placement refused"))
+}
+
+/// Tests of the whole-allocation path (the heap cache, stale heaps) turn
+/// off sub-range heaps, which a host with `ID3D12Device13` would take.
+#[cfg(test)]
+static WHOLE_ALLOCATIONS_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn whole_allocations_only() -> bool {
+    #[cfg(test)]
+    return WHOLE_ALLOCATIONS_ONLY.load(Ordering::Relaxed);
+    #[cfg(not(test))]
+    false
+}
+
+/// A buffer of `len` bytes placed at `offset` in `heap`, opened over title
+/// memory, and its GPU address.
+fn place_in(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    heap: &windows::Win32::Graphics::Direct3D12::ID3D12Heap,
+    offset: u64,
+    len: u64,
+) -> Option<(ID3D12Resource, u64)> {
+    use windows::Win32::Graphics::Direct3D12::*;
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: len,
@@ -1241,10 +1284,17 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
     };
     let mut buffer: Option<ID3D12Resource> = None;
     // SAFETY: a buffer inside the heap.
-    let made = unsafe { host.device.CreatePlacedResource(&heap, offset, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer) };
-    if made.is_err() {
-        return refuse("placement refused");
+    unsafe {
+        device.CreatePlacedResource(
+            heap,
+            offset,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
     }
+    .ok()?;
     let buffer = buffer?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1738,6 +1788,7 @@ mod tests {
         // SAFETY: our own allocation.
         let base = unsafe { VirtualAlloc(std::ptr::null(), LEN as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
         assert_ne!(base, 0);
+        touch(base as usize, LEN as usize);
         // SAFETY: our memory.
         unsafe { *((base + (64 << 10)) as *mut u32) = 0x1234_5678 };
         let Some((buffer, gpu)) = in_place_buffer(base + (64 << 10), 128 << 10) else {
@@ -1763,6 +1814,7 @@ mod tests {
     #[test]
     fn a_heap_over_a_released_allocation_is_let_go() {
         let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _whole = WholeAllocations::on();
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         if host().is_none() {
             return;
@@ -1771,6 +1823,7 @@ mod tests {
         let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
         assert_ne!(base, 0);
         assert_eq!(allocation_extent(base), Some(1 << 20));
+        touch(base, 1 << 20);
         if in_place_buffer(base as u64, 64 << 10).is_none() {
             // SAFETY: our allocation.
             unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
@@ -1789,6 +1842,7 @@ mod tests {
         // SAFETY: a new allocation, at that address if it is free.
         let again = unsafe { VirtualAlloc(base as *const _, 2 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
         if again == base {
+            touch(again, 2 << 20);
             let (buffer, _) = in_place_buffer(base as u64, 2 << 20).expect("a heap over the new allocation");
             // SAFETY: a plain query on a live buffer.
             assert_eq!(unsafe { buffer.GetDesc() }.Width, 2 << 20, "placed in the new, larger heap");
@@ -1805,6 +1859,7 @@ mod tests {
     #[test]
     fn a_stale_heap_is_replaced_under_the_callers_locks() {
         let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _whole = WholeAllocations::on();
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         if host().is_none() {
             return;
@@ -1812,6 +1867,7 @@ mod tests {
         // SAFETY: our own allocation.
         let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
         assert_ne!(base, 0);
+        touch(base, 1 << 20);
         if in_place_buffer(base as u64, 64 << 10).is_none() {
             // SAFETY: our allocation.
             unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
@@ -1843,4 +1899,113 @@ mod tests {
     /// (and may get each other's addresses back): one at a time.
     static IN_PLACE_TESTS: Mutex<()> = Mutex::new(());
 
+    /// Writes every page of `[base, base + len)`, so the allocation counts as
+    /// dense ([`dense`]).
+    fn touch(base: usize, len: usize) {
+        for page in (0..len).step_by(4096) {
+            // SAFETY: committed memory of the test's own allocation.
+            unsafe { ((base + page) as *mut u8).write_volatile(1) };
+        }
+    }
+
+    /// Takes the whole-allocation path for the life of the guard.
+    struct WholeAllocations;
+    impl WholeAllocations {
+        fn on() -> Self {
+            // Decisions of earlier tests may name an address given out again.
+            *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            WHOLE_ALLOCATIONS_ONLY.store(true, Ordering::Relaxed);
+            WholeAllocations
+        }
+    }
+    impl Drop for WholeAllocations {
+        fn drop(&mut self) {
+            WHOLE_ALLOCATIONS_ONLY.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// A sparse allocation (committed, mostly never touched) is not opened
+    /// whole: that would make all of it resident.
+    #[test]
+    fn a_sparse_allocation_is_not_opened_whole() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _whole = WholeAllocations::on();
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if host().is_none() {
+            return;
+        }
+        const LEN: usize = 16 << 20;
+        // SAFETY: our own allocation.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        touch(base, 64 << 10);
+        assert!(
+            in_place_buffer(base as u64, 64 << 10).is_none(),
+            "1 of 256 pieces touched"
+        );
+        assert!(
+            IN_PLACE_HEAPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(|h| !h.contains_key(&base))
+        );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Where the host opens sub-ranges, a buffer in place is a heap over its
+    /// own pages only, also in a sparse allocation, and no whole-allocation
+    /// heap is kept.
+    #[test]
+    fn a_sub_range_heap_covers_only_the_buffer() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device13;
+        use windows::core::Interface;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(host) = host() else { return };
+        if host.device.cast::<ID3D12Device13>().is_err() {
+            return; // no sub-range heaps on this host (vkd3d-proton)
+        }
+        const LEN: usize = 16 << 20;
+        // SAFETY: our own allocation.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        let Some((buffer, gpu)) = in_place_buffer((base + (1 << 20)) as u64, 128 << 10) else {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // the host refuses process memory as a heap
+        };
+        assert_ne!(gpu, 0);
+        // SAFETY: a plain query on a live buffer.
+        assert_eq!(unsafe { buffer.GetDesc() }.Width, 128 << 10);
+        assert!(
+            IN_PLACE_HEAPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(|h| !h.contains_key(&base))
+        );
+        drop(buffer);
+        // SAFETY: our allocation; the heap went with the buffer.
+        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
+    }
 }
