@@ -115,8 +115,7 @@ Where the host opens part of an allocation as a heap
 (`OpenExistingHeapFromAddress1`), only a buffer's own pages are opened.
 Elsewhere (vkd3d-proton) the whole allocation is opened, which makes all of
 it resident, so only allocations already mostly in memory go in place: 90%
-by default, `VICTORY_IN_PLACE_DENSITY` sets the percentage (lower values
-have hung the GPU while Grand Theft Auto VI loads its world). Sparse
+by default, `VICTORY_IN_PLACE_DENSITY` sets the percentage. Sparse
 allocations, and memory that is not one committed allocation (a buffer over
 many separately mapped pages, say), are still copied. Unset, nothing
 changes.
