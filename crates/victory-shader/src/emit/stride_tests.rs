@@ -223,8 +223,24 @@ fn build(
     shader
 }
 
+/// A heap-indexed buffer read by element, through a raw view as the test
+/// host makes for [`Stride::Structured`].
 #[test]
 fn a_heap_buffer_read_by_element_takes_the_views_stride() {
+    read_by_element(Stride::Structured(12));
+}
+
+/// The same read through a structured view, as the runtime makes one today
+/// from a title's structured descriptor (`descriptor::host::buffer_srv`).
+/// WARP passes; NVIDIA hardware applies the view's stride a second time and
+/// fails until the runtime makes such views raw (#1835). It is kept so that
+/// the raw test host above does not hide that.
+#[test]
+fn a_heap_buffer_read_by_element_through_the_runtimes_structured_view() {
+    read_by_element(Stride::StructuredDesc(12));
+}
+
+fn read_by_element(stride: Stride) {
     let shader = build(
         HEAP_ELEMENT_WAVE32,
         vec![
@@ -242,7 +258,7 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         View::RawUav(32),
         View::Buffer {
             data: &data,
-            stride: Stride::Structured(12),
+            stride,
         },
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME

@@ -1260,6 +1260,12 @@ pub enum Stride {
     /// Structured elements of this many bytes. Translated shaders read a raw
     /// view. Native PC shaders use their declared structure stride.
     Structured(u32),
+    /// A structured view of elements of this many bytes, whoever reads it:
+    /// what the runtime makes today from a title's structured descriptor
+    /// (`victory-gpu`, `descriptor::host::buffer_srv` keeps its
+    /// `StructureByteStride`). NVIDIA reads it by its own stride under a
+    /// translated byte-addressed load (#1835).
+    StructuredDesc(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
 }
@@ -1645,6 +1651,12 @@ impl Host {
                         let b = upload(data)?;
                         let (format, elements, stride, flags) = match stride {
                             Stride::Structured(bytes) if native_pc => (
+                                DXGI_FORMAT_UNKNOWN,
+                                data.len() * 4 / bytes as usize,
+                                bytes,
+                                D3D12_BUFFER_SRV_FLAG_NONE,
+                            ),
+                            Stride::StructuredDesc(bytes) => (
                                 DXGI_FORMAT_UNKNOWN,
                                 data.len() * 4 / bytes as usize,
                                 bytes,
