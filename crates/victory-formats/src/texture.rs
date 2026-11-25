@@ -613,11 +613,10 @@ impl Layout {
         depth_pitch: usize,
     ) -> Result<(), Error> {
         self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |runs, t, l| {
-            let from = &tiled[t..][..runs.span];
-            let to = &mut linear[l..][..runs.bytes];
-            // SAFETY: the row's runs lie in its `span` tiled bytes and its
-            // `bytes` linear bytes, both just bounds-checked.
-            unsafe { runs.copy::<true>(from.as_ptr(), to.as_mut_ptr()) };
+            runs.copy::<true>(
+                &tiled[t..][..runs.span],
+                &mut linear[l..][..runs.bytes],
+            );
         })
     }
 
@@ -632,10 +631,10 @@ impl Layout {
         depth_pitch: usize,
     ) -> Result<(), Error> {
         self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |runs, t, l| {
-            let from = &linear[l..][..runs.bytes];
-            let to = &mut tiled[t..][..runs.span];
-            // SAFETY: as in `detile`.
-            unsafe { runs.copy::<false>(from.as_ptr(), to.as_mut_ptr()) };
+            runs.copy::<false>(
+                &linear[l..][..runs.bytes],
+                &mut tiled[t..][..runs.span],
+            );
         })
     }
 
@@ -690,10 +689,12 @@ impl Layout {
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
-        let mut runs = Vec::new();
-        if linear {
-            runs.push((0, 0, bytes));
+        let runs = if linear {
+            // One run, the row: kept inline (no list to allocate for small
+            // linear textures, copied a few hundred bytes at a time).
+            Runs::one(bytes)
         } else {
+            let mut runs = Vec::new();
             let mut first_linear = 0;
             let mut first_tiled = self.column(m, 0) as usize;
             for x in 1..m.width {
@@ -706,8 +707,8 @@ impl Layout {
                 }
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
-        }
-        let runs = Runs::new(runs, bytes);
+            Runs::new(runs, bytes)
+        };
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -730,7 +731,10 @@ impl Layout {
 /// row's `span` tiled bytes and its `bytes` linear bytes, so a row is
 /// bounds-checked once and its runs copied without checks.
 struct Runs {
+    /// The runs, unless there is one ([`Runs::one`]).
     runs: Vec<(usize, usize, usize)>,
+    /// The run, where it is the only one.
+    one: (usize, usize, usize),
     /// The length every run but the last has, if they share one: a mip can
     /// end partway through its last run.
     len: Option<usize>,
@@ -752,21 +756,62 @@ impl Runs {
         assert!(runs.iter().all(|&(_, l, len)| l + len <= bytes));
         Runs {
             runs,
+            one: (0, 0, 0),
             len,
             span,
             bytes,
         }
     }
 
+    /// A single run of the whole row, at the start of both sides (a linear
+    /// layout's rows).
+    fn one(bytes: usize) -> Runs {
+        Runs {
+            runs: Vec::new(),
+            one: (0, 0, bytes),
+            len: None,
+            span: bytes,
+            bytes,
+        }
+    }
+
+    /// The runs, as (offset in the tiled row, offset in the linear row,
+    /// length).
+    fn list(&self) -> &[(usize, usize, usize)] {
+        if self.runs.is_empty() {
+            std::slice::from_ref(&self.one)
+        } else {
+            &self.runs
+        }
+    }
+
     /// Copies a row's runs: tiled to linear if `DETILE`, else linear to
-    /// tiled.
-    ///
-    /// # Safety
-    /// `from` and `to` are the row's bytes, not overlapping: `span` of the
-    /// tiled side, `bytes` of the linear side.
-    unsafe fn copy<const DETILE: bool>(&self, from: *const u8, to: *mut u8) {
-        let (body, last) = self.runs.split_at(self.runs.len() - 1);
-        // SAFETY: the caller's.
+    /// tiled. `from` and `to` are the row's bytes: `span` of the tiled
+    /// side, `bytes` of the linear side (checked here, once per row; the
+    /// runs then need no checks).
+    fn copy<const DETILE: bool>(&self, from: &[u8], to: &mut [u8]) {
+        let (tiled, linear) = if DETILE {
+            (from.len(), to.len())
+        } else {
+            (to.len(), from.len())
+        };
+        assert!(
+            tiled == self.span && linear == self.bytes,
+            "a row of {tiled} tiled and {linear} linear bytes, its runs need {} and {}",
+            self.span,
+            self.bytes
+        );
+        if self.runs.is_empty() {
+            // One run, the whole row on both sides (`Runs::one`).
+            to.copy_from_slice(from);
+            return;
+        }
+        let runs = self.list();
+        let (body, last) = runs.split_at(runs.len() - 1);
+        let (from, to) = (from.as_ptr(), to.as_mut_ptr());
+        // SAFETY: every run lies in `span` tiled bytes and `bytes` linear
+        // bytes (`Runs::new`), the lengths of the two rows (just checked),
+        // which do not overlap (a shared and an exclusive borrow).
         unsafe {
             match self.len {
                 Some(8) => copy_runs::<8, DETILE>(body, from, to),
@@ -1072,6 +1117,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Rows copied at their bounds: linear memory exactly as long as its last
+    /// row's bytes (no slack past it), tiled memory exactly the layout's
+    /// size, rows whose last run is shorter than the others (the mip ends
+    /// partway through it), pitch padding between rows left alone, and
+    /// tiled bytes outside the subresource left alone by `tile`.
+    #[test]
+    fn rows_are_copied_exactly_at_their_bounds() {
+        let mut partial = false;
+        for d in [
+            desc(33, 17, 6, 1, Swizzle::SW_4KB_D),
+            desc(83, 31, 6, 1, Swizzle::SW_256B_S),
+            desc(100, 60, 7, 4, Swizzle::SW_64KB_D),
+            desc(30, 20, 5, 4, Swizzle::LINEAR),
+            desc(5, 3, 1, 4, Swizzle::LINEAR),
+        ] {
+            let l = Layout::new(&d).unwrap();
+            let n = d.element_bytes as usize;
+            for mip in 0..d.mips {
+                let m = l.mips[mip as usize];
+                let active = m.width as usize * n;
+                let row = active + 7;
+                let len = (m.height as usize - 1) * row + active;
+                let linear: Vec<u8> = (0..len).map(|i| (i * 11 + 3) as u8).collect();
+                // What tile writes: this subresource's bytes, nothing else.
+                let mut tiled = vec![0x5a; l.size as usize];
+                l.tile(&mut tiled, mip, 0, &linear, row, len).unwrap();
+                let mut mine = vec![false; tiled.len()];
+                for y in 0..m.height {
+                    for x in 0..m.width {
+                        let at = l.offset(mip, x, y, 0).unwrap() as usize;
+                        mine[at..at + n].fill(true);
+                    }
+                }
+                assert!(
+                    tiled.iter().zip(&mine).all(|(&b, &m)| m || b == 0x5a),
+                    "{d:?} mip {mip}: tile wrote outside its subresource"
+                );
+                let mut back = vec![0xcc; len];
+                l.detile(&tiled, mip, 0, &mut back, row, len).unwrap();
+                for y in 0..m.height as usize {
+                    let start = y * row;
+                    assert_eq!(back[start..start + active], linear[start..start + active]);
+                    if y + 1 < m.height as usize {
+                        assert!(back[start + active..start + row].iter().all(|&b| b == 0xcc));
+                    }
+                }
+                l.walk(tiled.len(), mip, 0, len, row, len, |runs, _, _| {
+                    let list = runs.list();
+                    let last = list.last().unwrap().2;
+                    partial |= list.len() > 1 && last < list[0].2;
+                })
+                .unwrap();
+            }
+        }
+        assert!(partial, "some row ends in a shorter run");
     }
 
     /// Hand-checked: in a 64 KiB `D` block of 4-byte elements, x bits go to
@@ -1426,4 +1528,3 @@ mod tests {
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
     }
 }
-
