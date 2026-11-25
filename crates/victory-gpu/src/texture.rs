@@ -630,6 +630,25 @@ impl Staging {
             return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
         }
         if !committed(self.memory, size) {
+            // A streamed texture's smaller mips (at the start of its memory)
+            // can be there before the larger ones: those are detiled from
+            // the bytes they take and uploaded, the rest keep what they hold.
+            if let Some(first) = first_resident_mip(&self.layout, self.memory) {
+                let len = self.layout.bytes_from(first) as usize;
+                // SAFETY: committed memory, `len` bytes from the texture's start.
+                let tiled = unsafe { std::slice::from_raw_parts(self.memory, len) };
+                let hash = blake3::hash(tiled);
+                if last.hash == Some(hash) {
+                    return (len, None);
+                }
+                let resident: Vec<u32> = all()
+                    .into_iter()
+                    .filter(|i| i % self.mips >= first)
+                    .collect();
+                let buffer = self.detile(tiled, &resident);
+                last.hash = buffer.is_some().then_some(hash);
+                return (len, buffer.map(|(b, at)| (b, at, resident)));
+            }
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -747,6 +766,23 @@ fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64)
     padded.min(remaining)
 }
 
+/// The largest mip from which on a texture whose memory is not all committed
+/// has every byte its mips take committed (`None`: not even its smallest
+/// mip, or a layout whose slices each hold a whole chain).
+fn first_resident_mip(layout: &victory_formats::texture::Layout, memory: *const u8) -> Option<u32> {
+    let size = layout.size;
+    let mips = layout.desc.mips;
+    // Most textures not there at all fail at their smallest mip.
+    let smallest = layout.bytes_from(mips.checked_sub(1)?);
+    if smallest >= size || !committed(memory, smallest as usize) {
+        return None;
+    }
+    (1..mips).find(|&m| {
+        let len = layout.bytes_from(m);
+        len < size && committed(memory, len as usize)
+    })
+}
+
 /// Whether `[at, at + len)` is committed, readable memory (streamed textures
 /// may be unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
@@ -852,6 +888,47 @@ mod tests {
         assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
         assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
         assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    /// 1024x1024 BC1 in 4 KiB blocks with only its smallest mips' blocks
+    /// committed: they are the resident ones; with nothing committed, none.
+    #[test]
+    fn a_texture_with_only_its_small_mips_committed_reads_them() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 1024,
+            height: 1024,
+            depth: 1,
+            mips: 9,
+            element_bytes: 8,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        })
+        .unwrap();
+        let size = layout.size as usize;
+        // SAFETY: a private reservation for the test, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        assert_eq!(first_resident_mip(&layout, base.cast()), None);
+        for first in [4, 3, 2, 1] {
+            let len = layout.bytes_from(first) as usize;
+            // SAFETY: commits the start of our reservation.
+            let at = unsafe { VirtualAlloc(base, len, MEM_COMMIT, PAGE_READWRITE) };
+            assert_eq!(at, base);
+            assert_eq!(
+                first_resident_mip(&layout, base.cast()),
+                Some(first),
+                "{len} bytes"
+            );
+        }
+        // SAFETY: freeing the reservation above.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 
     #[test]
