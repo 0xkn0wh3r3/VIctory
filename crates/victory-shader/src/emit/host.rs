@@ -1784,6 +1784,19 @@ impl Host {
         self.dispatch_with_views(root, pso, d, true)
     }
 
+    /// [`Host::dispatch`] `repeat` times more after a first one (UAV
+    /// barriers between them), and the GPU's time per repeated dispatch in
+    /// ms (timestamps around them).
+    pub fn dispatch_timed(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        repeat: u32,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
+        self.dispatch_repeated(root, pso, d, false, repeat.max(1))
+    }
+
     fn dispatch_with_views(
         &self,
         root: &ID3D12RootSignature,
@@ -1791,6 +1804,19 @@ impl Host {
         d: &Dispatch,
         native_pc: bool,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_repeated(root, pso, d, native_pc, 0)
+            .map(|(out, _)| out)
+    }
+
+    /// The dispatch, then `repeat` more timed (none: untimed, 0 ms).
+    fn dispatch_repeated(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        native_pc: bool,
+        repeat: u32,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -2377,6 +2403,41 @@ impl Host {
             }
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
+            let stamps = if repeat > 0 {
+                let heap: ID3D12QueryHeap = {
+                    let mut h: Option<ID3D12QueryHeap> = None;
+                    dev.CreateQueryHeap(
+                        &D3D12_QUERY_HEAP_DESC {
+                            Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                            Count: 2,
+                            NodeMask: 0,
+                        },
+                        &mut h,
+                    )
+                    .map_err(err)?;
+                    h.ok_or_else(|| "no query heap".to_string())?
+                };
+                let rb = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buffer(16, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                let barrier = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    ..Default::default()
+                };
+                list.ResourceBarrier(std::slice::from_ref(&barrier));
+                list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                for _ in 0..repeat {
+                    list.Dispatch(x, y, z);
+                    list.ResourceBarrier(std::slice::from_ref(&barrier));
+                }
+                list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &rb, 0);
+                Some((heap, rb))
+            } else {
+                None
+            };
             for (r, size, n, rb) in &uavs {
                 list.ResourceBarrier(&[transition(
                     r,
@@ -2428,8 +2489,18 @@ impl Host {
                 rb.Unmap(0, None);
                 out.push(words);
             }
+            let mut ms = 0.0;
+            if let Some((_, rb)) = &stamps {
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).map_err(err)?;
+                let t = std::slice::from_raw_parts(p.cast::<u64>(), 2);
+                let ticks = t[1].saturating_sub(t[0]) as f64;
+                rb.Unmap(0, None);
+                let frequency = queue.GetTimestampFrequency().map_err(err)? as f64;
+                ms = ticks / frequency * 1e3 / f64::from(repeat);
+            }
             drop(keep);
-            Ok(out)
+            Ok((out, ms))
         }
     }
 }
