@@ -13,33 +13,9 @@ use victory_loader::{UnimplementedPolicy, prepare};
 /// Checks VIctory is known to answer differently from the public reference,
 /// each with why: reported, not failed. A check here that passes fails the
 /// test, so the list stays true.
-const KNOWN: &[(&str, &str)] = &[
-    (
-        "xasync: an async call with no queue and no process queue is E_NO_TASK_QUEUE",
-        "VIctory runs the call anyway; XTaskQueueSetCurrentProcessTaskQueue's \
-         page says APIs needing a queue then fail with E_NO_TASK_QUEUE",
-    ),
-    (
-        "xsystem: a retail console id is the documented zero id",
-        "VIctory returns 38 digits ending in 1; the reference gives \
-         00000000.00000000.00000000.00000000.00 for retail and PC",
-    ),
-    (
-        "dstorage: a queue filled to half its capacity is not submitted on its own",
-        "VIctory submits once half the capacity is enqueued; the overview \
-         says an Enqueue that fills more than half submits",
-    ),
-    (
-        "xuser: XUserFindUserByLocalId of no user is HRESULT_FROM_WIN32(ERROR_NOT_FOUND)",
-        "VIctory returns E_GAMEUSER_USER_NOT_FOUND (0x89245104); the \
-         XUserFindUserByLocalId page gives HRESULT_FROM_WIN32(ERROR_NOT_FOUND)",
-    ),
-    (
-        "xuser: an invalid gamertag component is E_INVALIDARG",
-        "VIctory answers any component other than ModernSuffix with the \
-         gamertag; the XUserGetGamertag page gives E_INVALIDARG",
-    ),
-];
+// Empty on demo: the five divergences the suite's PR (#2057) lists are fixed
+// by #2072, #2073, #2074, #2075 and #1717, all merged here.
+const KNOWN: &[(&str, &str)] = &[];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
