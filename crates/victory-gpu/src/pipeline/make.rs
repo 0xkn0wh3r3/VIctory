@@ -14,6 +14,14 @@
 //! Pipelines a draw waits for go ahead of those started early (at the
 //! title's creation, because an earlier run drew them).
 //!
+//! A pipeline that cannot get a host pipeline whatever its shaders
+//! translate to (unsupported stages), or one of whose shaders has failed
+//! to translate already, is neither queued nor waited for: its draws are
+//! dropped at once rather than wait for the workers behind the rest. While
+//! the overlay turns console shaders off (`crate::overlay`), every draw and
+//! dispatch is dropped that way and the workers take nothing from their
+//! queues; turned on again, the next use queues a pipeline as before.
+//!
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
@@ -102,27 +110,41 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
     key.finalize().to_hex()[..32].to_owned()
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Why a pipeline has no host pipeline (diagnostics): console shaders
+/// are off, else its shaders that do not translate, else "refused" or
+/// "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
-    match p.made.get() {
-        Some(Some(_)) => None,
-        None => Some("being made".into()),
-        Some(None) => {
-            let failed: Vec<String> = p
-                .shaders
-                .iter()
-                .filter(|s| matches!(s.translated.get(), Some(None)))
-                .map(|s| format!("{} {}", s.stage, s.hash))
-                .collect();
-            Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
-            } else {
-                failed.join(" + ")
-            })
-        }
+    if crate::overlay::console_shaders_off() {
+        return Some("console shaders off".into());
     }
+    if let Some(Some(_)) = p.made.get() {
+        return None;
+    }
+    let failed: Vec<String> = p
+        .shaders
+        .iter()
+        .filter(|s| matches!(s.translated.get(), Some(None)))
+        .map(|s| format!("{} {}", s.stage, s.hash))
+        .collect();
+    Some(match p.made.get() {
+        _ if !failed.is_empty() => failed.join(" + "),
+        None => "being made".into(),
+        Some(_) => format!("refused {:?}", p.shaders),
+    })
+}
+
+/// Whether `p` cannot get a host pipeline, as known without translating
+/// or compiling anything: unsupported stages (logged once per reason), or
+/// a shader that has failed to translate (logged once, by the shader).
+fn unavailable(p: &Pending) -> bool {
+    if let Some(reason) = super::host::unsupported(&p.shaders) {
+        super::host::refuse(reason, &p.shaders);
+        return true;
+    }
+    p.shaders
+        .iter()
+        .any(|s| matches!(s.translated.get(), Some(None)))
 }
 
 /// Logs the library name of the host pipeline this thread just made or
@@ -173,8 +195,22 @@ pub(crate) fn waiting() -> u64 {
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
+/// queues it on first use. `None` at once while console shaders are off.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    ready_unless(p, crate::overlay::console_shaders_off())
+}
+
+/// [`ready`], with console shaders `off` or not.
+fn ready_unless(p: &Arc<Pending>, off: bool) -> Option<&HostPipeline> {
+    if off {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "console shaders are off: draws and dispatches are dropped (logged once)"
+            );
+        }
+        return None;
+    }
     // Listed for an early start in later runs from its first use, made or
     // not: one a run never got made is the one it should start early.
     if !p.used.swap(true, Ordering::Relaxed) {
@@ -183,6 +219,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         log("used", &p.key, String::new);
     }
     if p.made.get().is_none() {
+        if unavailable(p) {
+            // A worker that has it queued finds it made.
+            let _ = p.made.set(None);
+            return None;
+        }
         start(p, true);
         wait(p, crate::frame::current());
     }
@@ -224,7 +265,7 @@ fn enqueue(p: &Pending, now: bool) -> Option<bool> {
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     super::library::note_created(&p.key);
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) && !unavailable(p) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, false);
     }
@@ -302,14 +343,17 @@ fn work() {
         let p = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
+                let off = crate::overlay::console_shaders_off();
+                if let Some(p) = next(&mut queues, off) {
                     break p;
                 }
+                // While console shaders are off, looks again shortly.
+                let rest = Duration::from_millis(if off { 100 } else { 20_000 });
                 let (held, waited) = work
-                    .wait_timeout(queues, Duration::from_secs(20))
+                    .wait_timeout(queues, rest)
                     .unwrap_or_else(|e| e.into_inner());
                 queues = held;
-                if waited.timed_out() {
+                if waited.timed_out() && !off {
                     drop(queues);
                     super::library::save(false);
                     queues = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -326,6 +370,15 @@ fn work() {
             super::library::save(false);
         }
     }
+}
+
+/// The next pipeline for a worker, those draws wait for first; none while
+/// console shaders are `off` (they stay queued).
+fn next(queues: &mut [VecDeque<Arc<Pending>>; 2], off: bool) -> Option<Arc<Pending>> {
+    if off {
+        return None;
+    }
+    queues.iter_mut().find_map(VecDeque::pop_front)
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -370,17 +423,70 @@ mod tests {
         WAITING.fetch_sub(3, Ordering::Relaxed);
     }
 
+    /// A compute shader whose container is not one: it fails to translate.
+    fn broken(tag: &[u8]) -> Arc<Shader> {
+        Arc::new(Shader::new(
+            "compute",
+            &[b"not a container ".as_slice(), tag].concat(),
+        ))
+    }
+
     /// A first use queues the pipeline and, within the budget, gets the
-    /// worker's answer (here: no host pipeline for no shaders).
+    /// worker's answer (here: no host pipeline, its shader does not
+    /// translate). Another pipeline with that shader is then dropped at
+    /// once, without the queue.
     #[test]
     fn first_use_is_made_by_a_worker() {
-        let p = Arc::new(Pending::new(Vec::new(), None));
-        assert!(ready(&p).is_none());
+        let shader = broken(b"first use");
+        let p = Arc::new(Pending::new(vec![shader.clone()], None));
+        assert!(ready_unless(&p, false).is_none());
         assert!(p.queued.load(Ordering::Relaxed));
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+        assert!(matches!(shader.translated.get(), Some(None)));
+        let q = Arc::new(Pending::new(vec![shader], None));
+        assert!(ready_unless(&q, false).is_none());
+        assert!(!q.queued.load(Ordering::Relaxed));
+        assert!(matches!(q.made.get(), Some(None)));
+    }
+
+    /// Stages that get no host pipeline whatever they translate to are not
+    /// queued, nor their shaders translated.
+    #[test]
+    fn unsupported_stages_are_not_queued() {
+        let geometry = Arc::new(Shader::new("geometry", b"geometry"));
+        let p = Arc::new(Pending::new(vec![geometry, broken(b"unsupported")], None));
+        assert!(ready_unless(&p, false).is_none());
+        assert!(!p.queued.load(Ordering::Relaxed));
+        assert!(p.shaders.iter().all(|s| s.translated.get().is_none()));
+        let none = Arc::new(Pending::new(Vec::new(), None));
+        assert!(ready_unless(&none, false).is_none());
+        assert!(!none.queued.load(Ordering::Relaxed));
+    }
+
+    /// While console shaders are off a draw neither queues its pipeline
+    /// nor translates its shaders, and workers take nothing from their
+    /// queues; turned on again, the next use queues it.
+    #[test]
+    fn console_shaders_off_makes_no_pipelines() {
+        let p = Arc::new(Pending::new(vec![broken(b"off")], None));
+        for _ in 0..3 {
+            assert!(ready_unless(&p, true).is_none());
+        }
+        assert!(!p.queued.load(Ordering::Relaxed));
+        assert!(!p.used.load(Ordering::Relaxed));
+        assert!(p.made.get().is_none());
+        assert!(p.shaders[0].translated.get().is_none());
+
+        let mut queues = [VecDeque::new(), VecDeque::from([p.clone()])];
+        assert!(next(&mut queues, true).is_none());
+        assert_eq!(queues[1].len(), 1);
+        assert!(next(&mut queues, false).is_some_and(|q| Arc::ptr_eq(&q, &p)));
+
+        let _ = ready_unless(&p, false);
+        assert!(p.queued.load(Ordering::Relaxed));
     }
 }
