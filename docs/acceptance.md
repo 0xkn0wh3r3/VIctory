@@ -131,6 +131,42 @@ with synthetic data that compresses about 3.5:1; on an RTX 5070 Ti machine
 in), far above the console's 2.0 GB/s raw minimum and 4.8 GB/s decompressed,
 because no storage is read. File sources and BCPack come next.
 
+The GPU frame (step 3, first part): `the_gpu_frame_matches_warp` has the
+title draw a scene through the console's D3D12 (`d3d12_xs.dll`) as a title
+does, from the device's method slots: device, queue, two allocators and
+lists, a fence, descriptor heaps (views, sampler, render target, depth),
+root signatures serialised by `D3D12SerializeRootSignature`, a graphics
+pipeline from a stream (input layout, rasterizer, depth, formats) and a
+compute pipeline. Their shaders are GFX10 programs assembled by hand from
+AMD's RDNA2 ISA guide (`tests/fixtures/conformance/src/gfx10.rs`), in the
+container layout VIctory reads: a vertex shader transforming position and
+normal by per-draw and per-frame constants, a pixel shader with diffuse and
+specular (Blinn-Phong) lighting from constant buffers times a texture
+sampled with linear filtering, and an 8 x 8 compute pass blurring the frame
+into a texture and a buffer. Vertex, index and constant buffers are in
+title memory, the texture is uploaded with `CopyTextureRegion`, the frame
+has a depth buffer, four indexed draws (ground, a glowing pyramid, two
+cubes, one hiding part of the pyramid), the dispatch, then a copy to a
+read-back buffer. The harness draws the same scene
+(`tests/fixtures/conformance/src/scene.rs`, shared) natively on WARP from
+equivalent HLSL; the title checks its frame against that (each channel
+within 4/255 but on at most 0.1% of pixels, mean under 0.5/255) and pixels
+exact by construction: the clear colour, the pyramid's emitted colour, and
+the cube where it hides the pyramid. 37 checks, all pass, on an RTX 5070 Ti
+(147,456 pixels: 91% identical to WARP's, the rest 1/255 off) and with
+VIctory itself on WARP (`--features diagnostics`, `VICTORY_D3D12_WARP=1`:
+every pixel identical). `VICTORY_CONFORMANCE_WINDOW=<seconds>` then
+presents the frame, animated, with `PresentX` in VIctory's window for that
+long; `VICTORY_CONFORMANCE_DUMP=<folder>` saves both frames as PPM images.
+
+Seen while writing it: a render target cannot be read back by a copy
+(VIctory does not copy textures to buffers yet), so the frame is read back
+through the compute pass's buffer; a view description the host refuses
+(a wrong field in the title's) removes the host device instead of failing
+that one view; and in this harness title memory lies above 40 bits (no
+allocation hooks), which VIctory warns about. Wave64 programs (split on
+32-lane hosts) are not in the frame yet.
+
 ## Build order
 
 1. The conformance title and its harness: a test registry, TAP output, a
