@@ -2460,7 +2460,11 @@ fn fill_pool() -> Option<&'static std::sync::mpsc::Sender<Box<dyn FnOnce() + Sen
                     loop {
                         let job = receive.lock().unwrap_or_else(|e| e.into_inner()).recv();
                         match job {
-                            Ok(job) => job(),
+                            // A share that panics is counted done
+                            // (`ShareDone`); the thread takes the next.
+                            Ok(job) => {
+                                drop(std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)))
+                            }
                             Err(_) => return,
                         }
                     }
@@ -2470,6 +2474,20 @@ fn fill_pool() -> Option<&'static std::sync::mpsc::Sender<Box<dyn FnOnce() + Sen
         (started > 0).then_some(send)
     })
     .as_ref()
+}
+
+/// Shares of a fill run left, and the wake-up when none is: one fewer when
+/// dropped.
+struct ShareDone(std::sync::Arc<(Mutex<usize>, std::sync::Condvar)>);
+
+impl Drop for ShareDone {
+    fn drop(&mut self) {
+        let mut n = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+        *n -= 1;
+        if *n == 0 {
+            self.0.1.notify_all();
+        }
+    }
 }
 
 /// Fills a thread takes at least: fewer are not worth one.
@@ -2516,14 +2534,15 @@ fn run_fills(fills: &[Fill], workers: usize) -> usize {
             *left.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
             let (chunk, left) = (chunk.to_vec(), left.clone());
             let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+                // Counted done when dropped: after the share, or while a
+                // panic in it unwinds (the submitting thread waits on it).
+                let _done = ShareDone(left);
                 chunk.into_iter().for_each(Fill::run);
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
             });
-            let _ = pool.send(job);
+            if let Err(std::sync::mpsc::SendError(job)) = pool.send(job) {
+                // No pool thread left: the share is done here.
+                job();
+            }
         }
         mine.iter().copied().for_each(Fill::run);
         let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -2571,6 +2590,25 @@ mod fill_tests {
             assert_eq!(parallel, input);
             assert_eq!(parallel, serial);
         }
+    }
+
+    /// A share that panics still counts as done: the thread waiting for
+    /// the run's shares is woken.
+    #[test]
+    fn a_panicking_share_counts_as_done() {
+        let left = std::sync::Arc::new((Mutex::new(1usize), std::sync::Condvar::new()));
+        let done = ShareDone(left.clone());
+        let share = std::thread::spawn(move || {
+            let _done = done;
+            panic!("a share that fails");
+        });
+        assert!(share.join().is_err());
+        let n = left.0.lock().unwrap();
+        let (n, waited) = left
+            .1
+            .wait_timeout_while(n, std::time::Duration::from_secs(5), |n| *n > 0)
+            .unwrap();
+        assert_eq!((*n, waited.timed_out()), (0, false));
     }
 
     /// A run of fills ends at the first other step: a title copy between
