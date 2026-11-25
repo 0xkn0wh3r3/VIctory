@@ -6,16 +6,21 @@
 //!   and uploads before submissions), the GPU's, and pipeline waits, the
 //!   slowest timed commands and what the guard skipped.
 //! - The slow-pipeline guard: compute dispatches and mesh draws are timed
-//!   on the GPU (two timestamps each, `HostList::time_start`), and a
-//!   pipeline one of whose commands took longer than the limit
-//!   (`VICTORY_SLOW_PIPELINE_MS`, 100 ms) [`STRIKES`] times is not run any
-//!   more: its draws and dispatches are dropped, said once. A submission
-//!   cannot be stopped once it runs, and one the host takes 2 s for resets
-//!   the device; a frame of a second stalls the title's world. The work
-//!   the guard drops is the title's, so what it computes is missing (a
-//!   pass's effect, or what later passes read from it): visible, logged,
-//!   and better than a world stopped or lost. `VICTORY_SLOW_PIPELINES=0`
-//!   turns it off.
+//!   on the GPU (two timestamps each, `HostList::time_start`). A frame
+//!   (present to present) in which one of a pipeline's commands took
+//!   longer than the limit (`VICTORY_SLOW_PIPELINE_MS`, 100 ms) is one
+//!   strike for it, however many of its commands did; a frame in which
+//!   all of its timed commands kept to the limit clears its strikes. After
+//!   [`STRIKES`] over-limit frames in a row the pipeline is banned, said
+//!   once: draws and dispatches of it recorded from then on are dropped
+//!   (`State::bind`). Lists recorded before still hold its commands and
+//!   run them each time they are submitted again; submission does not
+//!   bind again. A submission cannot be stopped once it runs, and one the
+//!   host takes 2 s for resets the device; a frame of a second stalls the
+//!   title's world. The work the guard drops is the title's, so what it
+//!   computes is missing (a pass's effect, or what later passes read from
+//!   it): visible, logged, and better than a world stopped or lost.
+//!   `VICTORY_SLOW_PIPELINES=0` turns it off.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -25,7 +30,7 @@ use std::time::{Duration, Instant};
 /// Frames longer than this are reported (a frame at 30 a second is
 /// 33.3 ms; past this one has slipped).
 pub(crate) const REPORT: Duration = Duration::from_millis(50);
-/// Over-limit commands before a pipeline is not run any more.
+/// Over-limit frames in a row before a pipeline is banned.
 pub(crate) const STRIKES: u32 = 3;
 /// The limit for one command without `VICTORY_SLOW_PIPELINE_MS`.
 const LIMIT_MS: f64 = 100.0;
@@ -56,9 +61,9 @@ pub(crate) fn timing() -> bool {
 
 #[derive(Default)]
 struct State {
-    /// Over-limit commands per pipeline.
+    /// Over-limit frames in a row per pipeline (none: no strikes).
     strikes: HashMap<String, u32>,
-    /// Pipelines not run any more.
+    /// Pipelines whose draws and dispatches are dropped when recorded.
     banned: HashSet<String>,
     frame: Frame,
     /// The end of the last frame, and of the last report.
@@ -81,6 +86,9 @@ struct Frame {
     slowest: Vec<(f64, String)>,
     /// Draws and dispatches the guard dropped.
     skipped: u32,
+    /// The pipelines timed this frame while the guard is on (not banned
+    /// ones), each with its slowest command's ms.
+    timed: HashMap<String, f64>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -93,7 +101,8 @@ fn state<R>(f: impl FnOnce(&mut State) -> R) -> R {
 }
 
 /// Whether the guard dropped `pipeline` (and counts the draw or dispatch
-/// not run).
+/// not run). Asked while recording: commands already in a closed list
+/// run whenever it is submitted.
 pub(crate) fn skips(pipeline: &str) -> bool {
     if !ANY_BANNED.load(Ordering::Relaxed) {
         return false;
@@ -105,28 +114,52 @@ pub(crate) fn skips(pipeline: &str) -> bool {
     })
 }
 
-/// A timed command of `pipeline` took `ms` on the GPU.
+/// A timed command of `pipeline` took `ms` on the GPU. Strikes are
+/// counted when the frame ends ([`presented`]).
 pub(crate) fn ran(pipeline: &str, ms: f64) {
-    let (on, limit) = guard();
+    let (on, _) = guard();
     state(|s| {
         keep_slowest(&mut s.frame.slowest, ms, pipeline);
-        if !on || ms <= limit || s.banned.contains(pipeline) {
+        if !on || s.banned.contains(pipeline) {
             return;
         }
-        let strikes = s.strikes.entry(pipeline.to_owned()).or_default();
-        *strikes += 1;
-        if *strikes >= STRIKES {
-            tracing::warn!(
-                pipeline,
-                ms = format_args!("{ms:.0}"),
-                limit_ms = limit,
-                "a pipeline too slow on this host is not run any more \
-                 (VICTORY_SLOW_PIPELINES=0 keeps it): what it computes is missing"
-            );
-            s.banned.insert(pipeline.to_owned());
-            ANY_BANNED.store(true, Ordering::Relaxed);
+        match s.frame.timed.get_mut(pipeline) {
+            Some(slowest) => *slowest = slowest.max(ms),
+            None => {
+                s.frame.timed.insert(pipeline.to_owned(), ms);
+            }
         }
     });
+}
+
+/// A frame's strikes: one for each pipeline with a command over the limit,
+/// and none left for those whose timed commands all kept to it. A
+/// pipeline at [`STRIKES`] is banned. Leaves `timed` empty.
+fn strike(s: &mut State, timed: &mut HashMap<String, f64>) {
+    let (_, limit) = guard();
+    for (pipeline, ms) in timed.drain() {
+        if ms <= limit {
+            s.strikes.remove(&pipeline);
+            continue;
+        }
+        let strikes = s.strikes.entry(pipeline.clone()).or_default();
+        *strikes += 1;
+        if *strikes < STRIKES {
+            continue;
+        }
+        tracing::warn!(
+            pipeline,
+            ms = format_args!("{ms:.0}"),
+            limit_ms = limit,
+            frames = STRIKES,
+            "a pipeline too slow on this host is dropped from draws and dispatches \
+             recorded from now on; lists recorded before still run it \
+             (VICTORY_SLOW_PIPELINES=0 keeps it): what it computes is missing"
+        );
+        s.strikes.remove(&pipeline);
+        s.banned.insert(pipeline);
+        ANY_BANNED.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Keeps the [`SLOWEST`] slowest commands of a frame, slowest first.
@@ -156,7 +189,10 @@ pub(crate) fn waited(time: Duration) {
 pub(crate) fn presented() {
     let now = Instant::now();
     state(|s| {
-        let frame = std::mem::take(&mut s.frame);
+        let mut frame = std::mem::take(&mut s.frame);
+        strike(s, &mut frame.timed);
+        // The next frame keeps the map's room.
+        s.frame.timed = std::mem::take(&mut frame.timed);
         let Some(last) = s.last.replace(now) else {
             return;
         };
@@ -194,8 +230,8 @@ pub(crate) fn presented() {
 pub(crate) mod tests {
     use super::*;
 
-    /// The tests share the guard: one at a time.
-    static ONE: Mutex<()> = Mutex::new(());
+    /// The tests share the guard: one at a time (`crate::draw`'s too).
+    pub(crate) static ONE: Mutex<()> = Mutex::new(());
 
     /// Clears the guard and the frame (tests share the process).
     pub(crate) fn reset() {
@@ -203,22 +239,71 @@ pub(crate) mod tests {
         ANY_BANNED.store(false, Ordering::Relaxed);
     }
 
-    /// A pipeline is dropped after [`STRIKES`] over-limit commands, not
-    /// before, and only it.
-    #[test]
-    fn a_pipeline_over_the_limit_is_dropped_after_its_strikes() {
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    /// A frame in which `pipeline` ran commands of `ms` each.
+    pub(crate) fn frame(pipeline: &str, ms: &[f64]) {
+        for &ms in ms {
+            ran(pipeline, ms);
+        }
+        presented();
+    }
+
+    /// The guard's limit, after a reset; None where the guard is off.
+    fn start() -> Option<f64> {
         reset();
         let (on, limit) = guard();
-        if !on {
-            return; // VICTORY_SLOW_PIPELINES=0 here
-        }
+        on.then_some(limit) // else VICTORY_SLOW_PIPELINES=0 here
+    }
+
+    /// Commands over the limit in one frame are one strike, however many:
+    /// a pipeline is not banned in the frame its commands first ran slow.
+    #[test]
+    fn slow_commands_in_one_frame_are_one_strike() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(limit) = start() else {
+            return;
+        };
+        frame("[compute slow]", &[limit + 1.0; STRIKES as usize]);
+        assert!(!skips("[compute slow]"), "one frame, one strike");
+        reset();
+    }
+
+    /// A frame in which all of a pipeline's commands kept to the limit
+    /// clears its strikes (a one-off hitch does not add up), and frames in
+    /// which it did not run leave them.
+    #[test]
+    fn a_frame_within_the_limit_clears_the_strikes() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(limit) = start() else {
+            return;
+        };
+        let (slow, quick) = (limit + 1.0, limit / 2.0);
+        frame("[compute hitch]", &[slow]);
+        frame("[compute hitch]", &[quick, quick]);
         for _ in 0..STRIKES - 1 {
-            ran("[compute slow]", limit + 1.0);
+            frame("[compute hitch]", &[slow]);
+            frame("[compute other]", &[quick]);
         }
-        ran("[compute quick]", limit / 2.0);
-        assert!(!skips("[compute slow]"), "not before its strikes");
-        ran("[compute slow]", limit + 1.0);
+        assert!(!skips("[compute hitch]"), "slow, quick, slow, slow");
+        reset();
+    }
+
+    /// [`STRIKES`] over-limit frames in a row ban a pipeline at the end of
+    /// the last, not before, and only it; a frame counts as over the limit
+    /// if any of its commands was.
+    #[test]
+    fn slow_frames_in_a_row_ban_a_pipeline() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(limit) = start() else {
+            return;
+        };
+        let (slow, quick) = (limit + 1.0, limit / 2.0);
+        for _ in 0..STRIKES - 1 {
+            frame("[compute slow]", &[quick, slow, quick]);
+            frame("[compute quick]", &[quick]);
+        }
+        ran("[compute slow]", slow);
+        assert!(!skips("[compute slow]"), "not before the frame ends");
+        presented();
         assert!(skips("[compute slow]"));
         assert!(!skips("[compute quick]"));
         reset();
