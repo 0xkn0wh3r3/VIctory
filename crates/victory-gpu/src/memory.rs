@@ -22,7 +22,9 @@
 //! Cost per submission with such a list: one change check of every host
 //! copy (the refresh), copies of the pages the title wrote, a compare of
 //! each 64 KiB page shaders wrote, and the table's rewrite when copies came
-//! or went (two views per new copy); per list a bitmap of 256 KiB.
+//! or went (two views per new copy); per list a bitmap of 256 KiB, in
+//! video memory, which the list copies into read-back memory and clears at
+//! its end (about 12 µs on an RTX 5070 Ti; [`Marks`]).
 //!
 //! Memory no copy holds reads 0 and takes no writes (null views,
 //! bounds-checked); shaders mark such pages (or 256 MiB regions with no
@@ -455,18 +457,30 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     })
     .flatten()?;
     let bits = (CAPACITY + 1) * BLOCK;
-    let (bitmap, data) = crate::host::host()?.shared_buffer((bits / 8).next_multiple_of(256) as u64)?;
-    crate::host::name(&bitmap, || "title memory written pages".into());
+    let bytes = (bits / 8).next_multiple_of(256) as u64;
     let words = bits / 32;
-    // SAFETY: our mapped buffer of at least `words` dwords.
-    unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
-    // SAFETY: a live buffer.
-    let dirty = unsafe { bitmap.GetGPUVirtualAddress() };
-    list.keep(&bitmap);
+    // The bitmap in video memory, lent while the list lives; else in system
+    // memory, where each atomic crosses the bus.
+    let (dirty, data, lent) = match lend(bytes) {
+        Some(m) => {
+            list.mark_pages_in(&m.bitmap, &m.back, &m.zeros);
+            // SAFETY: a live buffer.
+            let dirty = unsafe { m.bitmap.GetGPUVirtualAddress() };
+            (dirty, m.data, Lent(Some(m)))
+        }
+        None => {
+            let (bitmap, data) = crate::host::host()?.shared_buffer(bytes)?;
+            crate::host::name(&bitmap, || "title memory written pages".into());
+            // SAFETY: our mapped buffer of at least `words` dwords.
+            unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
+            list.keep(&bitmap);
+            // SAFETY: a live buffer.
+            (unsafe { bitmap.GetGPUVirtualAddress() }, data as usize, Lent(None))
+        }
+    };
     list.defer_memory(key);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
-    let data = data as usize;
     list.defer_missed(move || {
         let l = layout(key);
         // SAFETY: the bitmap is mapped and the list's run is over.
@@ -479,9 +493,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         })
     });
     list.defer_after(move || {
+        // Back to the pool when the list's deferred work goes, at its reset.
+        let _lent = &lent;
         let Layout { copies, blocks, owner, .. } = &*layout(key);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the bitmap is mapped and the list's run is over.
+        // SAFETY: the bitmap (or the read-back memory the list copied it
+        // into) is mapped and the list's run is over. Taking its bits clears
+        // one in system memory; one in video memory the list cleared itself.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
@@ -543,6 +561,71 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         dirty,
         precise,
     })
+}
+
+/// A list's page bitmap in video memory, where its shaders' atomics stay on
+/// the card, the read-back buffer the list copies it into at its end
+/// (mapped at `data`), and the zeros it clears it from
+/// ([`HostList::mark_pages_in`]). Atomics on a bitmap in system memory cost
+/// dispatches up to 250 times their time without marks on an RTX 5070 Ti;
+/// in video memory nothing (`crate::marks_bench`).
+struct Marks {
+    bitmap: ID3D12Resource,
+    back: ID3D12Resource,
+    zeros: ID3D12Resource,
+    data: usize,
+}
+
+/// Bitmaps no list holds; a list gets one at its first use of title memory
+/// with a heap bound, and gives it back at its reset, cleared (each run
+/// ends clearing it; a list closed and never run never wrote it).
+static MARKS: Mutex<Vec<Marks>> = Mutex::new(Vec::new());
+
+/// A [`Marks`] a list holds, back to [`MARKS`] when its deferred work is
+/// dropped (at the list's reset or drop, after its last run).
+struct Lent(Option<Marks>);
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        if let Some(m) = self.0.take() {
+            MARKS.lock().unwrap_or_else(|e| e.into_inner()).push(m);
+        }
+    }
+}
+
+/// A bitmap of `bytes` in video memory from the pool, or made; None if the
+/// card has no room (the bitmap is then in system memory).
+fn lend(bytes: u64) -> Option<Marks> {
+    if std::env::var_os("VICTORY_MARKS_IN_SYSTEM").is_some_and(|v| v == "1") {
+        return None;
+    }
+    if let Some(m) = MARKS.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        return Some(m);
+    }
+    let host = crate::host::host()?;
+    let bitmap = host.uav_buffer(bytes)?;
+    crate::host::name(&bitmap, || "title memory written pages".into());
+    let (back, data) = host.readback_buffer(bytes)?;
+    let zeros = zeros(bytes)?;
+    Some(Marks {
+        bitmap,
+        back,
+        zeros,
+        data: data as usize,
+    })
+}
+
+/// `bytes` of zeros in upload memory, shared by every bitmap.
+fn zeros(bytes: u64) -> Option<ID3D12Resource> {
+    static ZEROS: Mutex<Option<ID3D12Resource>> = Mutex::new(None);
+    let mut zeros = ZEROS.lock().unwrap_or_else(|e| e.into_inner());
+    if zeros.is_none() {
+        let (buffer, data) = crate::host::host()?.upload_buffer(bytes)?;
+        // SAFETY: a mapped upload buffer of `bytes` bytes.
+        unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+        *zeros = Some(buffer);
+    }
+    zeros.clone()
 }
 
 #[cfg(test)]
@@ -895,5 +978,69 @@ void main() {
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+    }
+
+    /// Sets bit `n` of the bitmap at `u0`, as a shader's mark does.
+    const MARK: &str = r#"
+#define RS "UAV(u0), RootConstants(num32BitConstants=1, b0)"
+RWByteAddressBuffer dirty : register(u0);
+cbuffer c : register(b0) { uint n; }
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    dirty.InterlockedOr(n >> 5 << 2, 1u << (n & 31));
+}
+"#;
+
+    /// A page bitmap in video memory reaches the CPU after each run of its
+    /// list and starts the next clear: a list recorded again, or another
+    /// list it is lent to, sees its own run's marks only. Its pool gives it
+    /// back to the next list.
+    #[test]
+    fn page_marks_in_video_memory_reach_the_cpu_and_start_clear() {
+        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let bytes = (((CAPACITY + 1) * BLOCK) / 8).next_multiple_of(256) as u64;
+        let Some(m) = lend(bytes) else {
+            return; // VICTORY_MARKS_IN_SYSTEM=1, or no room
+        };
+        let (root, pso) = pipeline(MARK);
+        let list = host.new_list().unwrap();
+        let fresh = std::cell::Cell::new(true);
+        // Records marks of the bits `marks`, runs the list once and returns
+        // the first two words the CPU sees.
+        let run = |m: &Marks, marks: &[u32]| -> [u32; 2] {
+            if !fresh.replace(false) {
+                list.reset();
+            }
+            list.mark_pages_in(&m.bitmap, &m.back, &m.zeros);
+            // SAFETY: a live buffer.
+            let at = unsafe { m.bitmap.GetGPUVirtualAddress() };
+            for &n in marks {
+                // SAFETY: an open list, live objects of ours.
+                unsafe {
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetPipelineState(&pso);
+                    list.list.SetComputeRootUnorderedAccessView(0, at);
+                    list.list.SetComputeRoot32BitConstant(1, n, 0);
+                    list.list.Dispatch(1, 1, 1);
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the read-back memory the list copied the bitmap into.
+            unsafe { [0, 1].map(|k| (m.data as *const u32).add(k).read_volatile()) }
+        };
+        assert_eq!(run(&m, &[3, 33]), [1 << 3, 1 << 1]);
+        assert_eq!(run(&m, &[5]), [1 << 5, 0], "cleared at the end of the run before");
+        assert_eq!(run(&m, &[]), [0, 0]);
+        let bitmap: ID3D12Resource = m.bitmap.clone();
+        drop(Lent(Some(m)));
+        let again = lend(bytes).expect("from the pool");
+        assert_eq!(again.bitmap, bitmap, "the pool gives the bitmap back");
+        assert_eq!(run(&again, &[7]), [1 << 7, 0]);
+        drop(Lent(Some(again)));
     }
 }
