@@ -599,6 +599,20 @@ impl Lane {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
     }
 
+    /// The most entries the queue holds: one slot stays free, as the
+    /// console's count of empty slots says.
+    fn held(&self) -> usize {
+        self.capacity.max(2) - 1
+    }
+
+    /// Entries enqueued since the last submission that submit the queue:
+    /// more than half its capacity, as the console does. A queue that
+    /// cannot hold that many (capacity 2) submits once full, or the next
+    /// enqueue would wait forever.
+    fn submits_at(&self) -> usize {
+        (self.capacity / 2 + 1).min(self.held())
+    }
+
     /// Writes the status entries whose earlier reads have all finished.
     fn flush(&mut self) {
         while let Some(&(seq, _)) = self.statuses.front() {
@@ -739,7 +753,8 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 }
 
 /// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// submits on its own once more than half of it is enqueued, as the
+/// console does.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -751,8 +766,7 @@ fn queue(this: QueueRef, command: Command) {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
             return; // closed: dropped (a status releases its array)
         };
-        // One slot stays free, as the console's count of empty slots says.
-        if lane.entries() + 1 < lane.capacity.max(2) {
+        if lane.entries() < lane.held() {
             break;
         }
         lanes = scheduler
@@ -764,7 +778,7 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if lane.unsubmitted.len() >= lane.submits_at() {
         lanes.submit(id);
         scheduler.work.notify_all();
     }
@@ -985,10 +999,11 @@ fn into_destination(
     }
     // Page number 0 is no page (numbers start at 0x10_0000): a list naming
     // it is one the title has not filled yet. The title writes a request's
-    // page list after enqueueing it, and a queue half full is submitted on
-    // its own, so a read can start first. Read the list again for a few
-    // milliseconds before failing: the title never looks at a request's
-    // result, so a failed one is a model or texture left unwritten.
+    // page list after enqueueing it, and a queue more than half full is
+    // submitted on its own, so a read can start first. Read the list again
+    // for a few milliseconds before failing: the title never looks at a
+    // request's result, so a failed one is a model or texture left
+    // unwritten.
     if pages.contains(&0) {
         for _ in 0..LATE_LIST_TRIES {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1272,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn half_a_queue_submits_itself() {
+    fn more_than_half_a_queue_submits_itself() {
         let (_dir, file) = file_with(&pattern(64));
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
@@ -1285,12 +1300,43 @@ mod tests {
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        let array = status_array(1);
+        let array = status_array(2);
         let mut out = [0u8; 16];
         enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
-        enqueue_status(queue, array, 0); // the second of four: no submit needed
+        enqueue_status(queue, array, 0); // two of four: half, not submitted
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(result(array, 0), E_PENDING);
+        enqueue_status(queue, array, 1); // three of four: submitted
         assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(wait(array, 1), S_OK);
         assert_eq!(out, pattern(64)[8..24]);
+    }
+
+    #[test]
+    fn a_full_queue_has_submitted_itself() {
+        // (capacity, entries held, entries that submit)
+        let expected = [
+            (0, 1, 1),
+            (1, 1, 1),
+            (2, 1, 1),
+            (3, 2, 2),
+            (4, 3, 3),
+            (8, 7, 5),
+        ];
+        for (capacity, held, submits_at) in expected {
+            let lane = Lane::new(0, capacity);
+            assert_eq!(
+                (lane.held(), lane.submits_at()),
+                (held, submits_at),
+                "{capacity}"
+            );
+        }
+        // A queue blocks once it holds `held` entries: those enqueued since
+        // the last submission must have been submitted by then.
+        for capacity in 0..=1024 {
+            let lane = Lane::new(0, capacity);
+            assert!(lane.submits_at() <= lane.held(), "{capacity}");
+        }
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
