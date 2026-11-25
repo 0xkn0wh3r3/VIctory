@@ -105,8 +105,8 @@ Covered so far: runtime initialisation, task queues and async calls,
 system information, physical-page aliasing, DirectStorage (memory and file
 sources), game saves, the user, networking hints, the package, HDR mode,
 files on the console's `G:` and `T:` drives through every path import
-VIctory binds, and persistent local storage: 143 checks, 139 pass. The
-four divergences found:
+VIctory binds, and persistent local storage: 152 checks, 147 pass. The
+five divergences found:
 
 | Check | Reference | VIctory |
 |---|---|---|
@@ -114,6 +114,7 @@ four divergences found:
 | DirectStorage automatic submission | when an Enqueue fills more than half the capacity | at half the capacity |
 | `XUserFindUserByLocalId`, no such user | `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)` | `E_GAMEUSER_USER_NOT_FOUND` (0x89245104) |
 | `XUserGetGamertag`, invalid component | `E_INVALIDARG` | the gamertag |
+| Async call with no queue, process queue set to nullptr | fails with `E_NO_TASK_QUEUE` | runs the call |
 
 Gaps seen while writing them (documented features VIctory's tables leave
 unimplemented, not yet tested): DirectStorage cancel by tag and the error

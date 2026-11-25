@@ -27,7 +27,11 @@ const E_ABORT: Hresult = 0x8000_4004_u32 as i32;
 // XTaskQueueDispatchMode and XTaskQueuePort.
 const MANUAL: u32 = 0;
 const THREAD_POOL: u32 = 1;
+const SERIALIZED_THREAD_POOL: u32 = 2;
 const IMMEDIATE: u32 = 3;
+/// E_NO_TASK_QUEUE (reference/errorcodes).
+const E_NO_TASK_QUEUE: Hresult = 0x8007_01AB_u32 as i32;
+const E_INVALIDARG: Hresult = 0x8007_0057_u32 as i32;
 const WORK: u32 = 0;
 const COMPLETION: u32 = 1;
 
@@ -88,6 +92,27 @@ unsafe extern "system" {
 struct Api(Object);
 
 impl Api {
+    fn port(&self, q: Queue, port: u32) -> *mut c_void {
+        let mut out = std::ptr::null_mut();
+        // SAFETY: (these methods) the slot's signature in VIctory's table.
+        let f: extern "system" fn(*mut c_void, Queue, u32, *mut *mut c_void) -> Hresult =
+            unsafe { self.0.method(0x70) };
+        f(self.0.this(), q, port, &mut out);
+        out
+    }
+    fn composite(&self, work: *mut c_void, completion: *mut c_void) -> Result<Queue, Hresult> {
+        let mut q = std::ptr::null_mut();
+        let f: extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *mut Queue) -> Hresult =
+            unsafe { self.0.method(0x68) };
+        match f(self.0.this(), work, completion, &mut q) {
+            S_OK => Ok(q),
+            hr => Err(hr),
+        }
+    }
+    fn set_process_queue(&self, q: Queue) {
+        let f: extern "system" fn(*mut c_void, Queue) = unsafe { self.0.method(0xd0) };
+        f(self.0.this(), q)
+    }
     fn create(&self, work: u32, completion: u32) -> Result<Queue, Hresult> {
         let mut q = std::ptr::null_mut();
         // SAFETY: (all methods) the slot's signature in VIctory's table.
@@ -465,6 +490,7 @@ pub fn run(t: &mut Tap) {
     }
 
     async_calls(t);
+    edges(t);
 }
 
 static OPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -621,4 +647,146 @@ fn async_calls(t: &mut Tap) {
         || format!("ops {ops:?}"),
     );
     a.close(q);
+}
+
+/// Counts callbacks running at once (and the most seen).
+#[derive(Default)]
+struct Overlap {
+    running: AtomicU32,
+    most: AtomicU32,
+    done: AtomicU32,
+}
+
+extern "system" fn slow(context: *mut c_void, _: bool) {
+    // SAFETY: tests pass a live `Overlap`.
+    let o = unsafe { &*context.cast::<Overlap>() };
+    let now = o.running.fetch_add(1, Ordering::SeqCst) + 1;
+    o.most.fetch_max(now, Ordering::SeqCst);
+    // SAFETY: a plain call.
+    unsafe { Sleep(2) };
+    o.running.fetch_sub(1, Ordering::SeqCst);
+    o.done.fetch_add(1, Ordering::SeqCst);
+}
+
+/// reference/system/xtaskqueue: SerializedThreadPool "executes the calls in
+/// serial, one at a time, on the thread pool"; XTaskQueueCreateComposite
+/// "Creates a task queue composed of ports of other task queues"; with the
+/// process task queue set to nullptr, "XTaskQueueGetCurrentProcessTaskQueue
+/// will also return nullptr" and APIs needing a queue "error with
+/// E_NO_TASK_QUEUE if null was provided". reference/system/xasyncprovider:
+/// XAsyncGetResult with another identity than XAsyncBegin's is a call
+/// mismatch, E_INVALIDARG.
+fn edges(t: &mut Tap) {
+    let a = api();
+
+    let q = a
+        .create(SERIALIZED_THREAD_POOL, SERIALIZED_THREAD_POOL)
+        .expect("serialized queue");
+    let overlap = Overlap::default();
+    for _ in 0..16 {
+        a.submit(q, WORK, ctx(&overlap), slow);
+    }
+    t.check(
+        wait_for(5000, || overlap.done.load(Ordering::SeqCst) == 16),
+        "xasync: a serialized thread-pool port runs every callback",
+        || format!("{} of 16", overlap.done.load(Ordering::SeqCst)),
+    );
+    t.eq(
+        overlap.most.load(Ordering::SeqCst),
+        1,
+        "xasync: ... one at a time",
+    );
+    a.close(q);
+    let q = a
+        .create(THREAD_POOL, THREAD_POOL)
+        .expect("thread-pool queue");
+    let parallel = Overlap::default();
+    for _ in 0..16 {
+        a.submit(q, WORK, ctx(&parallel), slow);
+    }
+    wait_for(5000, || parallel.done.load(Ordering::SeqCst) == 16);
+    t.check(
+        parallel.most.load(Ordering::SeqCst) > 1,
+        "xasync: a thread-pool port runs callbacks in parallel",
+        || "never more than one at a time".into(),
+    );
+    a.close(q);
+
+    // A composite of a manual queue's work port: its callbacks are
+    // dispatched from that queue.
+    let base = a.create(MANUAL, MANUAL).expect("manual queue");
+    let port = a.port(base, WORK);
+    match a.composite(port, port) {
+        Ok(c) => {
+            let seen = Seen::default();
+            a.submit(c, WORK, ctx(&seen), note);
+            t.eq(
+                a.dispatch(base, WORK, 0),
+                true,
+                "xasync: a composite queue's callback is dispatched from the queue owning its port",
+            );
+            t.eq(
+                seen.calls.load(Ordering::SeqCst),
+                1,
+                "xasync: ... and runs once",
+            );
+            a.close(c);
+        }
+        Err(hr) => t.check(false, "xasync: XTaskQueueCreateComposite succeeds", || {
+            format!("{hr:#010x}")
+        }),
+    }
+
+    // A call mismatch: another identity than XAsyncBegin's.
+    let mut block = Block::new(base, std::ptr::null_mut(), None);
+    let b: *mut Block = &mut block;
+    a.begin(
+        b,
+        std::ptr::null_mut(),
+        eight_bytes as *const c_void,
+        eight_bytes,
+    );
+    while a.dispatch(base, WORK, 0) || a.dispatch(base, COMPLETION, 0) {}
+    let mut buffer = [0u8; 8];
+    t.eq(
+        a.result(b, forever as *const c_void, &mut buffer).0,
+        E_INVALIDARG,
+        "xasync: XAsyncGetResult with another identity is E_INVALIDARG",
+    );
+    a.result(b, eight_bytes as *const c_void, &mut buffer);
+    a.close(base);
+
+    // No process task queue: Get says none, and an async call with no queue
+    // of its own fails with E_NO_TASK_QUEUE. The queue is put back after.
+    let (had, previous) = a.process_queue();
+    a.set_process_queue(std::ptr::null_mut());
+    let (has, none) = a.process_queue();
+    t.check(
+        !has && none.is_null(),
+        "xasync: with the process task queue set to nullptr, there is none",
+        || format!("{has} {none:?}"),
+    );
+    let mut block = Block::on_process_queue();
+    let hr = a.run(&mut block, work_ok);
+    t.eq(
+        hr,
+        E_NO_TASK_QUEUE,
+        "xasync: an async call with no queue and no process queue is E_NO_TASK_QUEUE",
+    );
+    if hr == S_OK {
+        wait(&mut block);
+    }
+    if had {
+        a.set_process_queue(previous);
+        a.close(previous);
+    }
+    let (back, q) = a.process_queue();
+    t.check(
+        back == had,
+        "xasync: the process task queue is put back",
+        || format!("had {had}, now {back}"),
+    );
+    if back {
+        a.close(q);
+    }
 }
