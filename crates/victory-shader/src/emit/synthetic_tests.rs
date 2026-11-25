@@ -906,7 +906,7 @@ fn pixel_programs_tested_before_they_run_keep_that_order() {
                 .draw_behind_depth(&root, &pso, &roots, &triangle, (8, 8), clear)
                 .unwrap_or_else(|e| panic!("{label}: draw failed: {e}"));
             assert!(
-                texels[1..].iter().all(|t| *t == [0.0; 4]),
+                texels[1..].iter().all(|t| *t == Host::UAV_SEED),
                 "{label}: stores only at (0, 0)"
             );
             texels[0]
@@ -919,10 +919,11 @@ fn pixel_programs_tested_before_they_run_keep_that_order() {
             STORED,
             "{label}: a visible pixel's store"
         );
-        // Hidden: tested first, it does not run, so nothing is stored.
+        // Hidden: tested first, it does not run, so nothing is stored: the
+        // texel keeps the value the UAV was filled with before the draw.
         assert_eq!(
             draw(&early, 0.0),
-            [0.0; 4],
+            Host::UAV_SEED,
             "{label}: hidden pixels store nothing"
         );
         // Hidden, without the flag: a host may run a program that writes
