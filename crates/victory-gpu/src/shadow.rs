@@ -51,7 +51,10 @@ pub(crate) struct Shadow {
     spare: bool,
 }
 
-/// The references `buffer` has besides the caller's.
+/// The references `buffer` has besides the caller's. (`Release` returns the
+/// count left; COM documents it for tests because another thread may take
+/// or drop references meanwhile. Here no other one can take a reference
+/// when none is held: 0 stays 0.)
 fn others(buffer: &ID3D12Resource) -> u32 {
     use windows::core::Interface;
     // SAFETY: a live COM object; one reference taken and given back.
@@ -630,8 +633,13 @@ impl Drop for Shadow {
             m.owners.remove(&base);
             m.give_back(base, pages(self.start, self.len));
         }
-        // Only a buffer nothing else holds (a list that kept it may not be
-        // submitted yet) is handed to the next copy.
+        // Only a buffer nothing else holds is handed on, and only once the
+        // submission running now has run ([`settle_spares`]). Whatever uses
+        // a buffer holds a reference to it, as on main, where dropping the
+        // last one frees it: lists (what they keep, and the copies their
+        // steps name) until they are reset, view heap slots, and slots
+        // rewritten while a submission runs ([`crate::host::retire`]).
+        // With none, nothing can take one again (cloning needs one).
         if self.spare && others(&self.buffer) == 0 {
             give_spare(self.buffer.clone(), self.data);
         }
@@ -1018,11 +1026,11 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 /// Buffers of dead copies of single views ([`exact`]), by width, for the
-/// next ones of that width, and their bytes in all: ring positions move
-/// every frame (views of the same sizes), so copies die and are made by the
-/// hundred, and a committed buffer made and mapped for each is a driver
-/// call and fresh pages every time.
-static SPARE: Mutex<(u64, BTreeMap<u64, Vec<Spare>>)> = Mutex::new((0, BTreeMap::new()));
+/// next ones of that width: ring positions move every frame (views of the
+/// same sizes), so copies die and are made by the hundred, and a committed
+/// buffer made and mapped for each is a driver call and fresh pages every
+/// time.
+static SPARE: Mutex<Pool> = Mutex::new(Pool::new(SPARE_BYTES));
 
 /// A spare buffer and its persistent mapping.
 struct Spare(ID3D12Resource, usize);
@@ -1034,25 +1042,68 @@ unsafe impl Send for Spare {}
 /// Spare buffers' bytes kept at most.
 const SPARE_BYTES: u64 = 256 << 20;
 
+/// Buffers given back wait for the submission running now to have run
+/// ([`Pool::settle`]); then they are spare, by width, up to `limit` bytes.
+struct Pool {
+    settling: Vec<Spare>,
+    spare: BTreeMap<u64, Vec<Spare>>,
+    bytes: u64,
+    limit: u64,
+}
+
+impl Pool {
+    const fn new(limit: u64) -> Pool {
+        Pool {
+            settling: Vec::new(),
+            spare: BTreeMap::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn give(&mut self, buffer: ID3D12Resource, data: *mut u8) {
+        self.settling.push(Spare(buffer, data as usize));
+    }
+
+    /// After a submission has run, with none running: what was given back
+    /// meanwhile is spare (as much as the limit keeps; the rest goes).
+    fn settle(&mut self) {
+        for Spare(buffer, data) in std::mem::take(&mut self.settling) {
+            // SAFETY: a live buffer.
+            let width = unsafe { buffer.GetDesc() }.Width;
+            if self.bytes + width <= self.limit {
+                self.bytes += width;
+                self.spare
+                    .entry(width)
+                    .or_default()
+                    .push(Spare(buffer, data));
+            }
+        }
+    }
+
+    fn take(&mut self, width: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let Spare(buffer, data) = self.spare.get_mut(&width)?.pop()?;
+        self.bytes -= width;
+        Some((buffer, data as *mut u8))
+    }
+}
+
+fn spares() -> std::sync::MutexGuard<'static, Pool> {
+    SPARE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn take_spare(width: u64) -> Option<(ID3D12Resource, *mut u8)> {
-    let mut guard = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-    let (bytes, map) = &mut *guard;
-    let Spare(buffer, data) = map.get_mut(&width)?.pop()?;
-    *bytes -= width;
-    Some((buffer, data as *mut u8))
+    spares().take(width)
 }
 
 fn give_spare(buffer: ID3D12Resource, data: *mut u8) {
-    // SAFETY: a live buffer.
-    let width = unsafe { buffer.GetDesc() }.Width;
-    let mut guard = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-    let (bytes, map) = &mut *guard;
-    if *bytes + width <= SPARE_BYTES {
-        *bytes += width;
-        map.entry(width)
-            .or_default()
-            .push(Spare(buffer, data as usize));
-    }
+    spares().give(buffer, data);
+}
+
+/// After a submission has run, with none running: the buffers of copies
+/// that died meanwhile become spare.
+pub(crate) fn settle_spares() {
+    spares().settle();
 }
 
 /// Every host copy of title memory made so far (buffers and windows).
@@ -1234,45 +1285,80 @@ mod tests {
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
     }
-    /// A copy of a single view's bytes takes the buffer of one that died
-    /// (zeroed), not a new one; one a list still holds is not handed on.
+    /// A buffer given back is spare only once a submission has run since,
+    /// then taken by a copy of its width (the last given first), within the
+    /// limit.
     #[test]
-    fn view_copies_reuse_the_buffers_of_dead_ones_nothing_holds() {
+    fn spare_buffers_wait_for_a_submission() {
         use windows::core::Interface;
-        let p = crate::watch::tests::pool(4);
-        let len = 4 * PAGE;
-        register(p, p as u64, len as u64);
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let buffer = || host.shared_buffer(512).unwrap();
+        let ((a, at), (b, bt), (c, ct)) = (buffer(), buffer(), buffer());
+        let raw = |x: &ID3D12Resource| x.as_raw() as usize;
+        let (ra, rb, rc) = (raw(&a), raw(&b), raw(&c));
+        let mut pool = Pool::new(1024);
+        pool.give(a, at);
+        assert!(pool.take(512).is_none(), "not before a submission ran");
+        pool.settle();
+        pool.give(b, bt);
+        assert_eq!(pool.take(512).map(|(x, _)| raw(&x)), Some(ra));
+        assert!(pool.take(512).is_none(), "b waits for the next one");
+        pool.settle();
+        assert_eq!(pool.take(256).map(|(x, _)| raw(&x)), None, "another width");
+        pool.give(c, ct);
+        pool.settle();
+        assert_eq!(
+            pool.take(512).map(|(x, _)| raw(&x)),
+            Some(rc),
+            "the last given first"
+        );
+        assert_eq!(pool.take(512).map(|(x, _)| raw(&x)), Some(rb));
+        assert_eq!(pool.bytes, 0);
+        // Past the limit, a buffer given back goes.
+        let mut small = Pool::new(256);
+        let (d, dt) = buffer();
+        small.give(d, dt);
+        small.settle();
+        assert!(small.take(512).is_none(), "over the limit: not kept");
+    }
+
+    /// A dead copy whose buffer a recorded list holds is not handed on, and
+    /// the list's GPU read of it, submitted after the copy died, sees the
+    /// copy's bytes.
+    #[test]
+    fn a_dead_copy_a_list_holds_is_not_handed_on() {
+        use windows::core::Interface;
+        let p = crate::watch::tests::pool(2);
+        register(p, p as u64, 2 * PAGE as u64);
         // 456-byte views of 12-byte elements, off the buffer's elements.
         let view = |at: usize| for_view((p + at) as u64, 456, 12);
-        let Some((first, true)) = view(4) else {
+        let (Some(host), Some((first, true))) = (crate::host::host(), view(4)) else {
             unregister(p, p as u64);
             return; // no host GPU here
         };
-        let raw = first.buffer.as_raw() as usize;
         first.write_host((p + 4) as u64, &[7; 456]);
+        let (out, at) = host.shared_buffer(512).unwrap();
+        let reader = host.new_list().unwrap();
+        // SAFETY: an open list; both buffers live (the list keeps the copy's).
+        unsafe { reader.list.CopyBufferRegion(&out, 0, &first.buffer, 0, 456) };
+        reader.keep(&first.buffer);
+        reader.close();
+        let held = first.buffer.as_raw() as usize;
         drop(first);
-        let (second, own) = view(PAGE + 4).unwrap();
-        assert!(own);
-        assert_eq!(
-            second.buffer.as_raw() as usize,
-            raw,
-            "the dead copy's buffer"
-        );
-        assert_eq!(
-            second.read_host((p + PAGE + 4) as u64, 114),
-            vec![0; 114],
-            "zeroed"
-        );
-        // A list keeps the buffer: it is not anyone's spare.
-        let kept = second.buffer.clone();
-        drop(second);
-        let (third, _) = view(2 * PAGE + 4).unwrap();
-        assert_ne!(
-            third.buffer.as_raw() as usize,
-            raw,
-            "a buffer a list still holds"
-        );
-        drop((kept, third));
+        let given = {
+            let pool = spares();
+            pool.settling
+                .iter()
+                .chain(pool.spare.values().flatten())
+                .any(|s| s.0.as_raw() as usize == held)
+        };
+        assert!(!given, "a buffer a list holds is not given back");
+        host.execute(&[&reader]);
+        // SAFETY: the mapped output; the submission has run.
+        let read = unsafe { std::slice::from_raw_parts(at, 456) }.to_vec();
+        assert_eq!(read, vec![7; 456], "the list read the dead copy's bytes");
         unregister(p, p as u64);
     }
 }
