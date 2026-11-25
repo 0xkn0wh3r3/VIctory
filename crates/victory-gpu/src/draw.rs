@@ -19,6 +19,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
+use crate::frame_budget::Kind;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
@@ -1065,7 +1066,7 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         if let Some(k) = timed {
-            list.time_end(k, &p.name);
+            list.time_end(k, p.timed(Kind::Dispatch, Some([x, y, z])));
         }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
@@ -1153,7 +1154,7 @@ impl State {
                     if let Some(k) = timed
                         && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
                     {
-                        list.time_end(k, &p.name);
+                        list.time_end(k, p.timed(Kind::Mesh, Some([x, 1, 1])));
                     }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -1771,7 +1772,11 @@ impl State {
         if let Some(k) = timed
             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
         {
-            list.time_end(k, &p.name);
+            let kind = match kind {
+                DISPATCH => Kind::IndirectDispatch,
+                _ => Kind::IndirectMesh,
+            };
+            list.time_end(k, p.timed(kind, None));
         }
         // A listed frame, or any frame for a traced shader: what the records
         // held (after the clamp).

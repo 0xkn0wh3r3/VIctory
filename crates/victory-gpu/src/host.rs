@@ -819,9 +819,9 @@ pub(crate) struct HostList {
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
     /// The frame budget's timed commands (`crate::frame_budget`): a timestamp
     /// before and after each, where they are read back, and each one's
-    /// pipeline.
+    /// command.
     timing: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
-    timed: Mutex<Vec<String>>,
+    timed: Mutex<Vec<crate::frame_budget::Command>>,
 }
 
 /// Timestamps per list for the frame budget (two per timed command);
@@ -1207,6 +1207,7 @@ impl Host {
         crate::descriptor::sync_heaps();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
+        let synced = std::time::Instant::now();
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -1243,6 +1244,7 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
+        let uploaded = std::time::Instant::now();
         let runs: Vec<&HostList> = uploads
             .as_ref()
             .map(|u| u.list())
@@ -1344,7 +1346,6 @@ impl Host {
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
-        crate::frame_budget::submitted(prepared - started, gpu);
         // The frame budget's timed commands: only lists that timed some
         // are read back.
         if crate::frame_budget::timing() {
@@ -1457,6 +1458,13 @@ impl Host {
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::frame_budget::submitted(crate::frame_budget::Phases {
+            sync: synced - started,
+            uploads: uploaded - synced,
+            refresh: prepared - uploaded,
+            gpu,
+            copy_back: copying.elapsed(),
+        });
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
@@ -1798,9 +1806,9 @@ impl HostList {
         Some(k)
     }
 
-    /// After timed command `k` (from [`HostList::time_start`]) of
-    /// `pipeline`.
-    pub(crate) fn time_end(&self, k: u32, pipeline: &str) {
+    /// After timed command `k` (from [`HostList::time_start`]), which was
+    /// `command`.
+    pub(crate) fn time_end(&self, k: u32, command: crate::frame_budget::Command) {
         let Some((heap, _)) = self.timing_made() else {
             return;
         };
@@ -1811,7 +1819,7 @@ impl HostList {
         };
         let mut timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
         debug_assert_eq!(timed.len() as u32, k);
-        timed.push(pipeline.to_owned());
+        timed.push(command);
     }
 
     /// After the list ran on `host`: each timed command's GPU time to the
@@ -1823,8 +1831,8 @@ impl HostList {
         crate::frame_budget::ran(self.timed_ms(host.timestamp_frequency()));
     }
 
-    /// After the list ran: each timed command's pipeline and GPU time in ms.
-    pub(crate) fn timed_ms(&self, frequency: u64) -> Vec<(String, f64)> {
+    /// After the list ran: each timed command and its GPU time in ms.
+    pub(crate) fn timed_ms(&self, frequency: u64) -> Vec<(crate::frame_budget::Command, f64)> {
         let timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
         let Some((_, back)) = self.timing_made().filter(|_| !timed.is_empty()) else {
             return Vec::new();
@@ -1847,10 +1855,10 @@ impl HostList {
         timed
             .iter()
             .enumerate()
-            .map(|(k, pipeline)| {
+            .map(|(k, command)| {
                 let ticks = stamps[2 * k + 1].saturating_sub(stamps[2 * k]);
                 let ms = ticks as f64 * 1e3 / frequency.max(1) as f64;
-                (pipeline.clone(), ms)
+                (command.clone(), ms)
             })
             .collect()
     }
