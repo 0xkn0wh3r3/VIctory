@@ -48,6 +48,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(all(windows, test))]
+mod list_bench;
 #[cfg(windows)]
 mod memory;
 #[cfg(all(test, windows))]
