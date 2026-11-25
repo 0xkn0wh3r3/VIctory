@@ -72,6 +72,10 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Whether relabelled threads take their ids by ticket
+    /// (`Lower::console_flat`).
+    #[cfg(test)]
+    pub ticket: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -116,6 +120,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+/// The host's group-shared memory for a compute program, in dwords (32 KiB;
+/// the validator refuses more).
+const GROUPSHARED_DWORDS: u32 = 32 * 1024 / 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
@@ -1415,6 +1422,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            ticket: self.console_flat.is_some() && self.ticket(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2945,7 +2954,8 @@ impl<'a> Lower<'a> {
     /// waves one base (`lane_order_tests`). There each full wave takes the
     /// next wave-sized run of ids from a group-shared ticket, and the one
     /// partial wave (the group's last threads; hosts fill its lanes from 0)
-    /// the last run.
+    /// the last run; where the ticket does not fit (`Lower::ticket`), the
+    /// rounding as for 1-D groups.
     fn console_flat(&mut self) -> V {
         if let Some(f) = self.console_flat {
             return f;
@@ -2958,7 +2968,7 @@ impl<'a> Lower<'a> {
         let lane = self
             .s
             .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        let base = if y == 1 && z == 1 {
+        let base = if !self.ticket() {
             let flat = self.s.op(
                 e,
                 "flattenedThreadIdInGroup.i32",
@@ -3025,6 +3035,17 @@ impl<'a> Lower<'a> {
         let f = self.s.m.bin(e, Bin::Add, base, lane);
         self.console_flat = Some(f);
         f
+    }
+
+    /// Whether relabelled threads take their ids by ticket
+    /// (`Lower::console_flat`): in groups that are not 1-D, unless the
+    /// program's LDS already takes all the host's group-shared memory, where
+    /// the ticket's dword would make it fail validation.
+    // shortcut: such programs keep the rounding, and with it the ids two
+    // waves share on hosts that put several rows into one wave.
+    fn ticket(&self) -> bool {
+        let [_, y, z] = self.s.threads.expect("compute");
+        (y, z) != (1, 1) && self.s.lds_dwords < GROUPSHARED_DWORDS
     }
 
     /// Mesh: the counts and the primitives no lane exports. The console's
