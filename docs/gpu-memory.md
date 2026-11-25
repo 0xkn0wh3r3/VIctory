@@ -90,6 +90,12 @@ Measured on an RTX 5070 Ti (driver 621.24), Ryzen 9 7900X, Windows 11,
 | video memory, default heap | 721.2 GB/s | (no CPU access) | (no CPU access) |
 
 ```mermaid
+---
+config:
+  xyChart:
+    width: 640
+    height: 170
+---
 xychart-beta
   title "GPU reading 256 MiB, GB/s"
   x-axis ["system memory (L0)", "GPU upload heap", "video memory"]
@@ -106,7 +112,8 @@ never read it there. Two opt-in switches act on that:
 | `VICTORY_GPU_UPLOAD_WRITES=1` (with the one above) | buffers shaders may write | a **mirror** in system memory |
 
 Both switches fall back to system memory when the GPU has no GPU upload
-heaps, and past a 2 GiB budget for these copies (`UPLOAD_BUDGET`). Copies
+heaps, and past a 2 GiB budget for these copies (`UPLOAD_BUDGET`; a copy's
+bytes are given back when D3D12 destroys its buffer). Copies
 of loose title memory and of single views (`loose`, `exact`) always stay
 in system memory.
 
@@ -209,6 +216,12 @@ runs, ms per frame):
 | snapshots of declared ranges | 708 | 910 | 950 |
 
 ```mermaid
+---
+config:
+  xyChart:
+    width: 640
+    height: 170
+---
 xychart-beta
   title "CPU time per synthetic frame, marked path (ms)"
   x-axis ["system memory", "mirror always written", "lazy mirror"]
