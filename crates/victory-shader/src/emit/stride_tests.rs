@@ -172,6 +172,17 @@ fn build(
     used: Vec<UsedResource>,
     threads: u32,
 ) -> HostShader {
+    build_with(words, layout, used, threads, false)
+}
+
+/// [`build`], with read and write marks (`view_marks`).
+fn build_with(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+    view_marks: bool,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -198,7 +209,7 @@ fn build(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        view_marks: false,
+        view_marks,
     })
     .expect("lower");
     let shader = HostShader {
@@ -401,6 +412,87 @@ fn a_heap_index_in_a_paged_view_heap_reads_where_its_page_is() {
             let want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
             assert_eq!(through_pages[0], want, "{label}");
         }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// With view pages and marks, the views a program takes from the heap mark
+/// their pages read (`emit`, "Read marks"): the buffer at virtual slot
+/// 1,099,777 sets bit `VIEW_PAGE_READS` + 4,296, the table's UAV at slot 0
+/// bit `VIEW_PAGE_READS`, and nothing else is set (no texture read, no
+/// write marked).
+#[test]
+fn views_read_in_a_paged_view_heap_mark_their_pages() {
+    let shader = {
+        let _paged = super::shader::view_pages(true);
+        build_with(
+            HEAP_ELEMENT_WAVE32,
+            vec![
+                param(RootType::Constants, 0),
+                param(RootType::ResourceHeap, 1),
+                param(RootType::Table, 2),
+            ],
+            vec![entry(ResourceType::Uav, 4, 2)],
+            32,
+            true,
+        )
+    };
+    assert!(shader.view_marks, "the bitmap is bound");
+    let page = super::VIEW_PAGE_SLOTS;
+    let slot = 4296 * page + 1;
+    let mut tables = vec![0u32; (super::HEAP_VIEWS + super::HEAP_VIEWS / page) as usize];
+    tables[..2].copy_from_slice(&[4, 12]);
+    tables[slot as usize] = 12;
+    // Pages 0 and 4,296 at host page 0 (entries are 0).
+    let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Structured(12),
+        },
+    ];
+    let words = (super::VIEW_PAGE_READS + super::HEAP_VIEWS / page) / 32;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = if u.root == RootType::Constants { slot } else { 0 };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: tables.clone() }),
+                        (2, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE, 0] }),
+                        (3, Root::Uav(words)),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let bits = &out[1];
+        let set: Vec<u32> = (0..bits.len() as u32 * 32)
+            .filter(|&b| bits[(b / 32) as usize] >> (b % 32) & 1 != 0)
+            .collect();
+        let pages = super::VIEW_PAGE_READS;
+        assert_eq!(set, [pages, pages + 4296], "{label}: the pages read");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
