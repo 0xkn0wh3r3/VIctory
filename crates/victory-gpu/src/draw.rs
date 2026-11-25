@@ -1735,7 +1735,8 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need. `marked`: a shader's
 /// writes through the view mark their pages (every translated shader's do);
-/// the host's own (clears) do not.
+/// the host's own (clears) do not, and their pages are marked for them
+/// ([`crate::shadow::Shadow::host_writes`]).
 fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
@@ -1764,7 +1765,11 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
-            shadow.gpu_writes(list, address, len, marked);
+            if marked {
+                shadow.gpu_writes(list, address, len, true);
+            } else {
+                shadow.host_writes(list, address, len);
+            }
         }
     }
     match (view, u.kind) {

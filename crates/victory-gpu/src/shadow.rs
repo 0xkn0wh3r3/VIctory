@@ -24,6 +24,10 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+/// The most marked pages that go back with one read of title memory
+/// ([`Shadow::copy_back_marked_run`]): 4 MiB.
+const RUN: usize = 64;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -367,6 +371,62 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
 
+    /// The host writes `[address, address + len)` of the copy in `list`
+    /// without a shader (an unordered access clear): as
+    /// [`Shadow::gpu_writes`], but its pages are marked as written at
+    /// submission, as a shader's view writes mark them, so that they go
+    /// back as marked pages ([`copy_back_marks`]): no snapshot of the range
+    /// before the submission and no comparison with it after, which for a
+    /// big buffer cleared in every submission cost tens of milliseconds
+    /// each (`benchmark_blank_frame`). Whole pages only: a refresh does not
+    /// take a page the range holds in part, which a title write before the
+    /// submission leaves changed, and a changed page that was not armed
+    /// keeps the title's bytes ([`Shadow::copy_back_marked`]); the parts of
+    /// pages at the range's ends are declared, byte for byte, as are the
+    /// writes of copies whose writes are not marked.
+    pub(crate) fn host_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        let len = len.min(self.left(address));
+        let end = address + len;
+        let page = PAGE as u64;
+        let (first, last) = (address.next_multiple_of(page), end / page * page);
+        if !self.marked() || first >= last {
+            self.gpu_writes(list, address, len, false);
+            return;
+        }
+        if address < first {
+            self.gpu_writes(list, address, first - address, false);
+        }
+        self.gpu_writes(list, first, last - first, true);
+        if last < end {
+            self.gpu_writes(list, last, end - last, false);
+        }
+        let copy = self.clone();
+        list.defer_host(move || copy.mark_pages(first, last - first));
+    }
+
+    /// Sets the view-mark bits of the pages `[address, address + len)`
+    /// touches, as a shader writing them through a view would (between
+    /// submissions: the bitmap is read and cleared after each).
+    fn mark_pages(&self, address: u64, len: u64) {
+        let (Some(base), Some(b)) = (self.marks, bitmap()) else {
+            return;
+        };
+        let (from, to) = (
+            address.max(self.start),
+            (address + len).min(self.start + self.len),
+        );
+        if from >= to {
+            return;
+        }
+        let words = b.data as *mut u32;
+        for k in (from >> 16) - (self.start >> 16)..=((to - 1) >> 16) - (self.start >> 16) {
+            let bit = base + k as u32;
+            // SAFETY: a dword of the mapped bitmap (the copy's bits are
+            // inside it); the GPU is not using it between submissions.
+            unsafe { *words.add(bit as usize / 32) |= 1 << (bit % 32) };
+        }
+    }
+
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
     /// per copy and submission, segments covering the ranges the submission
@@ -657,6 +717,103 @@ impl Shadow {
             t.taken(&[page / PAGE]);
         }
         written.map_or(0, |_| n)
+    }
+
+    /// [`Shadow::copy_back_marked`] of whole marked pages in a row (`pages`,
+    /// ascending, each the next): those the title has not written since the
+    /// copy took them go back [`RUN`] pages at a time, each time with one
+    /// read of title memory, one write per stretch of pages the GPU changed
+    /// and one take (page by page, a clear of 256 MiB cost 90 ms in these
+    /// calls: `benchmark_blank_frame`); the others page by page. Returns the
+    /// bytes written.
+    pub(crate) fn copy_back_marked_run(&self, pages: &[usize]) -> usize {
+        let Some(t) = &self.tracked else {
+            return 0;
+        };
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut written = 0;
+        let mut plain: Vec<usize> = Vec::with_capacity(RUN.min(pages.len()));
+        for &page in pages {
+            if page < start || page + PAGE > end || t.changed(page / PAGE) {
+                written += self.copy_back_plain(t, &mut plain);
+                written += self.copy_back_marked(page, None);
+            } else {
+                plain.push(page);
+                if plain.len() == RUN {
+                    written += self.copy_back_plain(t, &mut plain);
+                }
+            }
+        }
+        written + self.copy_back_plain(t, &mut plain)
+    }
+
+    /// The copy-back of [`Shadow::copy_back_marked_run`]'s whole pages in a
+    /// row that the title had not written (`pages`, emptied): the title's
+    /// bytes are the copy's from before, so what differs is the GPU's. A
+    /// page the title writes meanwhile goes back on its own, by what it
+    /// saved.
+    fn copy_back_plain(&self, t: &crate::watch::Tracked, pages: &mut Vec<usize>) -> usize {
+        let (Some(&first), Some(&last)) = (pages.first(), pages.last()) else {
+            return 0;
+        };
+        let start = self.start as usize;
+        let (from, to) = (first, last + PAGE);
+        let n = to - from;
+        self.freshen(from - start, to - start);
+        // Our own writes below must not save the pages for this copy again.
+        for &page in pages.iter() {
+            t.unarm(page / PAGE);
+        }
+        // Reused memory: a fresh buffer faults at each 4 KiB it takes.
+        let mut title = pooled(n);
+        title.resize(n, 0);
+        if !crate::host::read_into(from as *const u8, &mut title) {
+            give_back(title);
+            // A page not mapped: page by page, which leaves it alone.
+            let written = pages.iter().map(|&p| self.copy_back_marked(p, None)).sum();
+            pages.clear();
+            return written;
+        }
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
+        let mut written = 0;
+        let mut taken = Vec::with_capacity(pages.len());
+        let mut alone = Vec::new();
+        // The stretch of pages that differ, not yet written: its first byte.
+        let mut stretch: Option<usize> = None;
+        let mut write = |stretch: &mut Option<usize>, upto: usize| {
+            if let Some(at) = stretch.take() {
+                let _writing = crate::watch::writing(at, upto - at);
+                crate::host::write_mapped(at as *mut u8, host[at - from..].as_ptr(), upto - at);
+                written += upto - at;
+            }
+        };
+        for &page in pages.iter() {
+            let i = page - from;
+            if t.changed(page / PAGE) {
+                // Written by the title since the check: by what it saved.
+                write(&mut stretch, page);
+                alone.push(page);
+                continue;
+            }
+            if host[i..i + PAGE] != title[i..i + PAGE] {
+                stretch.get_or_insert(page);
+            } else {
+                write(&mut stretch, page);
+            }
+            taken.push(page / PAGE);
+        }
+        write(&mut stretch, to);
+        give_back(title);
+        self.push(from - start, n);
+        // Equal to title memory now: taken.
+        t.taken(&taken);
+        pages.clear();
+        written
+            + alone
+                .into_iter()
+                .map(|p| self.copy_back_marked(p, None))
+                .sum::<usize>()
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -1087,6 +1244,22 @@ pub(crate) fn copy_back_marks(declared: &[(Arc<Shadow>, usize, usize, bool)]) {
             .map(|(copy, page)| (copy.clone(), *page, PAGE))
             .collect::<Vec<_>>(),
     );
+    // Whole pages of a copy in a row go back together (a run of them a
+    // clear or a big dispatch wrote: a kernel copy and a guard change per
+    // run, not per page).
+    let mut run: Option<(Arc<Shadow>, Vec<usize>)> = None;
+    let flush = |run: &mut Option<(Arc<Shadow>, Vec<usize>)>| {
+        if let Some((copy, pages)) = run.take() {
+            let written = copy.copy_back_marked_run(&pages);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::MarkedPages, pages.len() as u64);
+                crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = written;
+        }
+    };
     for (copy, page) in pages {
         // The declared ranges of this copy on the page, cut to it.
         let on_page = |back: bool| -> Vec<(usize, usize)> {
@@ -1103,6 +1276,21 @@ pub(crate) fn copy_back_marks(declared: &[(Arc<Shadow>, usize, usize, bool)]) {
         if only.as_ref().is_some_and(Vec::is_empty) {
             continue;
         }
+        if only.is_none() {
+            match &mut run {
+                Some((c, pages))
+                    if Arc::ptr_eq(c, &copy) && pages.last().map(|p| p + PAGE) == Some(page) =>
+                {
+                    pages.push(page);
+                }
+                _ => {
+                    flush(&mut run);
+                    run = Some((copy, vec![page]));
+                }
+            }
+            continue;
+        }
+        flush(&mut run);
         let written = copy.copy_back_marked(page, only.as_deref());
         #[cfg(feature = "diagnostics")]
         {
@@ -1112,6 +1300,7 @@ pub(crate) fn copy_back_marks(declared: &[(Arc<Shadow>, usize, usize, bool)]) {
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
+    flush(&mut run);
 }
 
 /// `ranges` (half-open) less `minus`: sorted, disjoint.
@@ -2803,6 +2992,177 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: the mapped output; the submission has run.
         let read = unsafe { std::slice::from_raw_parts(at, 456) }.to_vec();
         assert_eq!(read, vec![7; 456], "the list read the dead copy's bytes");
+        unregister(p, p as u64);
+    }
+
+    /// A clear (the host's write, which marks no page) of part of a buffer
+    /// goes back as marked pages, the two whole pages in a row together:
+    /// its bytes reach title memory, the title's byte written before the
+    /// submission next to it on the same page stays, and pages it does not
+    /// touch keep theirs.
+    #[test]
+    fn host_writes_go_back_as_marked_pages() {
+        let Some(host) = host() else {
+            return;
+        };
+        if bitmap().is_none() {
+            return;
+        }
+        let (p, len, copy) = mirrored_buffer(4);
+        if !copy.marked() {
+            unregister(p, p as u64);
+            return; // no write marks for this memory here
+        }
+        let (from, to) = (p + PAGE + 100, p + 3 * PAGE);
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        copy.host_writes(&list, from as u64, (to - from) as u64);
+        let (src, data) = host.shared_buffer((to - from) as u64).unwrap();
+        // SAFETY: our mapped buffer of that many bytes.
+        unsafe { std::ptr::write_bytes(data, 0x5A, to - from) };
+        list.keep(&src);
+        // SAFETY: an open list; both buffers live and common.
+        unsafe {
+            list.list.CopyBufferRegion(
+                &copy.buffer,
+                copy.offset(from as u64),
+                &src,
+                0,
+                (to - from) as u64,
+            )
+        };
+        list.close();
+        // The title writes the first cleared page, before the clear's range.
+        // SAFETY: our pool's bytes.
+        unsafe { ((p + PAGE + 50) as *mut u8).write_volatile(0xE1) };
+        host.execute(&[&list]);
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        assert!(
+            title[from - p..to - p].iter().all(|&b| b == 0x5A),
+            "the clear's bytes"
+        );
+        assert_eq!(title[PAGE + 50], 0xE1, "the title's byte");
+        let pattern = |i: usize| (i % 251) as u8;
+        assert_eq!(title[PAGE + 99], pattern(PAGE + 99), "before the clear");
+        assert!(
+            (0..PAGE)
+                .chain(3 * PAGE..len)
+                .all(|i| title[i] == pattern(i)),
+            "the pages it does not touch"
+        );
+        unregister(p, p as u64);
+    }
+
+    /// A heavy frame with nothing on screen, as a title makes one: many
+    /// submissions, each reading and writing a big buffer of title memory
+    /// that the title also writes between them. Times each part of the
+    /// copy machinery per frame (synthetic; run with
+    /// `--release --ignored --nocapture blank_frame`).
+    #[test]
+    #[ignore = "synthetic benchmark; run with --release --ignored --nocapture"]
+    fn benchmark_blank_frame() {
+        let Some(host) = host() else {
+            return;
+        };
+        let setting = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let (mb, subs, dirty) = (
+            setting("BENCH_MB", 256),
+            setting("BENCH_SUBS", 60),
+            setting("BENCH_DIRTY", 8),
+        );
+        let pages = mb * (1 << 20) / PAGE;
+        let len = pages * PAGE;
+        let p = crate::watch::tests::pool(pages);
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).expect("a copy");
+        copy.update(p, len);
+        let lists: Vec<HostList> = (0..subs).map(|_| host.new_list().unwrap()).collect();
+        // What one submission does: whether it reads the buffer, how it
+        // writes it (0 not, 1 shaders that declare the range, 2 shaders that
+        // mark their pages, 3 a clear of all of it, 4 the same declared as
+        // shaders' writes, as clears were), and whether the title writes it
+        // between submissions.
+        let cases: [(&str, bool, u8, bool); 7] = [
+            ("empty submissions", false, 0, false),
+            ("reads, title idle", true, 0, false),
+            ("reads + title writes", true, 0, true),
+            ("reads + shader writes (declared)", true, 1, true),
+            ("reads + shader writes (marked)", true, 2, true),
+            ("reads + clears (declared, as before)", true, 4, true),
+            ("reads + clears (marked)", true, 3, true),
+        ];
+        // What the clears write: all zeros or all ones, by turns.
+        let fills: Vec<ID3D12Resource> = [0u8, 0xFF]
+            .iter()
+            .map(|&v| {
+                let (b, data) = host.shared_buffer(len as u64).unwrap();
+                // SAFETY: our mapped buffer of `len` bytes.
+                unsafe { std::ptr::write_bytes(data, v, len) };
+                b
+            })
+            .collect();
+        eprintln!(
+            "{mb} MiB buffer, {subs} submissions a frame, {dirty} pages written by the title between them"
+        );
+        for (name, read, write, title_writes) in cases {
+            if write >= 2 && bitmap().is_none() {
+                eprintln!("{name}: no write-mark bitmap here");
+                continue;
+            }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                for (k, list) in lists.iter().enumerate() {
+                    if read {
+                        copy.refresh(list, p as u64, len as u64);
+                    }
+                    match write {
+                        1 | 2 => copy.gpu_writes(list, p as u64, len as u64, write == 2),
+                        3 => copy.host_writes(list, p as u64, len as u64),
+                        4 => copy.gpu_writes(list, p as u64, len as u64, false),
+                        _ => {}
+                    }
+                    if write >= 3 {
+                        let fill = &fills[k % 2];
+                        list.keep(fill);
+                        // SAFETY: an open list; both buffers live and common.
+                        unsafe {
+                            list.list.CopyBufferRegion(
+                                &copy.buffer,
+                                copy.offset(p as u64),
+                                fill,
+                                0,
+                                len as u64,
+                            )
+                        };
+                    } else if write != 0 {
+                        gpu_store(list, &copy, p + (k % pages) * PAGE + 64, &[k as u8; 16]);
+                    }
+                    list.close();
+                    if title_writes {
+                        for d in 0..dirty {
+                            let page = (k * 7919 + d * 104_729) % pages;
+                            // SAFETY: our pool's bytes.
+                            unsafe { ((p + page * PAGE + 8) as *mut u8).write_volatile(k as u8) };
+                        }
+                    }
+                    host.execute(&[list]);
+                    list.reset();
+                }
+                best = best.min(started.elapsed());
+            }
+            eprintln!(
+                "{name}: {:.1} ms a frame ({:.2} ms a submission)",
+                best.as_secs_f64() * 1e3,
+                best.as_secs_f64() * 1e3 / subs as f64
+            );
+        }
         unregister(p, p as u64);
     }
 }
