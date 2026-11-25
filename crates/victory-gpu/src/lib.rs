@@ -20,6 +20,8 @@
 mod alias;
 #[cfg(windows)]
 mod bindless;
+#[cfg(windows)]
+mod budget;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
