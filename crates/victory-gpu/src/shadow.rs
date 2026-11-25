@@ -1680,7 +1680,14 @@ mod tests {
             return; // no heaps from process memory on this host
         }
         // SAFETY: our allocation.
-        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        let freed = unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } != 0;
+        if !freed || allocation_extent(base).is_some() {
+            // Windows keeps memory a heap was opened over until the heap
+            // goes (Wine releases it at once): let go of it, then release.
+            let_go_in_place(base as u64, 1 << 20);
+            // SAFETY: our allocation.
+            assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0, "released once the heap is let go");
+        }
         assert_eq!(allocation_extent(base), None);
         // SAFETY: a new allocation, at that address if it is free.
         let again = unsafe { VirtualAlloc(base as *const _, 2 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
