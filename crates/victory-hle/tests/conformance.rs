@@ -149,33 +149,129 @@ fn workloads() {
 fn the_conformance_title_runs_through_victory() {
     let tap = call("conformance_run");
     println!("{tap}");
+    match accept(&tap, KNOWN) {
+        Ok(known) => {
+            for (name, why) in known {
+                println!("known divergence: {name}: {why}");
+            }
+        }
+        Err(why) => panic!("{why}\n{tap}"),
+    }
+}
 
-    let failed: Vec<&str> = tap
+/// Checks a TAP report against `known` divergences: every result the plan
+/// announces is there (numbered 1 to N, in order), each known divergence
+/// is in it exactly once and fails, and nothing else fails. Returns the
+/// known divergences seen.
+fn accept<'a>(tap: &str, known: &'a [(&str, &str)]) -> Result<Vec<(&'a str, &'a str)>, String> {
+    let plan: usize = tap
         .lines()
-        .filter_map(|l| l.strip_prefix("not ok "))
-        .filter_map(|l| l.split_once(" - ").map(|(_, name)| name))
-        .collect();
-    let passed: Vec<&str> = tap
+        .find_map(|l| l.strip_prefix("1.."))
+        .and_then(|n| n.trim().parse().ok())
+        .ok_or("no TAP plan")?;
+    // (number, passed, name), the name without a skip's reason.
+    let results: Vec<(usize, bool, &str)> = tap
         .lines()
-        .filter_map(|l| l.strip_prefix("ok "))
-        .filter_map(|l| l.split_once(" - ").map(|(_, name)| name))
+        .filter_map(|l| {
+            let (passed, rest) = match (l.strip_prefix("not ok "), l.strip_prefix("ok ")) {
+                (Some(rest), _) => (false, rest),
+                (None, Some(rest)) => (true, rest),
+                (None, None) => return None,
+            };
+            let (n, name) = rest.split_once(" - ")?;
+            let name = name.split_once(" # SKIP").map_or(name, |(name, _)| name);
+            Some((n.parse().ok()?, passed, name))
+        })
         .collect();
-    let known = |name: &str| KNOWN.iter().find(|(k, _)| *k == name);
-    for name in &failed {
-        if let Some((_, why)) = known(name) {
-            println!("known divergence: {name}: {why}");
+    if plan == 0 {
+        return Err("no checks ran".into());
+    }
+    let numbers: Vec<usize> = results.iter().map(|r| r.0).collect();
+    if numbers != (1..=plan).collect::<Vec<_>>() {
+        return Err(format!(
+            "the report has {} results numbered {numbers:?}, its plan 1..{plan}",
+            results.len()
+        ));
+    }
+    let mut seen = Vec::new();
+    for &(name, why) in known {
+        match results.iter().filter(|r| r.2 == name).collect::<Vec<_>>()[..] {
+            [] => return Err(format!("a known divergence's check is missing: {name}")),
+            [(_, true, _)] => {
+                return Err(format!(
+                    "a known divergence now passes (take it off KNOWN): {name}"
+                ));
+            }
+            [_] => seen.push((name, why)),
+            _ => return Err(format!("a known divergence's check is there twice: {name}")),
         }
     }
-    let unexpected: Vec<&&str> = failed.iter().filter(|n| known(n).is_none()).collect();
-    let fixed: Vec<&str> = KNOWN
+    let unexpected: Vec<&str> = results
         .iter()
-        .map(|(k, _)| *k)
-        .filter(|k| passed.contains(k))
+        .filter(|r| !r.1 && !known.iter().any(|(k, _)| *k == r.2))
+        .map(|r| r.2)
         .collect();
-    assert!(passed.len() + failed.len() > 0, "no checks ran:\n{tap}");
-    assert!(unexpected.is_empty(), "checks that failed: {unexpected:#?}");
+    if !unexpected.is_empty() {
+        return Err(format!("checks that failed: {unexpected:#?}"));
+    }
+    Ok(seen)
+}
+
+/// What [`accept`] refuses, on made-up reports (review of #2057): a known
+/// divergence whose check is gone, also with the plan lowered to match, or
+/// a report cut short of its plan; as before, a known divergence that
+/// passes and an unknown failure.
+#[test]
+fn reports_missing_or_cut_short_checks_are_refused() {
+    let known = &[("k1", "why 1"), ("k2", "why 2")];
+    let report =
+        |lines: &[&str]| format!("TAP version 13\n1..{}\n{}\n", lines.len(), lines.join("\n"));
+    let numbered = |lines: &[(&str, bool)]| -> Vec<String> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ok))| {
+                format!("{}ok {} - {name}", if *ok { "" } else { "not " }, i + 1)
+            })
+            .collect()
+    };
+    let all = numbered(&[("a", true), ("k1", false), ("k2", false)]);
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
+    assert_eq!(accept(&report(&all), known).map(|k| k.len()), Ok(2));
+    let skipped = report(&[
+        "ok 1 - a # SKIP no device",
+        "not ok 2 - k1",
+        "not ok 3 - k2",
+    ]);
+    assert!(accept(&skipped, known).is_ok(), "a skipped check counts");
+    let gone = numbered(&[("a", true), ("k1", false)]);
+    let gone: Vec<&str> = gone.iter().map(String::as_str).collect();
     assert!(
-        fixed.is_empty(),
-        "known divergences that now pass (take them off KNOWN): {fixed:#?}"
+        accept(&report(&gone), known)
+            .unwrap_err()
+            .contains("missing: k2")
+    );
+    let cut = format!("TAP version 13\n1..3\n{}\n", all[0]);
+    assert!(accept(&cut, known).unwrap_err().contains("plan 1..3"));
+    let fixed = numbered(&[("a", true), ("k1", true), ("k2", false)]);
+    let fixed: Vec<&str> = fixed.iter().map(String::as_str).collect();
+    assert!(
+        accept(&report(&fixed), known)
+            .unwrap_err()
+            .contains("now passes")
+    );
+    let new = numbered(&[("a", false), ("k1", false), ("k2", false)]);
+    let new: Vec<&str> = new.iter().map(String::as_str).collect();
+    assert!(accept(&report(&new), known).unwrap_err().contains("failed"));
+    let twice = numbered(&[("k1", false), ("k1", false), ("k2", false)]);
+    let twice: Vec<&str> = twice.iter().map(String::as_str).collect();
+    assert!(
+        accept(&report(&twice), known)
+            .unwrap_err()
+            .contains("twice")
+    );
+    assert!(
+        accept("TAP version 13\n1..0\n", known).is_err(),
+        "no checks"
     );
 }
