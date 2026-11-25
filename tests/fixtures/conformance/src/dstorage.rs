@@ -29,7 +29,9 @@ const FACTORY: Guid = Guid(
 );
 const E_PENDING: Hresult = 0x8000_000A_u32 as i32;
 
+const SOURCE_FILE: u64 = 0;
 const SOURCE_MEMORY: u64 = 1;
+const PRIORITY_NORMAL: i8 = 0;
 const PRIORITY_REALTIME: i8 = 2;
 /// Request options: inflate zlib; the source is an address.
 const ZLIB: u64 = 1;
@@ -132,10 +134,13 @@ impl Storage {
         Com(out)
     }
     fn queue(&self, capacity: u16) -> Com {
+        self.queue_of(SOURCE_MEMORY, PRIORITY_REALTIME, capacity)
+    }
+    fn queue_of(&self, source_type: u64, priority: i8, capacity: u16) -> Com {
         let desc = QueueDesc {
-            source_type: SOURCE_MEMORY,
+            source_type,
             capacity,
-            priority: PRIORITY_REALTIME,
+            priority,
             name: c"conformance".as_ptr().cast(),
             unknown: 0,
         };
@@ -149,6 +154,112 @@ impl Storage {
         f(self.factory.0, &desc, std::ptr::null(), &mut out);
         Com(out)
     }
+}
+
+impl Storage {
+    /// IDStorageFactoryX::OpenFile.
+    fn open(&self, path: &std::path::Path) -> Result<Com, Hresult> {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut out = std::ptr::null_mut();
+        // SAFETY: the slot's signature in VIctory's table.
+        let f: extern "system" fn(
+            *mut c_void,
+            *const u16,
+            *const Guid,
+            *mut *mut c_void,
+        ) -> Hresult = unsafe { self.factory.method(0x20) };
+        match f(self.factory.0, wide.as_ptr(), std::ptr::null(), &mut out) {
+            S_OK if !out.is_null() => Ok(Com(out)),
+            S_OK => Err(-1),
+            hr => Err(hr),
+        }
+    }
+}
+
+/// A request reading `size` bytes of `file` at `offset`.
+fn from_file(options: u64, file: Com, offset: u64, size: usize, destination: &mut [u8]) -> Request {
+    Request {
+        options,
+        destination: destination.as_mut_ptr().cast(),
+        page_offset: 0,
+        destination_size: destination.len() as u32,
+        source: file.0,
+        offset,
+        source_size: size as u32,
+        intermediate_size: 0,
+        tag: 0,
+        name: std::ptr::null(),
+    }
+}
+
+/// File sources: raw reads at an offset, zlib at a 16-byte aligned offset
+/// (the overview: FileOffset must be 16-byte aligned for compressed data),
+/// and a missing file refused.
+fn files(t: &mut Tap, s: &Storage, array: Com) {
+    let plain = pattern(300_000, 7);
+    let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+    let mut contents = plain.clone();
+    contents.resize(contents.len().next_multiple_of(16), 0);
+    let zlib_at = contents.len() as u64;
+    contents.extend_from_slice(&packed);
+    let path = std::env::temp_dir().join(format!("victory-conformance-{}.bin", std::process::id()));
+    if let Err(e) = std::fs::write(&path, &contents) {
+        t.check(false, "dstorage: a test file is written", || e.to_string());
+        return;
+    }
+    let file = match s.open(&path) {
+        Ok(f) => f,
+        Err(hr) => {
+            t.check(
+                false,
+                "dstorage: IDStorageFactoryX::OpenFile opens a file",
+                || format!("{hr:#010x}"),
+            );
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+    };
+    t.check(
+        true,
+        "dstorage: IDStorageFactoryX::OpenFile opens a file",
+        String::new,
+    );
+    let q = s.queue_of(SOURCE_FILE, PRIORITY_NORMAL, 32);
+    let mut raw = vec![0u8; 1000];
+    let mut inflated = vec![0u8; plain.len()];
+    enqueue(q, &from_file(0, file, 5000, 1000, &mut raw));
+    enqueue(
+        q,
+        &from_file(ZLIB, file, zlib_at, packed.len(), &mut inflated),
+    );
+    enqueue_status(q, array, 13);
+    submit(q);
+    t.eq(
+        wait(array, 13, 5000),
+        S_OK,
+        "dstorage: file-sourced requests complete",
+    );
+    t.check(
+        raw == plain[5000..6000],
+        "dstorage: a raw file read returns the bytes at its offset",
+        || "bytes differ".into(),
+    );
+    t.check(
+        inflated == plain,
+        "dstorage: a zlib file read inflates to the original bytes",
+        || "bytes differ".into(),
+    );
+    close(q);
+    q.release();
+    file.release();
+    let _ = std::fs::remove_file(&path);
+    let missing = std::env::temp_dir().join("victory-conformance-no-such-file.bin");
+    t.check(
+        s.open(&missing).is_err(),
+        "dstorage: opening a missing file fails",
+        || "opened".into(),
+    );
 }
 
 fn enqueue(q: Com, r: &Request) {
@@ -350,6 +461,7 @@ pub fn run(t: &mut Tap) {
     close(small);
     small.release();
     q.release();
+    files(t, &s, array);
     array.release();
 }
 

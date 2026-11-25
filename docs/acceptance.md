@@ -102,19 +102,27 @@ rather than failed; one of them passing fails the test, so the list stays
 true. `-- --ignored` runs the workloads.
 
 Covered so far: runtime initialisation, task queues and async calls,
-system information, physical-page aliasing, DirectStorage (memory sources)
-and game saves: 82 checks, 80 pass. The two divergences found:
+system information, physical-page aliasing, DirectStorage (memory and file
+sources), game saves, the user, networking hints, the package, HDR mode,
+files on the console's `G:` and `T:` drives through every path import
+VIctory binds, and persistent local storage: 143 checks, 139 pass. The
+four divergences found:
 
 | Check | Reference | VIctory |
 |---|---|---|
 | `XSystemGetConsoleId` on retail | `00000000.00000000.00000000.00000000.00` | 38 digits ending in 1 |
 | DirectStorage automatic submission | when an Enqueue fills more than half the capacity | at half the capacity |
+| `XUserFindUserByLocalId`, no such user | `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)` | `E_GAMEUSER_USER_NOT_FOUND` (0x89245104) |
+| `XUserGetGamertag`, invalid component | `E_INVALIDARG` | the gamertag |
 
 Gaps seen while writing them (documented features VIctory's tables leave
 unimplemented, not yet tested): DirectStorage cancel by tag and the error
 event and record; the documented request limits (32 MiB destination, 16-byte
 offsets for compressed sources), whose behaviour when broken the reference
-does not state.
+does not state. System dialogs: text entry opens a real host dialog, which
+an unattended test cannot answer; the message and error dialogs, and
+thread time-sensitivity (`XThreadSetTimeSensitive`), are unimplemented
+slots in VIctory's tables.
 
 The streaming workload so far reads from memory only (no file source),
 with synthetic data that compresses about 3.5:1; on an RTX 5070 Ti machine
