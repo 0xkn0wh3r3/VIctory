@@ -16,6 +16,16 @@ use std::process::Command;
 use victory_hle::{HleResolver, HostPolicy};
 use victory_loader::{UnimplementedPolicy, prepare};
 
+// The GPU frame drawn natively on WARP (its own folder: a file here is a
+// test of its own).
+#[path = "conformance/reference.rs"]
+mod reference;
+// The GPU frame's scene, shared with the title so both draw the same (the
+// title alone uses some of it).
+#[allow(dead_code)]
+#[path = "../../../tests/fixtures/conformance/src/scene.rs"]
+mod scene;
+
 /// Checks VIctory is known to answer differently from the public reference,
 /// each with why: reported, not failed. A check here that passes fails the
 /// test, so the list stays true.
@@ -48,13 +58,42 @@ fn build_fixture() -> PathBuf {
     target.join("debug").join("conformance.dll")
 }
 
-/// The title loaded and bound once per test process (the runtime's state
-/// is global: one title at a time); `call(name)` runs one of its report
-/// exports.
+/// The title's report exports.
+struct Exports {
+    run: usize,
+    bench: usize,
+    gpu: usize,
+}
+
+/// Calls into the title one at a time: its runtime state, and the reports
+/// it hands out, are global.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Runs one of the title's report exports (`conformance_run` or
+/// `conformance_bench`).
 fn call(name: &str) -> String {
-    static EXPORTS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let &(run, bench) = EXPORTS.get_or_init(|| {
+    let e = exports();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let at = if name == "conformance_bench" {
+        e.bench
+    } else {
+        e.run
+    };
+    // SAFETY: the exports' signature in the fixture; the report stays valid
+    // until the next call, which the lock holds off.
+    unsafe {
+        let f: extern "system" fn(*mut usize) -> *const u8 = std::mem::transmute(at);
+        let mut len = 0;
+        let report = f(&mut len);
+        String::from_utf8_lossy(std::slice::from_raw_parts(report, len)).into_owned()
+    }
+}
+
+/// The title loaded and bound once per test process (the runtime's state
+/// is global: one title at a time).
+fn exports() -> &'static Exports {
+    static EXPORTS: std::sync::OnceLock<Exports> = std::sync::OnceLock::new();
+    EXPORTS.get_or_init(|| {
         let dll = build_fixture();
         let original = std::fs::read(&dll).unwrap();
         let prepared = prepare(&original).unwrap();
@@ -98,30 +137,102 @@ fn call(name: &str) -> String {
         );
         // SAFETY: its imports are bound; it depends on no title DLL.
         unsafe { image.attach() }.unwrap();
-        let exports = (
-            image.export("conformance_run").expect("conformance_run"),
-            image
-                .export("conformance_bench")
-                .expect("conformance_bench"),
-        );
+        let export = |name| image.export(name).unwrap_or_else(|| panic!("{name}"));
+        let exports = Exports {
+            run: export("conformance_run"),
+            bench: export("conformance_bench"),
+            gpu: export("conformance_gpu"),
+        };
         // Stays loaded for the rest of the process.
         std::mem::forget(image);
         exports
-    });
+    })
+}
+
+/// What `conformance_gpu` takes and hands back (the fixture's `GpuRun`).
+#[repr(C)]
+struct GpuRun {
+    reference: *const f32,
+    reference_len: usize,
+    window_seconds: u32,
+    image: *const f32,
+    image_len: usize,
+}
+
+/// Runs the title's GPU frame against `reference`: its TAP report and the
+/// frame it read back.
+fn call_gpu(reference: Option<&[f32]>, window_seconds: u32) -> (String, Vec<f32>) {
+    let e = exports();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let at = if name == "conformance_bench" {
-        bench
-    } else {
-        run
+    let mut run = GpuRun {
+        reference: reference.map_or(std::ptr::null(), <[f32]>::as_ptr),
+        reference_len: reference.map_or(0, <[f32]>::len),
+        window_seconds,
+        image: std::ptr::null(),
+        image_len: 0,
     };
-    // SAFETY: the exports' signature in the fixture; the report stays valid
-    // until the next call, which the lock holds off.
+    // SAFETY: the export's signature in the fixture; the report and image
+    // stay valid until the next call, which the lock holds off.
     unsafe {
-        let f: extern "system" fn(*mut usize) -> *const u8 = std::mem::transmute(at);
+        let f: extern "system" fn(*mut GpuRun, *mut usize) -> *const u8 =
+            std::mem::transmute(e.gpu);
         let mut len = 0;
-        let report = f(&mut len);
-        String::from_utf8_lossy(std::slice::from_raw_parts(report, len)).into_owned()
+        let report = f(&mut run, &mut len);
+        let report = String::from_utf8_lossy(std::slice::from_raw_parts(report, len)).into_owned();
+        let image = if run.image.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(run.image, run.image_len).to_vec()
+        };
+        (report, image)
     }
+}
+
+/// The GPU frame: the title draws a scene
+/// through VIctory's console D3D12 with hand-assembled GFX10 shaders, and
+/// checks its frame against the same scene drawn natively on WARP.
+/// `VICTORY_CONFORMANCE_WINDOW=<seconds>` keeps presenting it, animated,
+/// in a window that long; `VICTORY_CONFORMANCE_DUMP=<folder>` saves both
+/// frames there as PPM images.
+#[test]
+fn the_gpu_frame_matches_warp() {
+    let reference = match reference::render() {
+        Ok(r) => Some(r),
+        Err(e) => {
+            println!("no WARP reference: {e}");
+            None
+        }
+    };
+    let window = std::env::var("VICTORY_CONFORMANCE_WINDOW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let (tap, image) = call_gpu(reference.as_deref(), window);
+    println!("{tap}");
+    if let Some(dir) = std::env::var_os("VICTORY_CONFORMANCE_DUMP") {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        save_ppm(&dir.join("victory.ppm"), &image);
+        if let Some(r) = &reference {
+            save_ppm(&dir.join("warp.ppm"), r);
+        }
+    }
+    if let Err(why) = accept(&tap, &[]) {
+        panic!("{why}\n{tap}");
+    }
+}
+
+/// An RGBA float frame as a binary PPM (RGB8).
+fn save_ppm(path: &Path, image: &[f32]) {
+    let mut out = format!("P6\n{} {}\n255\n", scene::WIDTH, scene::HEIGHT).into_bytes();
+    for p in image.chunks(4) {
+        out.extend(
+            p[..3]
+                .iter()
+                .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8),
+        );
+    }
+    std::fs::write(path, out).unwrap();
 }
 
 /// The streaming workload: throughput, printed. Run with `cargo test
