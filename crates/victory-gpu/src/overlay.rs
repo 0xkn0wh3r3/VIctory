@@ -16,8 +16,8 @@
 //! while it is hidden.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
@@ -105,7 +105,8 @@ const MARGIN: u32 = 6;
 /// The presenter's overlay state.
 pub(crate) struct Overlay {
     enabled: bool,
-    /// Keys down at the last frame: Alt+Z, then 1-4.
+    /// Keys down at the last frame: Alt+Z, then 1-4 (only without the
+    /// key thread, [`watch_keys`]).
     down: u8,
     last: Option<Instant>,
     times: VecDeque<f32>,
@@ -134,6 +135,81 @@ impl Default for Overlay {
             adapter: None,
             upload: None,
             drawn: None,
+        }
+    }
+}
+
+/// How often the key thread looks at the keys. A world frame can take a
+/// second or more, and a key pressed and let go between two frames was
+/// lost when the keys were looked at once a frame.
+const POLL: Duration = Duration::from_millis(15);
+
+/// The window whose keys the overlay takes, as a number (0: none yet).
+static WINDOW: AtomicUsize = AtomicUsize::new(0);
+/// A key changed what the panel shows since it was last drawn.
+static CHANGED: AtomicBool = AtomicBool::new(false);
+/// The key thread runs.
+static KEY_THREAD: AtomicBool = AtomicBool::new(false);
+
+/// Starts the key thread the first time, and points it at `hwnd`; whether
+/// it runs (if not, the caller looks at the keys itself, once a frame).
+fn watch_keys(hwnd: HWND) -> bool {
+    static START: Once = Once::new();
+    WINDOW.store(hwnd.0 as usize, Relaxed);
+    START.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("victory overlay keys".into())
+            .spawn(|| {
+                let mut down = 0;
+                loop {
+                    down = poll_keys(down, HWND(WINDOW.load(Relaxed) as *mut _));
+                    std::thread::sleep(POLL);
+                }
+            });
+        match spawned {
+            Ok(_) => KEY_THREAD.store(true, Relaxed),
+            Err(e) => tracing::warn!(%e, "overlay: no key thread; keys are read once a frame"),
+        }
+    });
+    KEY_THREAD.load(Relaxed)
+}
+
+/// Alt+Z shows and hides the panel; 1-4 toggle work while it shows. Only
+/// while `hwnd` has focus, when a key goes down: `before` is what was down
+/// at the last look, and the keys down now are returned for the next.
+fn poll_keys(before: u8, hwnd: HWND) -> u8 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    // SAFETY: a plain query.
+    let focused = !hwnd.is_invalid() && unsafe { GetForegroundWindow() } == hwnd;
+    // SAFETY: a plain query.
+    let down = keys_down(|vk| focused && unsafe { GetAsyncKeyState(vk) } < 0);
+    toggle(down & !before);
+    down
+}
+
+/// The overlay's keys held, one bit each: Alt+Z, then 1-4.
+fn keys_down(held: impl Fn(i32) -> bool) -> u8 {
+    const ALT: i32 = 0x12;
+    let mut down = u8::from(held(ALT) && held(i32::from(b'Z')));
+    for (k, key) in (b'1'..=b'4').enumerate() {
+        down |= u8::from(held(i32::from(key))) << (k + 1);
+    }
+    down
+}
+
+/// Acts on the keys that went down (bits as [`keys_down`]).
+fn toggle(pressed: u8) {
+    if pressed & 1 != 0 {
+        let shown = !VISIBLE.fetch_xor(true, Relaxed);
+        tracing::info!(shown, "overlay");
+    }
+    if captured() {
+        for (k, skipped) in SKIPPED.iter().enumerate() {
+            if pressed >> (k + 1) & 1 != 0 {
+                let off = !skipped.fetch_xor(true, Relaxed);
+                tracing::warn!(work = WORK[k], left_out = off, "overlay toggle");
+                CHANGED.store(true, Relaxed);
+            }
         }
     }
 }
@@ -172,7 +248,12 @@ impl Overlay {
             }
             self.times.push_back((now - last).as_secs_f32() * 1000.0);
         }
-        self.poll_keys(hwnd);
+        if !watch_keys(hwnd) {
+            self.down = poll_keys(self.down, hwnd);
+        }
+        if CHANGED.swap(false, Relaxed) {
+            self.drawn = None;
+        }
         if !captured() {
             self.drawn = None;
             return state;
@@ -261,36 +342,6 @@ impl Overlay {
             list.CopyTextureRegion(&dst, margin, margin, 0, &src, None);
         }
         D3D12_RESOURCE_STATE_COPY_DEST
-    }
-
-    /// Alt+Z shows and hides the panel; 1-4 toggle work while it shows.
-    /// Only while our window has focus, on the frame a key goes down.
-    fn poll_keys(&mut self, hwnd: HWND) {
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-        // SAFETY: plain queries.
-        let focused = unsafe { GetForegroundWindow() } == hwnd;
-        // SAFETY: a plain query.
-        let held = |vk: i32| focused && unsafe { GetAsyncKeyState(vk) } < 0;
-        const ALT: i32 = 0x12;
-        let mut down = u8::from(held(ALT) && held(i32::from(b'Z')));
-        for (k, key) in (b'1'..=b'4').enumerate() {
-            down |= u8::from(held(i32::from(key))) << (k + 1);
-        }
-        let pressed = down & !self.down;
-        self.down = down;
-        if pressed & 1 != 0 {
-            let shown = !VISIBLE.fetch_xor(true, Relaxed);
-            tracing::info!(shown, "overlay");
-        }
-        if captured() {
-            for (k, skipped) in SKIPPED.iter().enumerate() {
-                if pressed >> (k + 1) & 1 != 0 {
-                    let off = !skipped.fetch_xor(true, Relaxed);
-                    tracing::warn!(work = WORK[k], left_out = off, "overlay toggle");
-                    self.drawn = None;
-                }
-            }
-        }
     }
 
     /// The process's CPU use and memory, the machine's memory and the
@@ -771,6 +822,27 @@ fn glyph(c: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Alt+Z is bit 0 only with Alt held; 1-4 are bits 1-4 alone.
+    #[test]
+    fn keys_map_to_their_bits() {
+        let with = |keys: &'static [u8]| keys_down(move |vk| keys.contains(&(vk as u8)));
+        assert_eq!(with(b"Z"), 0);
+        assert_eq!(with(&[0x12, b'Z']), 1);
+        assert_eq!(with(b"1"), 0b10);
+        assert_eq!(with(b"4"), 0b1_0000);
+        assert_eq!(with(&[0x12, b'Z', b'2', b'3']), 0b1101);
+    }
+
+    /// The key thread starts once and stays pointed at the latest window;
+    /// keys are then not read on the presenting thread.
+    #[test]
+    fn keys_are_read_on_a_thread_of_their_own() {
+        assert!(watch_keys(HWND(std::ptr::null_mut())));
+        assert!(watch_keys(HWND(8 as *mut _)));
+        assert_eq!(WINDOW.load(Relaxed), 8);
+        WINDOW.store(0, Relaxed);
+    }
 
     /// Every character the panel prints has a glyph of its own (not the
     /// `?` stand-in), and the lines fit the panel.
