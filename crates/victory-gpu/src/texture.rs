@@ -1243,6 +1243,9 @@ mod tests {
             spans: spans(&layout, 1, 1),
             footprints: vec![footprint],
             rows: vec![rows],
+            // Every level read (#2149): the whole memory.
+            first: 0,
+            prefix: layout.size as usize,
             layout,
             mips: 1,
             memory: memory.as_ptr(),

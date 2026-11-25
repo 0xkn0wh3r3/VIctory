@@ -829,7 +829,9 @@ impl Layout {
                 for x in (0..m.width).step_by(16 / n) {
                     let at = x as usize * n;
                     let tiled = self.render_xor_offset(m, x, y) as usize;
-                    copy(tiled, y as usize * row_pitch + at, 16.min(bytes - at));
+                    // One run per piece (#2026's rows are runs).
+                    let run = Runs::one(16.min(bytes - at));
+                    row(&run, tiled, y as usize * row_pitch + at);
                 }
             }
             return Ok(());
