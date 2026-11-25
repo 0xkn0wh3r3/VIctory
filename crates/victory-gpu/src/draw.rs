@@ -593,6 +593,11 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // A pipeline too slow on this host (`crate::budget`).
+        if crate::budget::skips(&p.name) {
+            not_run("a pipeline too slow on this host");
+            return false;
+        }
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
@@ -1055,8 +1060,12 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        let timed = list.time_start();
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if let Some(k) = timed {
+            list.time_end(k, &p.name);
+        }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1137,8 +1146,14 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    let timed = list.time_start();
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    if let Some(k) = timed
+                        && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+                    {
+                        list.time_end(k, &p.name);
+                    }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1736,6 +1751,10 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        // Indirect dispatches and mesh draws are timed as direct ones.
+        let timed = (kind == DISPATCH || kind == MESH)
+            .then(|| list.time_start())
+            .flatten();
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1748,6 +1767,11 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        if let Some(k) = timed
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            list.time_end(k, &p.name);
+        }
         // A listed frame, or any frame for a traced shader: what the records
         // held (after the clamp).
         #[cfg(feature = "diagnostics")]
