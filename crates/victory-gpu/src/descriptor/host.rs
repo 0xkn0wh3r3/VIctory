@@ -109,7 +109,7 @@ struct Placed {
 }
 
 // A page's bits are whole words.
-const _: () = assert!(PAGE % 64 == 0);
+const _: () = assert!(PAGE.is_multiple_of(64));
 
 impl Placed {
     /// `host` per page of slots, `next` the first host page to give out.
