@@ -120,6 +120,39 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// The debug overlay (Alt+Z, `victory_gpu::overlay`) shows the pad the
+/// title reads (the first connected one, else the keyboard's stand-in);
+/// while it shows, the title reads neutral pads (still connected) and no
+/// keys.
+fn overlay(
+    mut pads: [Option<PadState>; PADS],
+    mut keys: Vec<KeyState>,
+) -> ([Option<PadState>; PADS], Vec<KeyState>) {
+    #[cfg(windows)]
+    {
+        use victory_gpu::overlay::{Pad, captured, show_pad};
+        let read = pads
+            .iter()
+            .flatten()
+            .next()
+            .copied()
+            .unwrap_or_else(|| fallback(&keys));
+        show_pad(Some(Pad {
+            buttons: read.buttons,
+            triggers: [read.left_trigger, read.right_trigger],
+            left: [read.left_x, read.left_y],
+            right: [read.right_x, read.right_y],
+        }));
+        if captured() {
+            pads.iter_mut()
+                .flatten()
+                .for_each(|p| *p = PadState::default());
+            keys.clear();
+        }
+    }
+    (pads, keys)
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -445,6 +478,7 @@ impl Hub {
             let _ = &mut pads;
             (pads, source.keys())
         };
+        let (pads, keys) = overlay(pads, keys);
         let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
     }

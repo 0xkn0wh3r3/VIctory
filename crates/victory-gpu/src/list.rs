@@ -1185,12 +1185,18 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        if crate::overlay::skip(crate::overlay::Work::Vertex) {
+            return;
+        }
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        if crate::overlay::skip(crate::overlay::Work::Compute) {
+            return;
+        }
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
@@ -1200,6 +1206,9 @@ mod state {
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+        }
+        if crate::overlay::skip(crate::overlay::Work::Mesh) {
+            return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
@@ -1219,6 +1228,9 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
+        if crate::overlay::skip(crate::overlay::Work::Mesh) {
+            return;
+        }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
@@ -1230,6 +1242,9 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        if crate::overlay::skip(crate::overlay::Work::Vertex) {
+            return;
+        }
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1296,6 +1311,10 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    #[cfg(windows)]
+    if crate::overlay::skip(crate::overlay::Work::Indirect) {
+        return;
+    }
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
