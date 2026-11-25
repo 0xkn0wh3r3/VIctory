@@ -830,6 +830,9 @@ impl HostHeap {
         let host = host();
         for &(page, host_page) in &taken {
             for index in page * PAGE..((page + 1) * PAGE).min(self.count) {
+                // Not readable as made any more: `mirror`'s lock-free check
+                // must not pass it by when the page is placed again.
+                self.ready[index as usize].store(0, Ordering::Relaxed);
                 self.keep(index, None);
                 self.set_mark(index, None);
                 self.viewed.set(index, None, false);
@@ -875,7 +878,12 @@ impl HostHeap {
             .into_iter()
             .map(|page| (page * PAGE, ((page + 1) * PAGE).min(self.count)))
             .filter(|&(first, last)| first < last)
-            .inspect(|&(first, last)| made[first as usize..last as usize].fill(REMAKE))
+            .inspect(|&(first, last)| {
+                made[first as usize..last as usize].fill(REMAKE);
+                for ready in &self.ready[first as usize..last as usize] {
+                    ready.store(0, Ordering::Relaxed);
+                }
+            })
             .collect()
     }
 

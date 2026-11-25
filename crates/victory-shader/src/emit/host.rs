@@ -604,6 +604,23 @@ impl Host {
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
 
+    /// Whether this device runs native 16-bit operations (D3D12
+    /// `Native16BitShaderOpsSupported`, SM 6.2 and up, which the device
+    /// already has): what [`super::Options::native16`] asks of the host.
+    pub fn native16(&self) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+        // SAFETY: the query writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS4,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.Native16BitShaderOpsSupported.as_bool()
+    }
+
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind (NaN where an overflowing
@@ -815,6 +832,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        native16: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -1771,7 +1789,7 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
-        self.dispatch_with_views(root, pso, d, false)
+        self.dispatch_with_views(root, pso, d, false, 1).map(|(out, _)| out)
     }
 
     /// Runs original PC bytecode with views matching its HLSL declarations.
@@ -1781,7 +1799,19 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
-        self.dispatch_with_views(root, pso, d, true)
+        self.dispatch_with_views(root, pso, d, true, 1).map(|(out, _)| out)
+    }
+
+    /// [`Self::dispatch`] `times` times over, back to back, with the GPU
+    /// time between the first and the last in seconds (timestamps).
+    pub fn dispatch_timed(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        times: u32,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
+        self.dispatch_with_views(root, pso, d, false, times)
     }
 
     fn dispatch_with_views(
@@ -1790,7 +1820,8 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
         native_pc: bool,
-    ) -> Result<Vec<Vec<u32>>, String> {
+        times: u32,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -2376,7 +2407,30 @@ impl Host {
                 }
             }
             let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            let queries: ID3D12QueryHeap = {
+                let mut q: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 2,
+                        NodeMask: 0,
+                    },
+                    &mut q,
+                )
+                .map_err(err)?;
+                q.ok_or("no query heap")?
+            };
+            let stamps = make(
+                D3D12_HEAP_TYPE_READBACK,
+                &buffer(16, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?;
+            list.EndQuery(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            for _ in 0..times {
+                list.Dispatch(x, y, z);
+            }
+            list.EndQuery(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            list.ResolveQueryData(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &stamps, 0);
             for (r, size, n, rb) in &uavs {
                 list.ResourceBarrier(&[transition(
                     r,
@@ -2428,8 +2482,13 @@ impl Host {
                 rb.Unmap(0, None);
                 out.push(words);
             }
+            let mut p = std::ptr::null_mut();
+            stamps.Map(0, None, Some(&mut p)).map_err(err)?;
+            let [t0, t1] = p.cast::<[u64; 2]>().read();
+            stamps.Unmap(0, None);
+            let hz = queue.GetTimestampFrequency().map_err(err)?;
             drop(keep);
-            Ok(out)
+            Ok((out, t1.saturating_sub(t0) as f64 / hz as f64))
         }
     }
 }
