@@ -53,6 +53,15 @@ pub fn registry() -> &'static [HleModule] {
     &REGISTRY
 }
 
+/// Title DLLs a module serves only some functions of, its others the
+/// title's own: the title's copy still loads (`xcurl`).
+const WRAPPED: &[&str] = &["xcurl.dll"];
+
+/// Whether the title's own `dll` loads although a module serves it.
+pub fn wraps(dll: &str) -> bool {
+    WRAPPED.iter().any(|w| w.eq_ignore_ascii_case(dll))
+}
+
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     registry()
         .iter()

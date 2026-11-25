@@ -28,10 +28,14 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
+#[cfg(windows)]
+pub mod net_server;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
 pub mod xasync;
+#[cfg(windows)]
+pub mod xcurl;
 pub mod xg;
 pub mod xgame;
 pub mod xgameruntime;
@@ -69,6 +73,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(lifecycle::module());
     #[cfg(windows)]
     all.push(net::module());
+    #[cfg(windows)]
+    all.push(xcurl::module());
     all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
