@@ -1200,9 +1200,8 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
         let size = len.next_multiple_of(4096) as usize;
         // SAFETY: committed pages of one allocation of the title's, from
         // a 64 KiB boundary of it.
-        if let Ok(heap) =
-            unsafe { dev13.OpenExistingHeapFromAddress1::<ID3D12Heap>(start as *const _, size) }
-        {
+        let opened = unsafe { dev13.OpenExistingHeapFromAddress1::<ID3D12Heap>(start as *const _, size) };
+        if let Ok(heap) = opened {
             return place_in(&host.device, &heap, 0, len).or_else(|| refuse("placement refused"));
         }
     }
