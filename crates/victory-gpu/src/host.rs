@@ -289,6 +289,11 @@ pub(crate) static DEBUG_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// debug layer on: true in that child, where the test does its work (the
 /// host, made once per process, can only get the layer at its start);
 /// false in the parent, once the child passed.
+///
+/// The child says what it did ([`debug_layer_outcome`]): read the layer's
+/// messages, or skipped (no device, no layer installed). A skip is printed
+/// as one, and fails where `VICTORY_REQUIRE_DEBUG_LAYER=1` asks for the
+/// check to run; a child that says neither fails.
 #[cfg(all(test, feature = "diagnostics"))]
 pub(crate) fn rerun_with_debug_layer(name: &str) -> bool {
     const CHILD: &str = "VICTORY_TEST_DEBUG_LAYER_CHILD";
@@ -308,7 +313,34 @@ pub(crate) fn rerun_with_debug_layer(name: &str) -> bool {
         "{name} under the debug layer:\n{text}"
     );
     assert!(text.contains("1 passed"), "{name} did not run:\n{text}");
+    let outcome = text
+        .lines()
+        // (After libtest's `test <name> ... ` on the same line.)
+        .find_map(|l| {
+            l.split_once(DEBUG_LAYER_OUTCOME)
+                .map(|(_, outcome)| outcome)
+        })
+        .unwrap_or_else(|| panic!("{name} said neither that it checked nor why not:\n{text}"));
+    if let Some(why) = outcome.strip_prefix("skipped: ") {
+        let required = std::env::var_os("VICTORY_REQUIRE_DEBUG_LAYER").is_some_and(|v| v == "1");
+        assert!(
+            !required,
+            "{name}: the debug layer check was required, and skipped: {why}"
+        );
+        eprintln!("{name}: skipped, {why}");
+    }
     false
+}
+
+/// The line a test run by [`rerun_with_debug_layer`] prints: `checked` once
+/// it has read the layer's messages, or `skipped: ` and why.
+#[cfg(all(test, feature = "diagnostics"))]
+const DEBUG_LAYER_OUTCOME: &str = "debug layer check: ";
+
+/// Prints what a test run by [`rerun_with_debug_layer`] did.
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn debug_layer_outcome(outcome: &str) {
+    println!("{DEBUG_LAYER_OUTCOME}{outcome}");
 }
 
 #[cfg(test)]
@@ -326,14 +358,17 @@ mod tests {
             return;
         }
         let Some(host) = super::host() else {
-            return; // no host GPU here
+            super::debug_layer_outcome("skipped: no host GPU here");
+            return;
         };
         if !host.debug_layer() {
-            return; // no debug layer installed
+            super::debug_layer_outcome("skipped: no debug layer installed");
+            return;
         }
         host.log_messages();
         let errors = super::DEBUG_ERRORS.lock().unwrap().clone();
         assert!(errors.is_empty(), "{errors:#?}");
+        super::debug_layer_outcome("checked");
     }
 
     #[test]
