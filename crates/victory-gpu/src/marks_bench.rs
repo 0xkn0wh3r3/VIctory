@@ -150,7 +150,7 @@ const BASE: u64 = 0x41 << 28;
 const BITMAP: u64 = 2 * 4096 / 8;
 
 /// The newest Windows SDK's `dxc.exe`.
-fn dxc() -> Option<PathBuf> {
+pub(crate) fn dxc() -> Option<PathBuf> {
     let bin = PathBuf::from(std::env::var_os("ProgramFiles(x86)")?).join(r"Windows Kits\10\bin");
     let mut versions: Vec<PathBuf> = std::fs::read_dir(bin)
         .ok()?
@@ -163,24 +163,37 @@ fn dxc() -> Option<PathBuf> {
 
 /// The shader of `variant`, compiled.
 fn compile(dxc: &PathBuf, variant: usize) -> Option<Vec<u8>> {
-    let dir = std::env::temp_dir().join(format!("victory-marks-{}", std::process::id()));
+    let define = format!("-DVARIANT={variant}");
+    let code = compile_hlsl(dxc, &format!("marks{variant}"), SOURCE, &[&define]);
+    assert!(code.is_some(), "dxc failed for {}", VARIANTS[variant]);
+    code
+}
+
+/// `source` compiled with `dxc` as a cs_6_6 program with `args` (None if it
+/// could not run); `name` names its files in the temporary folder.
+pub(crate) fn compile_hlsl(
+    dxc: &PathBuf,
+    name: &str,
+    source: &str,
+    args: &[&str],
+) -> Option<Vec<u8>> {
+    let dir = std::env::temp_dir().join(format!("victory-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
-    let src = dir.join("marks.hlsl");
-    let out = dir.join(format!("marks{variant}.cso"));
-    std::fs::write(&src, SOURCE).ok()?;
+    let src = dir.join(format!("{name}.hlsl"));
+    let out = dir.join(format!("{name}.cso"));
+    std::fs::write(&src, source).ok()?;
     let status = std::process::Command::new(dxc)
         .args(["-nologo", "-T", "cs_6_6", "-E", "main", "-O3"])
-        .arg(format!("-DVARIANT={variant}"))
+        .args(args)
         .arg("-Fo")
         .arg(&out)
         .arg(&src)
         .status()
         .ok()?;
-    assert!(status.success(), "dxc failed for {}", VARIANTS[variant]);
-    std::fs::read(out).ok()
+    status.success().then(|| std::fs::read(out).ok()).flatten()
 }
 
-fn buffer(
+pub(crate) fn buffer(
     device: &ID3D12Device,
     heap: D3D12_HEAP_PROPERTIES,
     size: u64,
@@ -221,7 +234,7 @@ fn buffer(
     out.unwrap()
 }
 
-fn heap(kind: D3D12_HEAP_TYPE) -> D3D12_HEAP_PROPERTIES {
+pub(crate) fn heap(kind: D3D12_HEAP_TYPE) -> D3D12_HEAP_PROPERTIES {
     D3D12_HEAP_PROPERTIES {
         Type: kind,
         ..Default::default()
@@ -239,7 +252,7 @@ fn system() -> D3D12_HEAP_PROPERTIES {
 }
 
 /// A queue, a list and a fence of the bench's own.
-struct Gpu {
+pub(crate) struct Gpu {
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
@@ -252,7 +265,7 @@ struct Gpu {
 }
 
 impl Gpu {
-    fn new(device: ID3D12Device) -> Gpu {
+    pub(crate) fn new(device: ID3D12Device) -> Gpu {
         // SAFETY: plain creation.
         unsafe {
             let queue: ID3D12CommandQueue = device
@@ -317,7 +330,7 @@ impl Gpu {
     }
 
     /// Runs `f` between two timestamps; its GPU time in ms.
-    fn timed(&mut self, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> f64 {
+    pub(crate) fn timed(&mut self, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> f64 {
         let (stamps, readback) = (self.stamps.clone(), self.readback.clone());
         self.run(|list| {
             // SAFETY: an open list, our heap and read-back buffer.
