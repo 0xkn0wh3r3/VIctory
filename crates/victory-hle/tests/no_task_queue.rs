@@ -90,4 +90,7 @@ fn a_null_process_queue_refuses_calls_given_no_queue() {
     let mut b = block(null);
     assert_eq!(XAsyncRun(&mut b, Some(work)), S_OK);
     assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+    // The wait lasts until the completion routine has run: after it, nothing
+    // of the runtime's touches the block, which goes as the test returns.
+    assert_eq!(CALLED.load(Ordering::SeqCst), 4, "work and completion");
 }
