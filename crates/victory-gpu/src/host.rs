@@ -1227,13 +1227,18 @@ impl Host {
         handle
     }
 
-    /// A null render target view, for a slot the title binds a texture the
-    /// host cannot render to (its copy was made without that use): draws
-    /// write nothing there, and the other targets keep their slots.
-    pub(crate) fn null_rtv(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    /// A null render target view, for a slot whose texture the host cannot
+    /// render to (no view recorded, no host copy, or a copy made without
+    /// that use): draws write nothing there, and the other targets keep
+    /// their slots. In `format` (the title's view format) where the host
+    /// renders to it, so it matches the pipeline's target formats; else in
+    /// `R8G8B8A8_UNORM`.
+    pub(crate) fn null_rtv(&self, format: Option<DXGI_FORMAT>) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         let desc = D3D12_RENDER_TARGET_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Format: format
+                .filter(|&f| renders_format(f))
+                .unwrap_or(DXGI_FORMAT_R8G8B8A8_UNORM),
             ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
@@ -2638,6 +2643,35 @@ fn title_window() -> Option<HWND> {
 pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     // SAFETY: a plain query.
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
+}
+
+/// Whether the host renders to `format` (`D3D12_FORMAT_SUPPORT1_RENDER_TARGET`),
+/// asked once per format.
+pub(crate) fn renders_format(format: DXGI_FORMAT) -> bool {
+    static KNOWN: Mutex<Vec<(i32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format.0) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: format,
+        ..Default::default()
+    };
+    let ok = format != DXGI_FORMAT_UNKNOWN
+        && host().is_some_and(|h| {
+            // SAFETY: a plain query into a struct of its size.
+            unsafe {
+                h.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            }
+            .is_ok()
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0
+        });
+    known.push((format.0, ok));
+    ok
 }
 
 /// Whether the host copy of a texture can be a render target: not when the
