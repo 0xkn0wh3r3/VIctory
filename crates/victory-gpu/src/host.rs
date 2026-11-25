@@ -2707,6 +2707,7 @@ pub(crate) fn retire(resource: ID3D12Resource) {
 pub(crate) fn release_retired() {
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     drop(retired);
+    crate::shadow::settle_spares();
 }
 
 /// Diagnostics: a noted command running a shader `VICTORY_TRACE_SHADERS`
