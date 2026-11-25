@@ -1416,6 +1416,7 @@ impl<'a> Lower<'a> {
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
             early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
+            #[cfg(test)]
             ticket: self.console_flat.is_some() && self.ticket(),
             dxil: self.s.finish(),
             user_data,
