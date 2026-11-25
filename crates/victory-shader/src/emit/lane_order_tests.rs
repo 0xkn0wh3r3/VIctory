@@ -289,12 +289,13 @@ fn host_waves_keep_what_the_relabelling_relies_on() {
 /// A console wave32 program that reads lanes (`v_mbcnt`, so it is
 /// relabelled) and stores 1 at its thread's flat id, `y * x_size + x`, in a
 /// group of `[x, y, 1]`: every slot of the group must hold 1, where ids
-/// repeated by the relabelling leave some at 0.
-fn marks_its_thread(shape: [u32; 2]) -> HostShader {
+/// repeated by the relabelling leave some at 0. With `lds_bytes`, it
+/// allocates that much LDS and writes the 1 there too.
+fn marks_its_thread_native(shape: [u32; 2], lds_bytes: u32) -> NativeProgram {
     let [x, y] = shape;
     assert!(x <= 64, "an inline multiplier");
     let mbcnt = [0xD765_0005_u32, 0x0001_00C1]; // v_mbcnt_lo_u32_b32 v5, -1, 0
-    let code: Vec<u32> = vec![
+    let mut code: Vec<u32> = vec![
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0A02,
@@ -310,7 +311,11 @@ fn marks_its_thread(shape: [u32; 2]) -> HostShader {
         0x800A_0604, // buffer_store_dword v6, v4, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ];
-    let native = NativeProgram {
+    if lds_bytes > 0 {
+        // ds_write_b32 v4, v6, before the store.
+        code.splice(11..11, [0xD834_0000, 0x0000_0604]);
+    }
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
@@ -332,14 +337,18 @@ fn marks_its_thread(shape: [u32; 2]) -> HostShader {
             user_data: 0,
             slot: 0,
         }],
-        // One user SGPR; thread ids x and y.
+        // One user SGPR; thread ids x and y; LDS in 512-byte blocks.
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 1 << 1 | 1 << 11,
+            rsrc2: 1 << 1 | 1 << 11 | (lds_bytes / 512) << 15,
             threads: [x, y, 1],
         }),
         code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let l = super::synthetic_tests::lowered(&native).expect("lower");
+    }
+}
+
+/// [`marks_its_thread_native`] without LDS, translated.
+fn marks_its_thread(shape: [u32; 2]) -> HostShader {
+    let l = super::synthetic_tests::lowered(&marks_its_thread_native(shape, 0)).expect("lower");
     HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -370,6 +379,14 @@ fn relabelled_threads_each_get_their_own_id() {
         eprintln!("no SM 6.6 hardware device; skipped");
         return;
     };
+    // Translated programs that read lanes declare the console's wave size,
+    // 32; a host that runs no waves of 32 refuses them.
+    if let Ok((min, max)) = host.wave_lanes()
+        && !(min..=max).contains(&32)
+    {
+        eprintln!("the host runs waves of {min} to {max} lanes, not 32; skipped");
+        return;
+    }
     let mut wrong = Vec::new();
     for shape in [
         [64, 1],
@@ -383,9 +400,17 @@ fn relabelled_threads_each_get_their_own_id() {
         [10, 10],
     ] {
         let cs = marks_its_thread(shape);
-        let (root, pso) = host
-            .compute_pipeline(&cs)
-            .unwrap_or_else(|e| panic!("{shape:?}: {e}"));
+        let (root, pso) = match host.compute_pipeline(&cs) {
+            Ok(p) => p,
+            // The 1-D group takes no ticket: a host refusing its program
+            // refuses the wave size, whatever range it reports (an Intel UHD,
+            // Xe-LP, refused it with "The parameter is incorrect").
+            Err(e) if shape == [64, 1] => {
+                eprintln!("the host refuses a program with waves of 32 ({e}); skipped");
+                return;
+            }
+            Err(e) => panic!("{shape:?}: {e}"),
+        };
         let n = shape[0] * shape[1];
         let ud = vec![0u32; cs.user_data_dwords().max(1) as usize];
         let out = host
@@ -407,4 +432,27 @@ fn relabelled_threads_each_get_their_own_id() {
         }
     }
     assert!(wrong.is_empty(), "ids repeated: {wrong:?}");
+}
+
+/// A program that reads lanes in a 2-D group and already allocates all the
+/// host's group-shared memory (32 KiB) has no room for the ticket's dword
+/// (`Lower::ticket`): it keeps the rounding of 1-D groups and translates,
+/// where with the ticket it would fail validation. With a block of LDS
+/// free, it takes the ticket.
+#[test]
+fn programs_with_all_the_lds_keep_the_rounding() {
+    let lower = |lds| super::synthetic_tests::lowered(&marks_its_thread_native([8, 8], lds));
+    let full = lower(32 * 1024).expect("lower");
+    let room = lower(32 * 1024 - 512).expect("lower");
+    assert!(!full.ticket, "all the LDS: the rounding");
+    assert!(room.ticket, "a block free: the ticket");
+    let path = super::validator::Validator::default_path();
+    let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
+        eprintln!("no validator; lowering checked only");
+        return;
+    };
+    for (label, mut dxil) in [("all the LDS", full.dxil), ("a block free", room.dxil)] {
+        v.validate(&mut dxil)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+    }
 }
