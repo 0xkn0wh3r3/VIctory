@@ -655,6 +655,9 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    // The debug overlay times input to present from the frame's first read.
+    #[cfg(windows)]
+    victory_gpu::overlay::note_input_read();
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
