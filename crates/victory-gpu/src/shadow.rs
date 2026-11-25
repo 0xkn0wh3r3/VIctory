@@ -924,9 +924,12 @@ fn in_place_enabled() -> bool {
 }
 
 
+/// A heap opened over a title allocation and its size; `None` if it could
+/// not be opened.
+type OpenedHeap = Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>;
+
 /// Host heaps opened over title allocations, by allocation base.
-static IN_PLACE_HEAPS: Mutex<Option<std::collections::HashMap<usize, Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>>>> =
-    Mutex::new(None);
+static IN_PLACE_HEAPS: Mutex<Option<std::collections::HashMap<usize, OpenedHeap>>> = Mutex::new(None);
 
 /// Title memory `[at, at + len)` was mapped or unmapped: in-place windows
 /// over it and heaps opened over allocations it touches show the old pages
@@ -1019,7 +1022,7 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
         at = info.BaseAddress as usize + info.RegionSize;
     }
     let offset = start - base as u64;
-    if offset % (64 << 10) != 0 {
+    if !offset.is_multiple_of(64 << 10) {
         return refuse("offset");
     }
     let host = host()?;
@@ -1523,6 +1526,7 @@ mod tests {
         // SAFETY: our own reservation; the middle 4 x 64 KiB committed.
         let base = unsafe { VirtualAlloc(std::ptr::null(), (8 * K) as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
         assert_ne!(base, 0);
+        // SAFETY: committing pages of our own reservation.
         unsafe { VirtualAlloc((base + 2 * K) as *const _, (4 * K) as usize, MEM_COMMIT, PAGE_READWRITE) };
         // A range in the committed middle: the committed part of the window.
         assert_eq!(committed_part(base, 8 * K, base + 3 * K + 8, base + 3 * K + 16), Some((base + 2 * K, 4 * K)));
@@ -1551,10 +1555,12 @@ mod tests {
         unsafe { *((base + (64 << 10)) as *mut u32) = 0x1234_5678 };
         let Some((buffer, gpu)) = in_place_buffer(base + (64 << 10), 128 << 10) else {
             // A host that cannot open process memory as a heap: copies stay.
+            // SAFETY: our allocation.
             unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
             return;
         };
         assert_ne!(gpu, 0);
+        // SAFETY: a plain query on a live buffer.
         assert_eq!(unsafe { buffer.GetDesc() }.Width, 128 << 10);
         // Off 64 KiB: refused.
         assert!(in_place_buffer(base + 4096, 64 << 10).is_none());
