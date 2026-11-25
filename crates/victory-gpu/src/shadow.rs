@@ -989,8 +989,18 @@ fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Counts title buffers made and released: which buffer is the innermost
+/// one holding some bytes ([`find`]) may differ when it changed.
+static OWNERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The count of [`OWNERS`].
+pub(crate) fn owners() -> u64 {
+    OWNERS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
     buffers().insert(
         (start, resource),
         Entry {
@@ -1002,6 +1012,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
+    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
     if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
         changed();
     }
