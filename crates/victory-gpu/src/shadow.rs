@@ -262,6 +262,11 @@ impl Shadow {
         Some((base + u32::try_from(page).ok()?, (start & 0xFFFF) as u32))
     }
 
+    /// Whether this is title memory itself (`VICTORY_IN_PLACE`), not a copy.
+    pub(crate) fn in_place(&self) -> bool {
+        self.in_place
+    }
+
     /// Whether writes through views of this copy are marked.
     pub(crate) fn marked(&self) -> bool {
         self.marks.is_some()
