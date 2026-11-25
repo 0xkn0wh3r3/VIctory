@@ -673,11 +673,14 @@ impl State {
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
                     if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
-                        // The bound view heap's stride table; without one
+                        // The bound view heap's stride table (and, in a
+                        // paged heap, its page table): the title's, else our
+                        // own, bound where the title binds none; without one
                         // the shader would read an unbound root view.
-                        let heap = (self.heaps[0] != 0)
-                            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                            .flatten();
+                        let heap = match self.heaps[0] {
+                            0 => crate::memory::heap(),
+                            h => crate::descriptor::heap(h as This).host(),
+                        };
                         let Some(table) = heap.and_then(|h| h.strides()) else {
                             once!("a shader reads view strides without a view heap: dropped");
                             not_run("view strides without a view heap");
