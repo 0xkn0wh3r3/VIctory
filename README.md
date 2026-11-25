@@ -42,7 +42,7 @@ What each part does today and what it still needs:
 |-----------|-------|-------|
 | Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
+| Network | Offline by design: the title's HTTP requests and WebSockets (WinHTTP and XCurl) go to a server on loopback inside VIctory, which logs each with its full URL, headers, body and messages and answers as a service that is down. Nothing the title sends leaves this machine | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
