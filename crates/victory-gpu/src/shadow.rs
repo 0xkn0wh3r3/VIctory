@@ -3351,7 +3351,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (copied, pieces) = crate::copy_pool::queued(|| {
             copy.update(p + 16, 16) + copy.update(p + PAGE + 16, 16)
         });
-        assert!(copied > 0 && !pieces.is_empty(), "queued");
+        // A copy in video memory (the default where the host has GPU upload
+        // heaps, #2870) copies at once instead (#2130).
+        assert!(copied > 0 && (copy.mirrored() || !pieces.is_empty()), "queued");
         crate::copy_pool::run(pieces);
         copy.queued_made();
         copy.write_host((p + 10) as u64, &[0xaa]);
