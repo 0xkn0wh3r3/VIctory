@@ -465,10 +465,9 @@ pub fn run(t: &mut Tap) {
     array.release();
 }
 
-/// The streaming workload (docs/acceptance.md, Workloads): memory-sourced
-/// requests through one real-time queue, raw and zlib, in the chunk sizes
-/// the DirectStorage overview recommends (64 KiB to 512 KiB). A report of
-/// throughput per kind; the console's own figures are 2.0 GB/s raw (its
+/// The streaming workload: memory-sourced requests through one real-time
+/// queue, raw and zlib, in the chunk sizes the DirectStorage overview
+/// recommends (64 KiB to 512 KiB). A report of throughput per kind; the console's own figures are 2.0 GB/s raw (its
 /// minimum) and 4.8 GB/s decompressed at 2:1.
 pub fn bench() -> String {
     let mut out = std::ptr::null_mut();
