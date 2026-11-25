@@ -1301,6 +1301,28 @@ fn shared_texture(
     Some(t)
 }
 
+/// Where title texture `r` lies in its title heap, if it is placed there
+/// and shares its heap's memory on the host ([`shares_heap`]).
+#[cfg(windows)]
+fn spot(r: &Resource) -> Option<crate::alias::Spot<'static>> {
+    match r.backing {
+        Backing::Placed { heap, offset } if shares_heap(&r.desc) => {
+            footprint(&r.desc).map(|info| {
+                // SAFETY: a placed resource holds its heap; the spot is
+                // used while the resource makes its host texture.
+                let h = unsafe { &*heap.cast::<Heap>() };
+                crate::alias::Spot {
+                    heaps: &h.host,
+                    heap_size: h.desc.size,
+                    offset,
+                    room: info.size,
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Whether host texture `t` takes a title texture of host description
 /// `d` at its memory: its uses, and a view format of its family or
 /// castable list.
@@ -1543,22 +1565,7 @@ impl Resource {
         // maps, which `evict` holds while it takes this lock).
         let (state, clear) = self.made_with;
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
-        let spot = match self.backing {
-            Backing::Placed { heap, offset } if shares_heap(&self.desc) => {
-                footprint(&self.desc).map(|info| {
-                    // SAFETY: a placed resource holds its heap.
-                    let h = unsafe { &*heap.cast::<Heap>() };
-                    crate::alias::Spot {
-                        heaps: &h.host,
-                        heap_size: h.desc.size,
-                        offset,
-                        room: info.size,
-                    }
-                })
-            }
-            _ => None,
-        };
-        let made = shared_texture(self.data() as u64, &self.desc, state, clear, spot);
+        let made = shared_texture(self.data() as u64, &self.desc, state, clear, spot(self));
         // A texture made meanwhile by another thread is the memory's too.
         self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
     }

@@ -183,6 +183,7 @@ impl HostHeaps {
         }
         let heap = heap?;
         crate::host::name(&heap, || format!("title heap of {size:#x} bytes"));
+        keep_resident(&heap);
         HEAPS.fetch_add(1, Relaxed);
         HEAP_BYTES.fetch_add(size, Relaxed);
         let h = Arc::new(HostHeap {
@@ -192,6 +193,31 @@ impl HostHeaps {
         });
         heaps[kind] = Some(h.clone());
         Some(h)
+    }
+}
+
+/// Gives host heap `heap` a high residency priority: its render targets
+/// and textures shaders write are used every frame, so when video memory
+/// runs short they are the last moved out of it. The priority is the
+/// heap's: a texture placed in it takes none of its own (asked of a placed
+/// texture, `SetResidencyPriority` removed the device at the next
+/// submission).
+fn keep_resident(heap: &ID3D12Heap) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let (Ok(device), Ok(pageable)) = (
+        host.device.cast::<ID3D12Device1>(),
+        heap.cast::<ID3D12Pageable>(),
+    ) else {
+        return;
+    };
+    // SAFETY: one live pageable object and its priority.
+    let set =
+        unsafe { device.SetResidencyPriority(1, &Some(pageable), &D3D12_RESIDENCY_PRIORITY_HIGH) };
+    if let Err(e) = set {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| tracing::debug!(error = %e, "no residency priority for host heaps"));
     }
 }
 
