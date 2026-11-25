@@ -338,6 +338,7 @@ impl Shadow {
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
+        COPY_BYTES.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
         shadow
     }
 
@@ -975,12 +976,21 @@ impl Drop for Shadow {
         if let Some(slice) = self.slice {
             arena().give_back(slice);
         }
+        COPY_BYTES.fetch_sub(self.len, std::sync::atomic::Ordering::Relaxed);
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
             m.give_back(base, pages(self.start, self.len));
         }
     }
+}
+
+/// Bytes of title memory with a host copy now (copies alive).
+static COPY_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`COPY_BYTES`], for the budget's report of what fills memory.
+pub(crate) fn copy_bytes() -> u64 {
+    COPY_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The 64 KiB title pages `[start, start + len)` touches.
@@ -1073,6 +1083,7 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
             let bytes = u64::from(bits / 8);
             let (buffer, data) = host()?.shared_buffer(bytes)?;
             crate::host::name(&buffer, || "views' written pages and read slots".into());
+            crate::host::keep_resident(&buffer, crate::host::Residency::Frame);
             // SAFETY: our mapped buffer of `bytes` bytes.
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             // SAFETY: a live buffer.
@@ -1830,6 +1841,21 @@ pub(crate) mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D12::*;
 
+    /// The views' written-pages bitmaps, which shaders that mark their
+    /// writes set every frame, are kept resident.
+    #[test]
+    fn the_written_pages_bitmap_is_kept_resident() {
+        for memory in [false, true] {
+            let Some(b) = bitmap(memory) else {
+                return; // no host GPU here
+            };
+            assert_eq!(
+                crate::host::kept(&b._buffer),
+                Some(crate::host::Residency::Frame)
+            );
+        }
+    }
+
     /// Runs this binary's test `name` again in a child process with
     /// `VICTORY_GPU_UPLOAD=1`, and `VICTORY_GPU_UPLOAD_WRITES=1` if `writes`
     /// (the switches are read once per process): true
@@ -1896,6 +1922,11 @@ pub(crate) mod tests {
                 heap_type(&copy),
                 D3D12_HEAP_TYPE_GPU_UPLOAD,
                 "round {round}: in a GPU upload heap"
+            );
+            assert_eq!(
+                crate::host::kept(&copy.buffer),
+                Some(crate::host::Residency::Frame),
+                "round {round}: kept resident"
             );
             assert_eq!(
                 crate::host::upload_bytes(),
