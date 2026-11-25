@@ -598,12 +598,6 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
-        // A pipeline too slow on this host (`crate::frame_budget`): dropped
-        // from what is recorded now. Closed lists keep its commands.
-        if crate::frame_budget::skips(&p.name) {
-            not_run("a pipeline too slow on this host");
-            return false;
-        }
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
@@ -3640,81 +3634,6 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
-    }
-
-    /// The slow-pipeline guard (`crate::frame_budget`) drops a banned
-    /// pipeline's dispatches when they are recorded (`State::bind`): a list
-    /// closed before the ban still runs its dispatch each time it is
-    /// submitted again, and one recorded after does not hold it.
-    #[test]
-    fn a_banned_pipeline_is_dropped_from_lists_recorded_after_the_ban() {
-        use crate::frame_budget::tests::{ONE, ban, reset, switch};
-        const SOURCE: &str = r#"
-#define RS "UAV(u0), RootConstants(num32BitConstants=1, b0)"
-RWByteAddressBuffer o : register(u0);
-cbuffer c : register(b0) { uint v; }
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void main() { o.Store(0, v); }
-"#;
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
-        let _on = switch(true);
-        reset();
-        let (root, pso) = compile_cs(SOURCE);
-        let p = HostPipeline {
-            compute: true,
-            mesh: false,
-            pso,
-            root,
-            stages: Vec::new(),
-            rectangles: false,
-            slots: 0,
-            inputs: Vec::new(),
-            name: "[compute banned]".into(),
-            marks: None,
-        };
-        let (out, data) = host.shared_buffer(256).unwrap();
-        // SAFETY: the buffer's mapped first dword, read and written while
-        // no list runs.
-        let value = || unsafe { data.cast::<u32>().read_volatile() };
-        // SAFETY: as above.
-        let clear = || unsafe { data.cast::<u32>().write_volatile(0) };
-        // Records a dispatch writing `v` as `State::dispatch` does: if the
-        // pipeline binds.
-        let record = |v: u32| {
-            let list = host.new_list().unwrap();
-            let bound = State::default().bind(&list, &p, true);
-            if bound {
-                // SAFETY: an open list with our pipeline bound.
-                unsafe {
-                    list.list
-                        .SetComputeRootUnorderedAccessView(0, out.GetGPUVirtualAddress());
-                    list.list.SetComputeRoot32BitConstant(1, v, 0);
-                    list.list.Dispatch(1, 1, 1);
-                }
-            }
-            list.close();
-            (list, bound)
-        };
-        let (before, bound) = record(1);
-        assert!(bound);
-        clear();
-        host.execute(&[&before]);
-        assert_eq!(value(), 1);
-        ban("[compute banned]");
-        // Submission does not bind again: the closed list runs it.
-        clear();
-        host.execute(&[&before]);
-        assert_eq!(value(), 1, "a list recorded before the ban still runs it");
-        let (after, bound) = record(2);
-        assert!(!bound, "dropped when recorded after the ban");
-        clear();
-        host.execute(&[&after]);
-        assert_eq!(value(), 0);
-        reset();
     }
 
     #[test]
