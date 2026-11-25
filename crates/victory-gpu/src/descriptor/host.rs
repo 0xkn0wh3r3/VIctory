@@ -228,6 +228,15 @@ impl HostHeap {
             })
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
+        // A paged heap's page table is in the stride table's buffer: without
+        // it shaders would find no page, and there is nowhere to enter one.
+        let strides = match strides {
+            None if paged => {
+                tracing::warn!(count, "no stride and page table: no paged host view heap");
+                return None;
+            }
+            strides => strides,
+        };
         let marks = (!sampler)
             .then(|| {
                 let bytes = u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 8;
@@ -308,7 +317,7 @@ impl HostHeap {
         // and scratch pages: a table of them is bound as a range of the
         // host heap. Every other page reads the null page until placed.
         let pages = paged.then(|| {
-            let table = strides.as_ref().map_or(0, |s| s.1)
+            let table = strides.as_ref().expect("checked above").1
                 + victory_shader::emit::VIEW_PAGE_TABLE as usize;
             let virtual_pages = (victory_shader::emit::HEAP_VIEWS / PAGE) as usize;
             // SAFETY: the mapped table past the strides, a dword per page.
@@ -321,6 +330,13 @@ impl HostHeap {
                 unsafe { (table as *mut u32).add(page as usize).write_volatile(next) };
                 next += 1;
             }
+            tracing::info!(
+                slots = count,
+                host_slots = total,
+                pages = total / PAGE,
+                fixed = next,
+                "view heap paged: the host caps view heaps, title slots are placed by page"
+            );
             Pages {
                 placed: Mutex::new((placed, next)),
                 end: total / PAGE,
