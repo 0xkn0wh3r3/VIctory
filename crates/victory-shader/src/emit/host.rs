@@ -196,6 +196,69 @@ impl Host {
         Host { device, warp }
     }
 
+    /// A device on hardware adapter `adapter` that runs SM 6.6 (#1960's
+    /// tests run on every adapter).
+    fn on(adapter: &IDXGIAdapter1) -> Result<Self, String> {
+        // SAFETY: plain D3D12 calls with valid out pointers.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            let device = device.ok_or("no device")?;
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut sm).cast(),
+                    size_of_val(&sm) as u32,
+                )
+                .map_err(err)?;
+            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+                return Err(format!(
+                    "the device supports SM {:#x} only",
+                    sm.HighestShaderModel.0
+                ));
+            }
+            Ok(Host {
+                device,
+                warp: false,
+            })
+        }
+    }
+
+    /// Every hardware adapter that runs SM 6.6, by name: GPUs as
+    /// [`hardware_adapter`] takes them (not software, with video memory of
+    /// their own).
+    pub fn hardware() -> Vec<(String, Host)> {
+        let mut out = Vec::new();
+        // SAFETY: plain DXGI calls with valid out pointers.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return out;
+            };
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(i) {
+                i += 1;
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || desc.DedicatedVideoMemory == 0
+                {
+                    continue;
+                }
+                let len = desc.Description.iter().position(|&c| c == 0);
+                let name = String::from_utf16_lossy(&desc.Description[..len.unwrap_or(128)]);
+                if let Ok(host) = Self::on(&adapter) {
+                    out.push((name, host));
+                }
+            }
+        }
+        out
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.

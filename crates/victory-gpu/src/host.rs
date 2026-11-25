@@ -231,6 +231,25 @@ fn create() -> windows::core::Result<Host> {
             )
             .is_ok()
             && options.DepthBoundsTestSupported.as_bool();
+        // Whether compute shaders run in 64-lane waves: the translation
+        // splits wave64 programs into host waves of 32 lanes otherwise.
+        let mut lanes = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let wave64 = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut lanes).cast(),
+                size_of_val(&lanes) as u32,
+            )
+            .is_ok()
+            && lanes.WaveLaneCountMin <= 64
+            && lanes.WaveLaneCountMax >= 64;
+        victory_shader::emit::set_host_wave64(wave64);
+        tracing::info!(
+            min = lanes.WaveLaneCountMin,
+            max = lanes.WaveLaneCountMax,
+            wave64,
+            "host wave lanes"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
