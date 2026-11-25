@@ -814,7 +814,7 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
-    /// The frame budget's timed commands (`crate::budget`): a timestamp
+    /// The frame budget's timed commands (`crate::frame_budget`): a timestamp
     /// before and after each, where they are read back, and each one's
     /// pipeline.
     timing: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
@@ -1337,8 +1337,8 @@ impl Host {
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
-        crate::budget::submitted(prepared - started, gpu);
-        if crate::budget::timing() {
+        crate::frame_budget::submitted(prepared - started, gpu);
+        if crate::frame_budget::timing() {
             // SAFETY: a plain query.
             let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
             for r in runs {
@@ -1763,10 +1763,10 @@ impl HostList {
         self.timing.get_or_init(|| timestamps(TIMED)).as_ref()
     }
 
-    /// Before a command the frame budget times (`crate::budget`): its
+    /// Before a command the frame budget times (`crate::frame_budget`): its
     /// number, None where commands are not timed (or no room is left).
     pub(crate) fn time_start(&self) -> Option<u32> {
-        if !crate::budget::timing() {
+        if !crate::frame_budget::timing() {
             return None;
         }
         let k = self.timed.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
@@ -1799,7 +1799,7 @@ impl HostList {
     /// budget (`frequency`: the queue's timestamp ticks a second).
     fn report_timed(&self, frequency: u64) {
         for (pipeline, ms) in self.timed_ms(frequency) {
-            crate::budget::ran(&pipeline, ms);
+            crate::frame_budget::ran(&pipeline, ms);
         }
     }
 
@@ -3078,7 +3078,7 @@ impl Host {
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         // A frame ends: the frame budget reports it if it was slow.
-        crate::budget::presented();
+        crate::frame_budget::presented();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {

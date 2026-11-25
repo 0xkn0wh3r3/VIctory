@@ -18,8 +18,6 @@
 
 #[cfg(windows)]
 mod bindless;
-#[cfg(windows)]
-mod budget;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -34,6 +32,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod frame_budget;
 mod hold;
 #[cfg(windows)]
 mod host;

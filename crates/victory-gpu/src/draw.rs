@@ -593,8 +593,8 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
-        // A pipeline too slow on this host (`crate::budget`).
-        if crate::budget::skips(&p.name) {
+        // A pipeline too slow on this host (`crate::frame_budget`).
+        if crate::frame_budget::skips(&p.name) {
             not_run("a pipeline too slow on this host");
             return false;
         }
