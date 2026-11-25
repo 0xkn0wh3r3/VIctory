@@ -80,48 +80,128 @@ const SCRATCH_PAGE: u32 = 1;
 /// none: [`NULL_PAGE`]), entered in the page table shaders read, and the
 /// host pages not given out yet.
 struct Pages {
-    placed: Mutex<(Vec<u32>, u32)>,
+    placed: Mutex<Placed>,
     /// Host pages in all.
     end: u32,
     /// The page table, a dword per page, in the view-stride table's buffer.
     table: usize,
 }
 
+/// [`Pages`] as they are placed and written.
+struct Placed {
+    /// Per page of slots, its host page.
+    host: Vec<u32>,
+    /// The next host page to give out.
+    next: u32,
+    /// The first host page given out on a write (those before it hold the
+    /// dynamic slots, placed at once).
+    first: u32,
+    /// Per page of slots, a bit per slot written: how full the pages placed
+    /// on a write are tells whether smaller pages would fit more of a title.
+    written: Vec<u64>,
+    /// Slots written in pages placed on a write.
+    slots: u64,
+    /// Pages written when no host page was left, and their slots written.
+    refused: u32,
+    refused_slots: u64,
+}
+
+// A page's bits are whole words.
+const _: () = assert!(PAGE % 64 == 0);
+
+impl Placed {
+    /// `host` per page of slots, `next` the first host page to give out.
+    fn new(host: Vec<u32>, next: u32) -> Self {
+        let words = host.len() * (PAGE / 64) as usize;
+        Self {
+            host,
+            next,
+            first: next,
+            written: vec![0; words],
+            slots: 0,
+            refused: 0,
+            refused_slots: 0,
+        }
+    }
+
+    /// Notes slot `index` written: whether it is the slot's first write,
+    /// and its page's.
+    fn note(&mut self, index: u32) -> (bool, bool) {
+        let words = (PAGE / 64) as usize;
+        let at = (index / PAGE) as usize * words;
+        let bits = &mut self.written[at..at + words];
+        let page_new = bits.iter().all(|&w| w == 0);
+        let k = (index % PAGE) as usize;
+        let bit = 1u64 << (k % 64);
+        let new = bits[k / 64] & bit == 0;
+        bits[k / 64] |= bit;
+        (new, new && page_new)
+    }
+
+    /// Slots in the pages placed on a write.
+    fn placed_slots(&self) -> u64 {
+        u64::from(self.next - self.first) * u64::from(PAGE)
+    }
+}
+
 impl Pages {
     /// The host slot of slot `index`, placing its page if it has none and
-    /// `place`; None where it has none (none left, or not to place).
+    /// `place` (a write); None where it has none (none left, or not to
+    /// place).
     fn slot(&self, index: u32, place: bool) -> Option<u32> {
         let page = (index / PAGE) as usize;
         let mut guard = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-        let (placed, next) = &mut *guard;
-        let host = match *placed.get(page)? {
+        let p = &mut *guard;
+        let host = match *p.host.get(page)? {
             NULL_PAGE if !place => return None,
             NULL_PAGE => {
-                if *next >= self.end {
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        tracing::warn!(
-                            pages = self.end,
-                            "no room left in the host view heap: slots of further pages read null"
-                        );
-                    });
+                if p.next >= self.end {
+                    let (new, page_new) = p.note(index);
+                    p.refused_slots += u64::from(new);
+                    if page_new {
+                        p.refused += 1;
+                        if p.refused == 1 {
+                            tracing::warn!(
+                                pages = self.end,
+                                written = p.slots,
+                                of = p.placed_slots(),
+                                "no room left in the host view heap: slots of further pages read null"
+                            );
+                        } else if p.refused.is_power_of_two() {
+                            tracing::info!(
+                                pages = p.refused,
+                                written = p.refused_slots,
+                                placed_written = p.slots,
+                                of = p.placed_slots(),
+                                "view heap pages written with no room left"
+                            );
+                        }
+                    }
                     return None;
                 }
-                let host = *next;
-                *next += 1;
-                placed[page] = host;
+                let host = p.next;
+                p.next += 1;
+                p.host[page] = host;
                 // SAFETY: the mapped page table has a dword per page.
                 unsafe { (self.table as *mut u32).add(page).write_volatile(host) };
-                if host.is_power_of_two() || *next == self.end {
+                p.slots += u64::from(p.note(index).0);
+                if host.is_power_of_two() || p.next == self.end {
                     tracing::info!(
                         pages = host + 1,
                         of = self.end,
+                        written = p.slots,
+                        of_slots = p.placed_slots(),
                         "host view heap pages in use"
                     );
                 }
                 host
             }
-            host => host,
+            host => {
+                if place && host >= p.first {
+                    p.slots += u64::from(p.note(index).0);
+                }
+                host
+            }
         };
         Some(host * PAGE + index % PAGE)
     }
@@ -338,7 +418,7 @@ impl HostHeap {
                 "view heap paged: the host caps view heaps, title slots are placed by page"
             );
             Pages {
-                placed: Mutex::new((placed, next)),
+                placed: Mutex::new(Placed::new(placed, next)),
                 end: total / PAGE,
                 table,
             }
@@ -2209,7 +2289,7 @@ mod tests {
     fn pages_are_placed_once_on_first_write() {
         let mut table = vec![0u32; 8];
         let pages = Pages {
-            placed: Mutex::new((vec![NULL_PAGE; 8], SCRATCH_PAGE + 1)),
+            placed: Mutex::new(Placed::new(vec![NULL_PAGE; 8], SCRATCH_PAGE + 1)),
             end: 4,
             table: table.as_mut_ptr() as usize,
         };
@@ -2224,9 +2304,47 @@ mod tests {
         assert_eq!(pages.slot(at(6, 0), true), Some(at(3, 0)));
         assert_eq!(pages.slot(at(7, 1), true), None, "no host page left");
         assert_eq!(pages.slot(at(8, 0), true), None, "past the virtual pages");
-        assert_eq!(pages.placed.lock().unwrap().1, 4);
+        assert_eq!(pages.placed.lock().unwrap().next, 4);
         drop(pages);
         assert_eq!(table, [0, 0, 0, 2, 0, 0, 3, 0]);
+    }
+
+    /// Slots written are counted once each, in the pages placed on a write
+    /// (not the ones placed at once) and in the pages with no room left;
+    /// reads count none.
+    #[test]
+    fn written_slots_are_counted_per_page() {
+        let mut table = vec![0u32; 8];
+        let mut host = vec![NULL_PAGE; 8];
+        host[0] = SCRATCH_PAGE + 1; // placed at once, as the dynamic slots
+        let pages = Pages {
+            placed: Mutex::new(Placed::new(host, SCRATCH_PAGE + 2)),
+            end: 5,
+            table: table.as_mut_ptr() as usize,
+        };
+        let at = |page: u32, k: u32| page * PAGE + k;
+        for k in [0, 1, 1, 63, 64, PAGE - 1] {
+            pages.slot(at(2, k), true);
+        }
+        pages.slot(at(2, 7), false);
+        pages.slot(at(0, 3), true);
+        pages.slot(at(4, 9), true);
+        {
+            let p = pages.placed.lock().unwrap();
+            assert_eq!(p.next, 5);
+            assert_eq!((p.slots, p.placed_slots()), (6, 2 * u64::from(PAGE)));
+            assert_eq!((p.refused, p.refused_slots), (0, 0));
+        }
+        pages.slot(at(5, 1), true);
+        pages.slot(at(5, 1), true);
+        pages.slot(at(5, 2), true);
+        pages.slot(at(6, 0), true);
+        let p = pages.placed.lock().unwrap();
+        assert_eq!((p.refused, p.refused_slots), (2, 3));
+        assert_eq!(p.slots, 6);
+        drop(p);
+        drop(pages);
+        assert_eq!(table, [0, 0, 3, 0, 4, 0, 0, 0]);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
