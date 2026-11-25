@@ -128,6 +128,7 @@ const V_AND: u32 = 0x1B;
 const V_ADD: u32 = 0x25;
 const V_SUB: u32 = 0x26;
 // VOP3-only and VOPC opcodes.
+const V_CMP_EQ_U32: u32 = 0xC2;
 const V_CMP_GT_U32: u32 = 0xC4;
 const V_CMP_NE_U32: u32 = 0xC5;
 const V_MUL_LO_U32: u32 = 0x169;
@@ -197,9 +198,22 @@ fn lower_counting(
     lds: u32,
     host_wave64: bool,
 ) -> Result<(HostShader, u32), String> {
+    lower_waves(words, threads, lds, true, host_wave64, false)
+}
+
+/// [`lower_counting`] of a console wave64 program, or (not `wave64`) of a
+/// wave32 one; with `group_id`, the group id x in s1.
+fn lower_waves(
+    words: &[u32],
+    threads: u32,
+    lds: u32,
+    wave64: bool,
+    host_wave64: bool,
+    group_id: bool,
+) -> Result<(HostShader, u32), String> {
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: true,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -220,7 +234,7 @@ fn lower_counting(
             slot: 0,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 1 << 1 | (lds / 512) << 15,
+            rsrc2: 1 << 1 | u32::from(group_id) << 7 | (lds / 512) << 15,
             threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -793,4 +807,220 @@ fn lds_in_one_wave64_wave_of_more_than_32_threads_is_refused() {
     lower_cs(&w, 64, 512, true).expect("lowered for 64-lane waves");
     lower_cs(&w, 32, 512, false).expect("one host wave");
     lower_cs(&w, 128, 512, false).expect("two console waves");
+}
+
+// ---- what the split costs ----
+
+/// The cross-lane operation of each block of [`timing_program`].
+#[derive(Clone, Copy, PartialEq)]
+enum Cross {
+    /// None: the program reads only its own lane's console lane.
+    None,
+    /// `v_readlane_b32` of lane 5, added to every lane.
+    ReadLane,
+    /// `v_readfirstlane_b32` (every lane in EXEC), added to every lane.
+    ReadFirstLane,
+}
+
+/// The prologue, each lane's console lane (`v_mbcnt`) added to its data,
+/// then `blocks` blocks of `alu` multiply-xorshifts and one `cross` operation,
+/// and the result stored by group 0 (the group id x in s1), and by lanes of
+/// other groups whose result is 0x12345678 (the same value in the same
+/// dword: every group computes what group 0 does). Other groups' stores to
+/// the same dwords made a floor of their own, and a store by group 0 alone
+/// let the compiler skip the work everywhere else. The same words as a
+/// wave64 and as a wave32 program (`wave64`), but for the masks at the end.
+fn timing_program(threads: u32, blocks: u32, alu: u32, cross: Cross, wave64: bool) -> Vec<u32> {
+    let mut w = vec![s_mov_b32(20, s(1))];
+    w.extend(prologue());
+    w.extend(vop3(V_MBCNT_LO, 3, 0xC1, k(0), 0)); // -1
+    w.extend(vop3(V_MBCNT_HI, 3, 0xC1, v(3), 0));
+    w.push(vop2(V_ADD, 1, v(3), 1));
+    for _ in 0..blocks {
+        // Multiply and xor-shift: not affine, so no compiler folds a chain.
+        for _ in 0..alu {
+            w.extend(vop3(V_MUL_LO_U32, 1, v(1), s(2), 0));
+            w.push(vop2(V_LSHRREV, 4, k(9), 1));
+            w.push(vop2(0x1D, 1, v(4), 1)); // v_xor_b32
+        }
+        match cross {
+            Cross::None => {}
+            Cross::ReadLane => w.extend(vop3(V_READLANE, 14, v(1), k(5), 0)),
+            Cross::ReadFirstLane => w.push(v_readfirstlane_b32(14, v(1))),
+        }
+        if cross != Cross::None {
+            w.push(vop2(V_ADD, 1, s(14), 1));
+        }
+    }
+    w.extend([s_mov_b32(3, LITERAL), 0x1234_5678]);
+    w.extend(vop3(V_CMP_EQ_U32, 22, s(3), v(1), 0));
+    w.push(0xBF06_8014); // s_cmp_eq_u32 s20, 0
+    if wave64 {
+        w.push(sop2(0x0B, 22, 0xC1, s(22))); // s_cselect_b64 s[22:23], -1, s[22:23]
+        w.push(sop1(S_AND_SAVEEXEC_B64, 26, s(22)));
+    } else {
+        w.push(sop2(0x0A, 22, 0xC1, s(22))); // s_cselect_b32 s22, -1, s22
+        w.push(sop1(0x3C, 26, s(22))); // s_and_saveexec_b32 s26, s22
+    }
+    w.extend(store(1, 0, threads));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// [`timing_program`]'s results in console waves of `lanes` lanes.
+fn timing_model(threads: u32, blocks: u32, alu: u32, cross: Cross, lanes: u32) -> Vec<u32> {
+    let mut vals: Vec<u32> = (0..threads)
+        .map(|t| data(t).wrapping_add(t % lanes))
+        .collect();
+    for _ in 0..blocks {
+        for x in vals.iter_mut() {
+            for _ in 0..alu {
+                *x = x.wrapping_mul(0x9E37_79B1);
+                *x ^= *x >> 9;
+            }
+        }
+        let from = match cross {
+            Cross::None => continue,
+            Cross::ReadLane => 5,
+            Cross::ReadFirstLane => 0,
+        };
+        let before = vals.clone();
+        for (t, x) in vals.iter_mut().enumerate() {
+            *x = x.wrapping_add(before[t / lanes as usize * lanes as usize + from]);
+        }
+    }
+    vals
+}
+
+/// The GPU's time per dispatch of compute-heavy programs (up to 65536
+/// groups of 256 threads) on each hardware adapter: a console wave64 program split
+/// into two 32-lane host waves (`lower::wave64`), the same words as a
+/// wave32 program (the work without the split: its cross-lane reads stay
+/// in 32 lanes, so its results differ), and the wave64 program on 64-lane
+/// host waves where the adapter runs them. Each run's results are checked
+/// against the console's (for its wave size).
+/// `cargo test --release -p victory-shader --lib wave64_split_cost -- --ignored --nocapture`
+#[test]
+#[ignore = "benchmark: run in release with --ignored --nocapture"]
+fn wave64_split_cost() {
+    const THREADS: u32 = 256;
+    const GROUPS: u32 = 65536;
+    const REPEAT: u32 = 50;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts = Host::hardware();
+    if hosts.is_empty() {
+        eprintln!("no hardware adapter; skipped");
+        return;
+    }
+    let cases = [
+        ("lane ids only, 128 ALU steps", 16, 8, Cross::None),
+        ("1 v_readlane per 64 ALU steps (x2)", 2, 64, Cross::ReadLane),
+        ("1 v_readlane per 32 ALU steps (x4)", 4, 32, Cross::ReadLane),
+        ("1 v_readlane per 8 ALU steps (x16)", 16, 8, Cross::ReadLane),
+        (
+            "1 v_readfirstlane per 8 ALU steps (x16)",
+            16,
+            8,
+            Cross::ReadFirstLane,
+        ),
+        ("16 v_readlane back to back", 16, 0, Cross::ReadLane),
+        ("64 v_readlane back to back", 64, 0, Cross::ReadLane),
+    ];
+    'adapters: for (name, host) in &hosts {
+        let (min, max) = host.wave_lanes();
+        // Groups for about 0.4 ms per dispatch of the first program, at most
+        // GROUPS: an integrated GPU's list of 51 dispatches of GROUPS groups
+        // ran past the timeout that removes the device.
+        let groups = {
+            let (blocks, alu, cross) = (cases[0].1, cases[0].2, cases[0].3);
+            let words = timing_program(THREADS, blocks, alu, cross, false);
+            let (shader, _) = lower_waves(&words, THREADS, 0, false, false, true).unwrap();
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let d = Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(THREADS)],
+                samplers: &[],
+                groups: [256, 1, 1],
+            };
+            match host.dispatch_timed(&root, &pso, &d, 4) {
+                // The host's timing is seconds for all four: ms per dispatch.
+                Ok((_, secs)) => {
+                    let ms = secs * 1e3 / 4.0;
+                    ((256.0 * 0.4 / ms.max(1e-6)) as u32).clamp(64, GROUPS)
+                }
+                Err(e) => {
+                    eprintln!("{name}: {e}; adapter skipped");
+                    continue;
+                }
+            }
+        };
+        eprintln!(
+            "{name}: waves of {min}-{max} lanes; {groups} groups of {THREADS}, GPU ms per dispatch (median of 3 x {REPEAT})"
+        );
+        eprintln!(
+            "| program | group syncs | wave32 program | wave64 split | split / wave32 | wave64 native |"
+        );
+        eprintln!("|---|---|---|---|---|---|");
+        for (label, blocks, alu, cross) in cases {
+            let mut times = Vec::new();
+            let mut syncs = 0;
+            for (wave64, host64) in [(false, false), (true, false), (true, true)] {
+                let words = timing_program(THREADS, blocks, alu, cross, wave64);
+                let lanes = if host64 { 64 } else { 32 };
+                if !(min..=max).contains(&lanes) {
+                    times.push(None);
+                    continue;
+                }
+                let (shader, n) = lower_waves(&words, THREADS, 0, wave64, host64, true)
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
+                if wave64 && !host64 {
+                    syncs = n;
+                }
+                let (root, pso) = host
+                    .compute_pipeline(&shader)
+                    .unwrap_or_else(|e| panic!("{name}, {label}: pipeline: {e}"));
+                let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                let d = Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(THREADS)],
+                    samplers: &[],
+                    groups: [groups, 1, 1],
+                };
+                let mut ms = Vec::new();
+                for _ in 0..3 {
+                    let (out, t) = match host.dispatch_timed(&root, &pso, &d, REPEAT) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("{name}, {label}: {e}; adapter skipped");
+                            continue 'adapters;
+                        }
+                    };
+                    let want =
+                        timing_model(THREADS, blocks, alu, cross, if wave64 { 64 } else { 32 });
+                    assert_eq!(
+                        out[0], want,
+                        "{name}, {label}, wave64 {wave64}, host {lanes} lanes"
+                    );
+                    // Seconds for all REPEAT dispatches: ms per dispatch.
+                    ms.push(t * 1e3 / f64::from(REPEAT));
+                }
+                ms.sort_by(f64::total_cmp);
+                times.push(Some(ms[1]));
+            }
+            let cell = |t: Option<f64>| t.map_or("n/a".into(), |t| format!("{t:.3}"));
+            let ratio = match (times[0], times[1]) {
+                (Some(a), Some(b)) => format!("{:.2}x", b / a),
+                _ => "n/a".into(),
+            };
+            eprintln!(
+                "| {label} | {syncs} | {} | {} | {ratio} | {} |",
+                cell(times[0]),
+                cell(times[1]),
+                cell(times[2])
+            );
+        }
+    }
 }
