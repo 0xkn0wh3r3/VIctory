@@ -803,14 +803,17 @@ extern "system" fn copy_texture_region(
             }
             from.resource = texture.as_raw().cast_const().cast();
         }
-        crate::texture::host_writes(list, dst.resource);
         if same {
             // SAFETY: the title's box (same layout as the host's) or null.
             let in_place = match unsafe { source_box.as_ref() } {
                 Some(b) => [b[0], b[1], b[2]] == [x, y, z],
                 None => [x, y, z] == [0; 3],
             };
-            if !in_place {
+            if in_place {
+                // As a copy would have: what is noted stays as it was.
+                crate::texture::host_writes(list, dst.resource);
+            } else {
+                // Not done, so the destination is not the host's either.
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     tracing::warn!("a copy to another place in its own subresource is not done");
@@ -819,6 +822,7 @@ extern "system" fn copy_texture_region(
             self_copy(dst.resource, src.resource);
             return;
         }
+        crate::texture::host_writes(list, dst.resource);
         ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
