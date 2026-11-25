@@ -202,11 +202,17 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     let list = guard.0.as_ref()?;
     let mut recorded = false;
     let mut done = std::collections::HashSet::new();
+    // Held while uploading: the title releasing a texture (and its memory)
+    // waits in `forget`. The heaps themselves are not: the title writing
+    // their slots (`Viewed::set`, under the host heap's lock) goes on while
+    // the textures are detiled and hashed.
+    let _uploading = UPLOADING.lock().unwrap_or_else(|e| e.into_inner());
     for viewed in heaps {
-        // Held while uploading: the title releasing a texture (and its
-        // memory) waits in `forget`.
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for &r in inner.textures.keys() {
+        let textures: Vec<usize> = {
+            let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.textures.keys().copied().collect()
+        };
+        for r in textures {
             if !done.insert(r) {
                 continue;
             }
@@ -282,9 +288,14 @@ pub(crate) fn register(viewed: &Arc<Viewed>) {
     heaps.push(Arc::downgrade(viewed));
 }
 
+/// Held by [`uploads`] while it reads the heaps' textures, and by
+/// [`forget`]: a texture the title releases is not freed under it.
+static UPLOADING: Mutex<()> = Mutex::new(());
+
 /// The title released `resource`: slots viewing it as a texture view
 /// nothing to upload any more (its memory may be gone).
 pub(crate) fn forget(resource: usize) {
+    let _uploading = UPLOADING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
