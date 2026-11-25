@@ -151,6 +151,7 @@ fn lowered_with(
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        native16: false,
     })
 }
 
@@ -1148,6 +1149,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             prims: Vec::new(),
             mesh_stride: 0,
             view_marks: false,
+            native16: false,
         })
         .expect("lower");
         if let Ok(mut v) =
