@@ -38,7 +38,9 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    pub(crate) queue: ID3D12CommandQueue,
+    queue: ID3D12CommandQueue,
+    /// The queue's timestamp ticks a second, asked once.
+    frequency: OnceLock<u64>,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -240,6 +242,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             queue,
+            frequency: OnceLock::new(),
             fence,
             submitted: Mutex::new(0),
             event,
@@ -1178,6 +1181,12 @@ impl Host {
         }
     }
 
+    /// The queue's timestamp ticks a second.
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: a plain query.
+        *self.frequency.get_or_init(|| unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1))
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -1315,14 +1324,12 @@ impl Host {
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let frequency = self.timestamp_frequency();
                 gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let frequency = self.timestamp_frequency();
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
                 for (ms, op) in runs[i].slowest(frequency, 6) {
@@ -1338,11 +1345,11 @@ impl Host {
         let _ = &firsts;
         let gpu = prepared.elapsed();
         crate::frame_budget::submitted(prepared - started, gpu);
+        // The frame budget's timed commands: only lists that timed some
+        // are read back.
         if crate::frame_budget::timing() {
-            // SAFETY: a plain query.
-            let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
             for r in runs {
-                r.report_timed(frequency);
+                r.report_timed(self);
             }
         }
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
@@ -1758,9 +1765,21 @@ impl HostList {
     }
 
     /// The frame budget's timestamp heap and its read-back buffer, made
-    /// on first use.
+    /// at the list's first timed command and kept across resets.
     fn timing(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
         self.timing.get_or_init(|| timestamps(TIMED)).as_ref()
+    }
+
+    /// The frame budget's timestamp heap and its read-back buffer if the
+    /// list made them.
+    fn timing_made(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        self.timing.get().and_then(Option::as_ref)
+    }
+
+    /// The frame budget's timestamp heap, if the list made it.
+    #[cfg(test)]
+    pub(crate) fn timestamp_heap(&self) -> Option<ID3D12QueryHeap> {
+        self.timing_made().map(|(heap, _)| heap.clone())
     }
 
     /// Before a command the frame budget times (`crate::frame_budget`): its
@@ -1782,7 +1801,7 @@ impl HostList {
     /// After timed command `k` (from [`HostList::time_start`]) of
     /// `pipeline`.
     pub(crate) fn time_end(&self, k: u32, pipeline: &str) {
-        let Some((heap, _)) = self.timing() else {
+        let Some((heap, _)) = self.timing_made() else {
             return;
         };
         // SAFETY: an open list and our query heap.
@@ -1795,18 +1814,19 @@ impl HostList {
         timed.push(pipeline.to_owned());
     }
 
-    /// After the list ran: each timed command's GPU time to the frame
-    /// budget (`frequency`: the queue's timestamp ticks a second).
-    fn report_timed(&self, frequency: u64) {
-        for (pipeline, ms) in self.timed_ms(frequency) {
-            crate::frame_budget::ran(&pipeline, ms);
+    /// After the list ran on `host`: each timed command's GPU time to the
+    /// frame budget. A list that timed none reads nothing back.
+    fn report_timed(&self, host: &Host) {
+        if self.timed.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return;
         }
+        crate::frame_budget::ran(self.timed_ms(host.timestamp_frequency()));
     }
 
     /// After the list ran: each timed command's pipeline and GPU time in ms.
     pub(crate) fn timed_ms(&self, frequency: u64) -> Vec<(String, f64)> {
         let timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((_, back)) = self.timing().filter(|_| !timed.is_empty()) else {
+        let Some((_, back)) = self.timing_made().filter(|_| !timed.is_empty()) else {
             return Vec::new();
         };
         let n = 2 * timed.len();
@@ -1838,7 +1858,7 @@ impl HostList {
     pub(crate) fn close(&self) {
         let timed = self.timed.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
         if timed > 0
-            && let Some((heap, back)) = self.timing()
+            && let Some((heap, back)) = self.timing_made()
         {
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {

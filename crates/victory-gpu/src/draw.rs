@@ -3004,7 +3004,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// submitted again, and one recorded after does not hold it.
     #[test]
     fn a_banned_pipeline_is_dropped_from_lists_recorded_after_the_ban() {
-        use crate::frame_budget::tests::{ONE, frame, reset};
+        use crate::frame_budget::tests::{ONE, ban, reset, switch};
         const SOURCE: &str = r#"
 #define RS "UAV(u0), RootConstants(num32BitConstants=1, b0)"
 RWByteAddressBuffer o : register(u0);
@@ -3017,10 +3017,7 @@ void main() { o.Store(0, v); }
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
-        let (on, limit) = crate::frame_budget::guard();
-        if !on {
-            return; // VICTORY_SLOW_PIPELINES=0 here
-        }
+        let _on = switch(true);
         reset();
         let (root, pso) = compile_cs(SOURCE);
         let p = HostPipeline {
@@ -3063,9 +3060,7 @@ void main() { o.Store(0, v); }
         clear();
         host.execute(&[&before]);
         assert_eq!(value(), 1);
-        for _ in 0..crate::frame_budget::STRIKES {
-            frame("[compute banned]", &[limit + 1.0]);
-        }
+        ban("[compute banned]");
         // Submission does not bind again: the closed list runs it.
         clear();
         host.execute(&[&before]);
