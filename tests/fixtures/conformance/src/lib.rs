@@ -1,7 +1,7 @@
-//! The conformance title (docs/acceptance.md): calls the console runtime as
-//! a title does and checks what Microsoft's public GDK reference says each
-//! call does. Results are TAP lines, read by the harness through
-//! `conformance_run`.
+//! The conformance title: calls the console runtime as a title does and
+//! checks what the public platform documentation says each call does.
+//! Results are TAP lines, read by the harness
+//! (`crates/victory-hle/tests/conformance.rs`) through `conformance_run`.
 //!
 //! How a title reaches the runtime is VIctory's own description
 //! (`crates/victory-hle/src/modules/xgameruntime.rs`): code linked into the

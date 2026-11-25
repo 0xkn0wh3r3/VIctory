@@ -1,7 +1,13 @@
-//! The conformance title (tests/fixtures/conformance, docs/acceptance.md)
-//! run through VIctory's loader and runtime, as `victory run` runs a title:
-//! its checks are what Microsoft's public GDK reference says each call does.
-//! No game data and no SDK.
+//! The conformance title (tests/fixtures/conformance) run through VIctory's
+//! loader and runtime, as `victory run` runs a title. The title is ours,
+//! written from the public platform documentation only: its checks are what
+//! those pages say each call does. No game data and no SDK.
+//!
+//! `cargo test -p victory-hle --test conformance -- --nocapture` builds the
+//! title, runs it and prints its TAP report. `KNOWN` lists the checks VIctory
+//! is known to answer differently from the documentation, each with why:
+//! they are reported, not failed, and one that starts passing fails the test
+//! so the list stays true. `-- --ignored` runs the streaming workload.
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
@@ -137,8 +143,8 @@ fn call(name: &str) -> String {
     }
 }
 
-/// The streaming workload (docs/acceptance.md): throughput, printed. Run
-/// with `cargo test --release -p victory-hle --test conformance -- /// --ignored --nocapture`.
+/// The streaming workload: throughput, printed. Run with `cargo test
+/// --release -p victory-hle --test conformance -- --ignored --nocapture`.
 #[test]
 #[ignore = "a benchmark: run on demand"]
 fn workloads() {
