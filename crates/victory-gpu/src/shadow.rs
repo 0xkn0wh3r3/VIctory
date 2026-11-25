@@ -1253,7 +1253,15 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64, HeapId)
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::Interface;
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let refuse = |_why: &str| None;
+    let refuse = |why: &'static str| {
+        #[cfg(feature = "diagnostics")]
+        {
+            let mut r = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+            *r.entry(why).or_insert(0) += 1;
+        }
+        let _ = why;
+        None
+    };
     // The whole range committed, in one allocation.
     let mut base = 0usize;
     let mut at = start as usize;
@@ -1494,10 +1502,19 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
 #[cfg(feature = "diagnostics")]
 static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Logs [`VIEWS`] per frame over `frames`.
+/// Why title memory stayed copied instead of going in place, by reason
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+static REFUSED: Mutex<std::collections::BTreeMap<&'static str, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Logs [`VIEWS`] per frame over `frames`, and why ranges stayed copied.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_views(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
+    let refused = std::mem::take(&mut *REFUSED.lock().unwrap_or_else(|e| e.into_inner()));
+    if !refused.is_empty() {
+        tracing::info!(?refused, "title memory kept as a copy, not in place (since the line before)");
+    }
     let [asks, made, bytes, largest] = [0, 1, 2, 3].map(|i| VIEWS[i].swap(0, Relaxed));
     let live = EXACT
         .lock()
