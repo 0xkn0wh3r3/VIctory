@@ -184,7 +184,12 @@ impl Lower<'_> {
         Some(self.valu16_native_op(inst, name, guard))
     }
 
-    pub(super) fn valu16_native_op(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Result<(), Why> {
+    pub(super) fn valu16_native_op(
+        &mut self,
+        inst: &Inst,
+        name: &str,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
