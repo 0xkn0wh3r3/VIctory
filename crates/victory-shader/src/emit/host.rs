@@ -97,17 +97,25 @@ impl Host {
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        // SAFETY: plain D3D12/DXGI calls with valid out pointers.
-        unsafe {
-            let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain DXGI calls.
+        let adapter = unsafe {
             let factory: IDXGIFactory4 =
                 CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-            let adapter: IDXGIAdapter1 = if warp {
+            if warp {
                 factory.EnumWarpAdapter().map_err(err)?
             } else {
                 hardware_adapter(&factory).map_err(err)?
-            };
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            }
+        };
+        Self::on(&adapter)
+    }
+
+    /// A device on `adapter` that runs SM 6.6.
+    fn on(adapter: &IDXGIAdapter1) -> Result<Self, String> {
+        // SAFETY: plain D3D12 calls with valid out pointers.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
@@ -126,6 +134,55 @@ impl Host {
                 ));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// Every hardware adapter that runs SM 6.6, by name: GPUs as
+    /// [`hardware_adapter`] takes them (not software, with video memory of
+    /// their own).
+    pub fn hardware() -> Vec<(String, Host)> {
+        let mut out = Vec::new();
+        // SAFETY: plain DXGI calls with valid out pointers.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return out;
+            };
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(i) {
+                i += 1;
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || desc.DedicatedVideoMemory == 0
+                {
+                    continue;
+                }
+                let len = desc.Description.iter().position(|&c| c == 0);
+                let name = String::from_utf16_lossy(&desc.Description[..len.unwrap_or(128)]);
+                if let Ok(host) = Self::on(&adapter) {
+                    out.push((name, host));
+                }
+            }
+        }
+        out
+    }
+
+    /// The wave sizes the device runs (`WaveLaneCountMin`, `Max`).
+    pub fn wave_lanes(&self) -> (u32, u32) {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the structure of the given size.
+        let ok = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o).cast(),
+                size_of_val(&o) as u32,
+            )
+        };
+        match ok {
+            Ok(()) => (o.WaveLaneCountMin, o.WaveLaneCountMax),
+            Err(_) => (0, 0),
         }
     }
 
@@ -545,23 +602,6 @@ impl Host {
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
-    }
-
-    /// The wave sizes this device runs, fewest and most lanes
-    /// (`D3D12_FEATURE_D3D12_OPTIONS1`); a program declaring a wave size
-    /// outside them is refused.
-    pub fn wave_lanes(&self) -> Result<(u32, u32), String> {
-        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        // SAFETY: the feature query writes the structure of the given size.
-        unsafe {
-            self.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS1,
-                (&raw mut o).cast(),
-                size_of_val(&o) as u32,
-            )
-        }
-        .map_err(err)?;
-        Ok((o.WaveLaneCountMin, o.WaveLaneCountMax))
     }
 
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for

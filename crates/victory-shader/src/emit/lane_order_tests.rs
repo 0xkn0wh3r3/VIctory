@@ -381,9 +381,8 @@ fn relabelled_threads_each_get_their_own_id() {
     };
     // Translated programs that read lanes declare the console's wave size,
     // 32; a host that runs no waves of 32 refuses them.
-    if let Ok((min, max)) = host.wave_lanes()
-        && !(min..=max).contains(&32)
-    {
+    let (min, max) = host.wave_lanes();
+    if !(min..=max).contains(&32) {
         eprintln!("the host runs waves of {min} to {max} lanes, not 32; skipped");
         return;
     }
