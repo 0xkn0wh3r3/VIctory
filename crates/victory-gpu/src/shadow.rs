@@ -951,13 +951,62 @@ type OpenedHeap = Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)
 /// Host heaps opened over title allocations, by allocation base.
 static IN_PLACE_HEAPS: Mutex<Option<std::collections::HashMap<usize, OpenedHeap>>> = Mutex::new(None);
 
+/// The size of the allocation starting at `base` if all of it is still
+/// committed memory of that allocation, else `None`.
+fn allocation_extent(base: usize) -> Option<u64> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut at = base;
+    loop {
+        // SAFETY: plain data, filled by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.AllocationBase as usize != base
+        {
+            return (at > base).then(|| (at - base) as u64);
+        }
+        if info.State != MEM_COMMIT {
+            return None;
+        }
+        at = info.BaseAddress as usize + info.RegionSize;
+    }
+}
+
+/// Once a frame: heaps opened over allocations the title has released or
+/// changed since (another size, or not all committed) are let go with the
+/// in-place windows and title buffers over them, as on a remap. The title
+/// frees some of its memory itself, unseen by us; what this cannot tell is
+/// an allocation released and made again at the same address and size.
+pub(crate) fn check_in_place() {
+    if !in_place_enabled() {
+        return;
+    }
+    let stale: Vec<(usize, u64)> = {
+        let heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            .flat_map(|h| h.iter())
+            .filter_map(|(&base, v)| v.as_ref().map(|(_, size)| (base, *size)))
+            .filter(|&(base, size)| allocation_extent(base) != Some(size))
+            .collect()
+    };
+    for (base, size) in stale {
+        let_go_in_place(base as u64, size);
+    }
+}
+
 /// Title memory `[at, at + len)` was mapped or unmapped: in-place windows
 /// and title buffers over it, and heaps opened over allocations it touches show the old pages
 /// (pinned while a list still holds them), so lookups get new ones.
 pub(crate) fn in_place_remapped(at: u64, len: u64) {
-    if !in_place_enabled() {
-        return;
+    if in_place_enabled() {
+        let_go_in_place(at, len);
     }
+}
+
+/// Lets go of in-place windows and title buffers over `[at, at + len)` and
+/// heaps opened over allocations it touches.
+fn let_go_in_place(at: u64, len: u64) {
     let end = at.saturating_add(len);
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let before = map.len();
@@ -1054,6 +1103,20 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
         return refuse("offset");
     }
     let host = host()?;
+    // A heap opened earlier over an allocation the title has released or
+    // changed since goes first, with what is placed in it.
+    let extent = allocation_extent(base);
+    let stale = {
+        let heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .as_ref()
+            .and_then(|h| h.get(&base))
+            .and_then(|v| v.as_ref().map(|(_, size)| *size))
+            .filter(|&size| extent != Some(size))
+    };
+    if let Some(size) = stale {
+        let_go_in_place(base as u64, size);
+    }
     let mut heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     let heap = heaps.get_or_insert_with(Default::default).entry(base).or_insert_with(|| {
         let dev3: ID3D12Device3 = host.device.cast().ok()?;
@@ -1593,9 +1656,43 @@ mod tests {
         // Off 64 KiB: refused.
         assert!(in_place_buffer(base + 4096, 64 << 10).is_none());
         drop(buffer);
-        in_place_remapped(base, LEN);
+        let_go_in_place(base, LEN);
         // SAFETY: our allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+
+    /// A heap opened over an allocation that is released and made again
+    /// with another size is not handed out again.
+    #[test]
+    fn a_heap_over_a_released_allocation_is_let_go() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if host().is_none() {
+            return;
+        }
+        // SAFETY: our own allocation.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        assert_eq!(allocation_extent(base), Some(1 << 20));
+        if in_place_buffer(base as u64, 64 << 10).is_none() {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // no heaps from process memory on this host
+        }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        assert_eq!(allocation_extent(base), None);
+        // SAFETY: a new allocation, at that address if it is free.
+        let again = unsafe { VirtualAlloc(base as *const _, 2 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        if again == base {
+            let (buffer, _) = in_place_buffer(base as u64, 2 << 20).expect("a heap over the new allocation");
+            // SAFETY: a plain query on a live buffer.
+            assert_eq!(unsafe { buffer.GetDesc() }.Width, 2 << 20, "placed in the new, larger heap");
+            drop(buffer);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(again as *mut _, 0, MEM_RELEASE) };
+        }
+        let_go_in_place(base as u64, 2 << 20);
     }
 
 }
