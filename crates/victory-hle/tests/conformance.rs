@@ -29,14 +29,9 @@ mod scene;
 /// Checks VIctory is known to answer differently from the public reference,
 /// each with why: reported, not failed. A check here that passes fails the
 /// test, so the list stays true.
-// On demo, four of the five divergences the suite's PR (#2057) lists are
-// fixed by #2072, #2073, #2074 and #2075, all merged here; the console id's
-// fix (#1717) is not one of ours and is not merged.
-const KNOWN: &[(&str, &str)] = &[(
-    "xsystem: a retail console id is the documented zero id",
-    "VIctory returns 38 digits ending in 1; the reference gives \
-     00000000.00000000.00000000.00000000.00 for retail and PC",
-)];
+// Empty on demo: the five divergences the suite's PR (#2057) lists are fixed
+// by #2072, #2073, #2074, #2075 and #1717, all merged here.
+const KNOWN: &[(&str, &str)] = &[];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
