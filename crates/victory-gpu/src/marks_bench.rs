@@ -592,3 +592,44 @@ fn marks_bench() {
         }
     }
 }
+
+/// What a page bitmap in video memory costs a list's end
+/// (as #2175 and #2465 record them): a copy of the bitmap into read-back memory and its
+/// clear from zeros, at the size `crate::memory` uses (513 blocks of 4,096
+/// pages, 256.5 KiB); the median of 20, in µs.
+#[test]
+#[ignore]
+fn bitmap_copy_out_bench() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let bytes = (513 * 4096 / 8_u64).next_multiple_of(256);
+    let device = host.device.clone();
+    let bitmap = buffer(&device, heap(D3D12_HEAP_TYPE_DEFAULT), bytes, true);
+    let back = buffer(&device, heap(D3D12_HEAP_TYPE_READBACK), bytes, false);
+    let zeros = buffer(&device, heap(D3D12_HEAP_TYPE_UPLOAD), bytes, false);
+    let mut gpu = Gpu::new(device);
+    let mut times: Vec<f64> = (0..21)
+        .map(|_| {
+            gpu.timed(|list| {
+                // SAFETY: an open list; buffers of `bytes` bytes, the bitmap
+                // in the common state at the list's start.
+                unsafe {
+                    use D3D12_RESOURCE_STATE_COPY_DEST as DEST;
+                    use D3D12_RESOURCE_STATE_COPY_SOURCE as SOURCE;
+                    let t = crate::host::transition;
+                    list.ResourceBarrier(&[t(&bitmap, D3D12_RESOURCE_STATE_COMMON, SOURCE)]);
+                    list.CopyBufferRegion(&back, 0, &bitmap, 0, bytes);
+                    list.ResourceBarrier(&[t(&bitmap, SOURCE, DEST)]);
+                    list.CopyBufferRegion(&bitmap, 0, &zeros, 0, bytes);
+                }
+            }) * 1e3
+        })
+        .skip(1)
+        .collect();
+    times.sort_by(f64::total_cmp);
+    println!(
+        "bitmap copy-out and clear, {bytes} bytes: {:.1} µs",
+        times[times.len() / 2]
+    );
+}
