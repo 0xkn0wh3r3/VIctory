@@ -17,7 +17,7 @@
 //! makes none); the graphs have labelled axes and reference lines.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -94,6 +94,191 @@ pub(crate) fn second(s: Second) {
     *SECOND.lock().unwrap_or_else(|e| e.into_inner()) = s;
 }
 
+/// GPU time of the submissions since the last present, in nanoseconds:
+/// a timestamp before and after each one ([`time_lists`]), while the
+/// overlay shows.
+static GPU_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The submission timer: two small lists that write a timestamp each, the
+/// second also resolving both into the read-back buffer.
+struct Timer {
+    allocator: ID3D12CommandAllocator,
+    begin: ID3D12GraphicsCommandList,
+    end: ID3D12GraphicsCommandList,
+    heap: ID3D12QueryHeap,
+    readback: ID3D12Resource,
+    /// Ticks a second.
+    frequency: u64,
+    /// A timed submission was sent and not read yet.
+    pending: bool,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the timer is used under its lock.
+unsafe impl Send for Timer {}
+
+static TIMER: Mutex<Option<Option<Timer>>> = Mutex::new(None);
+
+impl Timer {
+    fn new(device: &ID3D12Device, queue: &ID3D12CommandQueue) -> Option<Timer> {
+        // SAFETY: plain object creation; the lists start closed.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .ok()?;
+            let list = || -> Option<ID3D12GraphicsCommandList> {
+                let l: ID3D12GraphicsCommandList = device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .ok()?;
+                l.Close().ok()?;
+                Some(l)
+            };
+            let (begin, end) = (list()?, list()?);
+            let mut heap: Option<ID3D12QueryHeap> = None;
+            device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 2,
+                        NodeMask: 0,
+                    },
+                    &mut heap,
+                )
+                .ok()?;
+            let mut readback: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 16,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .ok()?;
+            Some(Timer {
+                allocator,
+                begin,
+                end,
+                heap: heap?,
+                readback: readback?,
+                frequency: queue.GetTimestampFrequency().ok()?.max(1),
+                pending: false,
+            })
+        }
+    }
+
+    /// Records the two lists afresh (the last submission was waited for).
+    fn record(&mut self) -> Option<()> {
+        // SAFETY: the allocator's lists ran (every submission is waited
+        // for); the heap and buffer are ours.
+        unsafe {
+            self.allocator.Reset().ok()?;
+            self.begin.Reset(&self.allocator, None).ok()?;
+            self.begin
+                .EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            self.begin.Close().ok()?;
+            self.end.Reset(&self.allocator, None).ok()?;
+            self.end.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            self.end.ResolveQueryData(
+                &self.heap,
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                0,
+                2,
+                &self.readback,
+                0,
+            );
+            self.end.Close().ok()?;
+        }
+        Some(())
+    }
+}
+
+/// While the overlay shows: `group` between the timer's two lists, to
+/// submit in its place ([`time_read`] once it has run); `None` otherwise.
+pub(crate) fn time_lists(
+    device: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    group: &[Option<ID3D12CommandList>],
+) -> Option<Vec<Option<ID3D12CommandList>>> {
+    if !captured() {
+        return None;
+    }
+    let mut slot = TIMER.lock().unwrap_or_else(|e| e.into_inner());
+    let timer = slot
+        .get_or_insert_with(|| Timer::new(device, queue))
+        .as_mut()?;
+    timer.record()?;
+    timer.pending = true;
+    let mut lists = Vec::with_capacity(group.len() + 2);
+    lists.push(Some(timer.begin.clone().into()));
+    lists.extend_from_slice(group);
+    lists.push(Some(timer.end.clone().into()));
+    Some(lists)
+}
+
+/// After a submission [`time_lists`] timed has run: adds its GPU time to
+/// the frame's.
+pub(crate) fn time_read() {
+    let mut slot = TIMER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Some(timer)) = slot.as_mut() else {
+        return;
+    };
+    if !std::mem::take(&mut timer.pending) {
+        return;
+    }
+    let mut mapped = std::ptr::null_mut();
+    let range = D3D12_RANGE { Begin: 0, End: 16 };
+    // SAFETY: the resolve ran (the submission was waited for); the buffer
+    // holds two timestamps.
+    let ticks = unsafe {
+        if timer
+            .readback
+            .Map(0, Some(&range), Some(&mut mapped))
+            .is_err()
+        {
+            return;
+        }
+        let [a, b] = mapped.cast::<[u64; 2]>().read();
+        timer.readback.Unmap(0, Some(&D3D12_RANGE::default()));
+        b.saturating_sub(a)
+    };
+    let ns = u128::from(ticks) * 1_000_000_000 / u128::from(timer.frequency);
+    GPU_NS.fetch_add(ns as u64, Relaxed);
+}
+
+/// When the title first read input since the last present, in nanoseconds
+/// past [`epoch`] (0: not yet).
+static FIRST_READ: AtomicU64 = AtomicU64::new(0);
+
+fn epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// The title reads its input (GameInput's current reading): the first read
+/// after a present starts the input-to-present time of the next frame.
+pub fn note_input_read() {
+    if captured() {
+        let at = (Instant::now() - epoch()).as_nanos().max(1) as u64;
+        let _ = FIRST_READ.compare_exchange(0, at, Relaxed, Relaxed);
+    }
+}
+
 /// Frame times kept for the graph and the 1% low.
 const HISTORY: usize = 240;
 /// The panel is redrawn at most this often; it is copied every frame.
@@ -119,10 +304,14 @@ pub(crate) struct Overlay {
     down: u8,
     last: Option<Instant>,
     times: VecDeque<f32>,
+    /// Per frame: GPU busy time and input-to-present time, ms (`None`:
+    /// not measured that frame).
+    gpu: VecDeque<Option<f32>>,
+    latency: VecDeque<Option<f32>>,
     sampled: Option<(Instant, System)>,
-    /// CPU use and video memory used of its budget, in percent, a sample a
-    /// second, for the history graph.
-    history: VecDeque<[Option<f32>; 2]>,
+    /// CPU use, GPU busy time of the frame time, and video memory used of
+    /// its budget, in percent, a sample a second, for the history graph.
+    history: VecDeque<[Option<f32>; 3]>,
     cpu: Option<(Instant, u64)>,
     adapter: Option<Option<IDXGIAdapter3>>,
     /// Upload memory (its address as a number: the presenter lives behind
@@ -142,6 +331,8 @@ impl Default for Overlay {
             down: 0,
             last: None,
             times: VecDeque::with_capacity(HISTORY),
+            gpu: VecDeque::with_capacity(HISTORY),
+            latency: VecDeque::with_capacity(HISTORY),
             sampled: None,
             history: VecDeque::with_capacity(SECONDS),
             cpu: None,
@@ -255,11 +446,26 @@ impl Overlay {
             return state;
         }
         let now = Instant::now();
+        let gpu_ns = GPU_NS.swap(0, Relaxed);
+        let read = FIRST_READ.swap(0, Relaxed);
         if let Some(last) = self.last.replace(now) {
+            let push = |q: &mut VecDeque<Option<f32>>, v| {
+                if q.len() == HISTORY {
+                    q.pop_front();
+                }
+                q.push_back(v);
+            };
             if self.times.len() == HISTORY {
                 self.times.pop_front();
             }
             self.times.push_back((now - last).as_secs_f32() * 1000.0);
+            let gpu = (captured() && gpu_ns > 0).then(|| gpu_ns as f32 / 1e6);
+            push(&mut self.gpu, gpu);
+            let latency = (read > 0).then(|| {
+                let at = epoch() + Duration::from_nanos(read);
+                now.saturating_duration_since(at).as_secs_f32() * 1000.0
+            });
+            push(&mut self.latency, latency);
         }
         if !watch_keys(hwnd) {
             self.down = poll_keys(self.down, hwnd);
@@ -286,7 +492,9 @@ impl Overlay {
             let vram = system
                 .vram
                 .map(|(used, budget, _)| (used as f64 / budget.max(1) as f64 * 100.0) as f32);
-            self.history.push_back([system.cpu.map(|c| c as f32), vram]);
+            let gpu = busy_percent(&self.times, &self.gpu);
+            self.history
+                .push_back([system.cpu.map(|c| c as f32), gpu, vram]);
             self.sampled = Some((now, system));
         }
         let scale = scale_for(height);
@@ -450,6 +658,8 @@ impl Overlay {
             &Facts {
                 times: &self.times,
                 history: &self.history,
+                gpu: &self.gpu,
+                latency: &self.latency,
                 second,
                 system: *system,
                 pad,
@@ -462,7 +672,9 @@ impl Overlay {
 /// What the panel shows.
 struct Facts<'a> {
     times: &'a VecDeque<f32>,
-    history: &'a VecDeque<[Option<f32>; 2]>,
+    history: &'a VecDeque<[Option<f32>; 3]>,
+    gpu: &'a VecDeque<Option<f32>>,
+    latency: &'a VecDeque<Option<f32>>,
     second: Second,
     system: System,
     pad: Option<Pad>,
@@ -481,6 +693,33 @@ fn frame_stats(times: &VecDeque<f32>) -> (f32, f32, f32) {
     let worst = sorted[..n].iter().sum::<f32>() / n as f32;
     let rate = |ms: f32| if ms > 0.0 { 1000.0 / ms } else { 0.0 };
     (mean, rate(mean), rate(worst))
+}
+
+/// The mean of the last `n` measured values (`None`: none measured), and
+/// the largest.
+fn recent(values: &VecDeque<Option<f32>>, n: usize) -> Option<(f32, f32)> {
+    let measured: Vec<f32> = values.iter().rev().take(n).flatten().copied().collect();
+    let max = measured
+        .iter()
+        .copied()
+        .fold(None, |m: Option<f32>, v| Some(m.map_or(v, |m| m.max(v))))?;
+    Some((measured.iter().sum::<f32>() / measured.len() as f32, max))
+}
+
+/// GPU busy time over the last second of frames, percent of their time.
+fn busy_percent(times: &VecDeque<f32>, gpu: &VecDeque<Option<f32>>) -> Option<f32> {
+    let (mut wall, mut busy, mut measured) = (0.0, 0.0, false);
+    for (&t, g) in times.iter().rev().zip(gpu.iter().rev()) {
+        if wall >= 1000.0 {
+            break;
+        }
+        wall += t;
+        if let Some(g) = g {
+            busy += g;
+            measured = true;
+        }
+    }
+    (measured && wall > 0.0).then(|| (busy / wall * 100.0).min(100.0))
 }
 
 /// Gigabytes, one decimal.
@@ -505,6 +744,7 @@ mod colour {
     pub(super) const GRID: Rgb = [46, 51, 64];
     pub(super) const AXIS: Rgb = [116, 123, 140];
     pub(super) const CPU: Rgb = [80, 170, 255];
+    pub(super) const GPU: Rgb = [255, 150, 70];
     pub(super) const VRAM: Rgb = [206, 128, 255];
     pub(super) const CHIP: Rgb = [38, 42, 54];
     pub(super) const LIT: Rgb = [70, 190, 255];
@@ -997,6 +1237,16 @@ fn draw_panel(fonts: &Fonts, scale: f32, f: &Facts) -> Image {
         &format!("{:.1} ms / frame", s.prepare_ms),
         colour::VALUE,
     );
+    let gpu = match recent(f.gpu, 60) {
+        Some((ms, _)) => format!("{ms:.1} ms / frame ({:.0} %)", ms / mean.max(0.001) * 100.0),
+        None => "...".to_owned(),
+    };
+    y = p.row(left, right, y, "GPU busy (timestamps)", &gpu, colour::GPU);
+    let latency = match recent(f.latency, 60) {
+        Some((ms, max)) => format!("{ms:.1} ms (slowest {max:.1})"),
+        None => "no input read".to_owned(),
+    };
+    y = p.row(left, right, y, "Input to present", &latency, colour::VALUE);
     y = p.row(
         left,
         right,
@@ -1232,7 +1482,7 @@ fn history_graph(
     x: i32,
     y: i32,
     w: i32,
-    history: &VecDeque<[Option<f32>; 2]>,
+    history: &VecDeque<[Option<f32>; 3]>,
 ) -> i32 {
     p.text(
         x,
@@ -1244,7 +1494,11 @@ fn history_graph(
     );
     // Legend.
     let mut lx = x + w;
-    for (name, c) in [("Video memory", colour::VRAM), ("CPU", colour::CPU)] {
+    for (name, c) in [
+        ("Video memory", colour::VRAM),
+        ("GPU busy", colour::GPU),
+        ("CPU", colour::CPU),
+    ] {
         let tw = p.text(lx, y, name, (12.0, false), colour::LABEL, Align::Right);
         lx -= tw + p.px(6.0);
         p.image
@@ -1277,7 +1531,7 @@ fn history_graph(
     );
     let step = gw as f32 / (SECONDS - 1) as f32;
     let start = SECONDS - history.len().min(SECONDS);
-    for (series, c) in [(0, colour::CPU), (1, colour::VRAM)] {
+    for (series, c) in [(0, colour::CPU), (1, colour::GPU), (2, colour::VRAM)] {
         let mut last: Option<(f32, f32)> = None;
         for (k, sample) in history.iter().enumerate() {
             let Some(v) = sample[series] else {
@@ -1507,11 +1761,14 @@ mod tests {
     /// some slow ones, a pad with A and RB held, compute left out.
     fn sample_facts<'a>(
         times: &'a VecDeque<f32>,
-        history: &'a VecDeque<[Option<f32>; 2]>,
+        history: &'a VecDeque<[Option<f32>; 3]>,
+        series: &'a (VecDeque<Option<f32>>, VecDeque<Option<f32>>),
     ) -> Facts<'a> {
         Facts {
             times,
             history,
+            gpu: &series.0,
+            latency: &series.1,
             second: Second {
                 draws: 2513.0,
                 prepare_ms: 12.3,
@@ -1534,7 +1791,17 @@ mod tests {
         }
     }
 
-    fn sample_series() -> (VecDeque<f32>, VecDeque<[Option<f32>; 2]>) {
+    /// GPU busy time and input-to-present time per frame.
+    fn sample_frames() -> (VecDeque<Option<f32>>, VecDeque<Option<f32>>) {
+        (
+            (0..HISTORY).map(|k| Some(24.0 + (k % 5) as f32)).collect(),
+            (0..HISTORY)
+                .map(|k| (k % 3 != 0).then_some(48.0 + (k % 9) as f32))
+                .collect(),
+        )
+    }
+
+    fn sample_series() -> (VecDeque<f32>, VecDeque<[Option<f32>; 3]>) {
         let times = (0..HISTORY)
             .map(|k| 31.0 + (k % 7) as f32 + if k % 37 == 0 { 30.0 } else { 0.0 })
             .collect();
@@ -1542,6 +1809,7 @@ mod tests {
             .map(|k| {
                 [
                     Some(30.0 + (k % 10) as f32 * 2.0),
+                    Some(70.0 + (k % 6) as f32),
                     Some(50.0 + k as f32 / 6.0),
                 ]
             })
@@ -1566,10 +1834,11 @@ mod tests {
     #[test]
     fn the_panel_fits_the_frames_it_is_drawn_for() {
         let (times, history) = sample_series();
+        let frames = sample_frames();
         for fonts in [Fonts::new(), Fonts::Bitmap] {
             for height in [720, 1080, 2160] {
                 let scale = scale_for(height);
-                let image = draw_panel(&fonts, scale, &sample_facts(&times, &history));
+                let image = draw_panel(&fonts, scale, &sample_facts(&times, &history, &frames));
                 let margin = (MARGIN as f32 * scale).round() as u32;
                 assert!(
                     image.height + 2 * margin <= height,
@@ -1583,6 +1852,7 @@ mod tests {
                     colour::GOOD,
                     colour::BAD,
                     colour::CPU,
+                    colour::GPU,
                     colour::VRAM,
                     colour::LIT,
                 ] {
@@ -1688,7 +1958,6 @@ mod tests {
             HWND::default(),
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
-        VISIBLE.store(false, Relaxed);
         // SAFETY: an open list and live resources; footprint in the buffer.
         unsafe {
             list.list.ResourceBarrier(&[crate::host::transition(
@@ -1722,7 +1991,11 @@ mod tests {
             list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         }
         list.close();
+        GPU_NS.store(0, Relaxed);
         host.execute(&[&list]);
+        VISIBLE.store(false, Relaxed);
+        // The submission ran between two timestamps while the panel showed.
+        assert!(GPU_NS.swap(0, Relaxed) > 0, "GPU busy time measured");
         let mut mapped = std::ptr::null_mut();
         // SAFETY: the copy finished (execute waits); the buffer holds the rows.
         let pixels = unsafe {
@@ -1758,9 +2031,14 @@ mod tests {
             return;
         };
         let (times, history) = sample_series();
+        let frames = sample_frames();
         let fonts = Fonts::new();
         for height in [1080, 1440] {
-            let image = draw_panel(&fonts, scale_for(height), &sample_facts(&times, &history));
+            let image = draw_panel(
+                &fonts,
+                scale_for(height),
+                &sample_facts(&times, &history, &frames),
+            );
             let (w, h) = (image.width, image.height);
             let mut rows = vec![0u8; (w * h * 4) as usize];
             image.write(Pixel::Bgra8, (w * 4) as usize, &mut rows);
@@ -1817,6 +2095,23 @@ mod tests {
             Pixel::Rgba16f.encode(colour::VALUE),
             "the second pixel"
         );
+    }
+
+    /// GPU busy percent is over the last second of frames; the recent mean
+    /// and slowest skip frames not measured.
+    #[test]
+    fn busy_and_latency_figures() {
+        let times: VecDeque<f32> = std::iter::repeat_n(50.0, 40).collect();
+        let gpu: VecDeque<Option<f32>> = (0..40).map(|k| (k >= 20).then_some(25.0)).collect();
+        assert_eq!(
+            busy_percent(&times, &gpu),
+            Some(50.0),
+            "the last 20 frames, half busy"
+        );
+        assert_eq!(busy_percent(&times, &VecDeque::from(vec![None; 40])), None);
+        let latency: VecDeque<Option<f32>> = VecDeque::from(vec![Some(40.0), None, Some(60.0)]);
+        assert_eq!(recent(&latency, 60), Some((50.0, 60.0)));
+        assert_eq!(recent(&VecDeque::from(vec![None]), 60), None);
     }
 
     /// Blending covers by coverage: none keeps the pixel, full replaces it.
