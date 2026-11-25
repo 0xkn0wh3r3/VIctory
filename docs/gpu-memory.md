@@ -10,7 +10,7 @@ A desktop PC (Apple silicon and integrated GPUs aside) has two pools:
 system memory next to the CPU and video memory on the graphics card,
 joined by PCI Express. Each processor is fast in its own pool and slow in
 the other one. This page covers how `victory-gpu` bridges the two, what
-each choice costs, and the switches that move data closer to the GPU.
+each choice costs, and the switches that choose where the data lives.
 
 ```mermaid
 flowchart LR
@@ -68,10 +68,11 @@ sequenceDiagram
 
 ## Where the copies live
 
-By default every copy is in **system memory**, mapped write-back for the
-CPU (`Host::shared_buffer`: a custom heap, `MEMORY_POOL_L0`). The CPU
-writes and reads it at full speed, but every shader access crosses PCI
-Express.
+A copy can be in **system memory**, mapped write-back for the CPU
+(`Host::shared_buffer`: a custom heap, `MEMORY_POOL_L0`). The CPU writes
+and reads it at full speed, but every shader access crosses PCI Express.
+That is where copies go on a host without GPU upload heaps (below), and
+where every copy was before 2026-11-25.
 
 On a GPU with **Resizable BAR**, D3D12 also offers **GPU upload heaps**
 (`D3D12_HEAP_TYPE_GPU_UPLOAD`, reported by
@@ -104,15 +105,22 @@ xychart-beta
 ```
 
 So a copy shaders use heavily belongs in video memory, but the CPU must
-never read it there. Two opt-in switches act on that:
+never read it there. Where the host has GPU upload heaps, every copy of a
+title buffer goes there **by default** (`host::upload_placement`, decided
+once per run), with a mirror for the copies shaders write. Two switches
+turn it off:
 
-| switch | copies moved to a GPU upload heap | what the CPU reads |
-|---|---|---|
-| `VICTORY_GPU_UPLOAD=1` | buffers made without unordered access (shaders only read them) | nothing: the CPU only writes these copies |
-| `VICTORY_GPU_UPLOAD_WRITES=1` (with the one above) | buffers shaders may write | a **mirror** in system memory |
+| switch | default where the host has GPU upload heaps | copies in a GPU upload heap | what the CPU reads |
+|---|---|---|---|
+| `VICTORY_GPU_UPLOAD` | on; `0` keeps every copy in system memory | buffers made without unordered access (shaders only read them) | nothing: the CPU only writes these copies |
+| `VICTORY_GPU_UPLOAD_WRITES` | on (with the one above); `0` keeps these in system memory | buffers shaders may write | a **mirror** in system memory |
 
-Both switches fall back to system memory when the GPU has no GPU upload
-heaps, and past these copies' share of the video memory budget
+Any value but `0` (`1`, say) leaves a switch on. On a host without GPU
+upload heaps (no Resizable BAR, older runtimes or drivers) every copy is
+in system memory whatever the switches say; the log line
+`host copies of title buffers in GPU upload heaps` gives the outcome.
+Copies also fall back to system memory past their share of the video
+memory budget
 (`UPLOAD_POOL`, see [below](#video-memory-budget-and-residency); a copy's
 bytes are given back when D3D12 destroys its buffer). Copies
 of loose title memory and of single views (`loose`, `exact`) always stay
@@ -120,11 +128,15 @@ in system memory.
 
 ```mermaid
 flowchart TD
-  B[title buffer used by the GPU] --> RO{"made without<br/>unordered access?"}
-  RO -- yes --> U1{VICTORY_GPU_UPLOAD}
+  B[title buffer used by the GPU]
+  RO{"made without<br/>unordered access?"}
+  B --> H{"host has GPU<br/>upload heaps?"}
+  H -- no --> SM["system memory (L0)"]
+  H -- yes --> RO
+  RO -- yes --> U1{"VICTORY_GPU_UPLOAD<br/>(on unless 0)"}
   U1 -- on --> UH["GPU upload heap<br/>(CPU writes only)"]
-  U1 -- off --> SM["system memory (L0)"]
-  RO -- no --> U2{"VICTORY_GPU_UPLOAD +<br/>VICTORY_GPU_UPLOAD_WRITES"}
+  U1 -- off --> SM
+  RO -- no --> U2{"VICTORY_GPU_UPLOAD +<br/>VICTORY_GPU_UPLOAD_WRITES<br/>(on unless 0)"}
   U2 -- on --> VM["GPU upload heap<br/>+ mirror in system memory"]
   U2 -- off --> SM
 ```
@@ -237,6 +249,75 @@ come back. The snapshot path pays for bringing every declared range back
 before its compare (several GB per frame here): it needs marks to
 benefit.
 
+### A compute-heavy submission: why both are on by default
+
+The tables above time one big copy. The test
+`shadow::bench::compute_heavy_submissions_by_copy_placement` times what a
+title's compute passes look like instead, through the copies' real paths
+(`shadow::find`, `Shadow::refresh`, `Shadow::gpu_writes`, `HostList`,
+`Host::execute`): one submission of 200 dispatches in 8 lists over six
+title buffers (four of 64 MiB made without unordered access, two of
+32 MiB shaders write; 320 MiB in all). Each dispatch reads 4 MiB of a
+read-only buffer, reads and writes 1 MiB of a written one (24 MiB of each
+are written over the submission) and reads 256 KiB of the title's data
+in the rest of it, with a UAV barrier after each. Shaders find what they
+wrote by write marks (each store sets its page's bit where still clear,
+as translated shaders do) or by snapshots of the declared ranges. Between
+submissions the title leaves its data alone, or writes 16 MiB of it
+(12 MiB in the read-only buffers, 2 MiB in each written one's title
+part), which the next refresh copies. Each placement runs in a child
+process of its own, and the test checks that all of them leave title
+memory the same. Median of three runs of the median of 5 submissions,
+ms (`total`: all of `Host::execute`; `prepare`: refreshes and snapshots;
+`GPU`: the wait for the GPU; `copy-back`: comparing and copying what
+shaders wrote, including bringing it back from video memory):
+
+| copies | writes found by | title writes | total | prepare | GPU | copy-back |
+|---|---|---|---|---|---|---|
+| system memory | write marks | none | 59.7 | 0.0 | 44.0 | 15.7 |
+| system memory | write marks | 16 MiB per submission | 61.6 | 2.3 | 43.8 | 15.2 |
+| system memory | snapshots | none | 73.5 | 12.4 | 43.4 | 17.8 |
+| system memory | snapshots | 16 MiB per submission | 76.4 | 14.6 | 43.0 | 18.1 |
+| read-only copies in video memory | write marks | none | 31.0 | 0.0 | 15.7 | 15.1 |
+| read-only copies in video memory | write marks | 16 MiB per submission | 32.9 | 2.1 | 15.8 | 15.0 |
+| read-only copies in video memory | snapshots | none | 43.3 | 12.2 | 12.9 | 18.3 |
+| read-only copies in video memory | snapshots | 16 MiB per submission | 45.6 | 14.3 | 12.8 | 18.2 |
+| all copies in video memory | write marks | none | 31.7 | 0.0 | 12.0 | 19.6 |
+| all copies in video memory | write marks | 16 MiB per submission | 32.3 | 1.8 | 11.0 | 19.4 |
+| all copies in video memory | snapshots | none | 35.9 | 12.1 | 2.1 | 21.8 |
+| all copies in video memory | snapshots | 16 MiB per submission | 37.7 | 14.0 | 2.1 | 21.4 |
+
+`cargo test --release -p victory-gpu --lib compute_heavy -- --ignored --nocapture`
+(RTX 5070 Ti, driver 621.24, Ryzen 9 7900X, Windows 11).
+
+- **Read-only copies in video memory** halve the submission with write
+  marks (60 ms to 31) and save 40% with snapshots (74 to 43): the GPU's
+  time drops from 44 ms to 16 (13 with snapshots), and nothing else
+  changes. Refreshing them through the BAR costs what refreshing system
+  memory does (2 ms for 16 MiB either way).
+- **Written copies in video memory as well** take the GPU's time down to
+  11-12 ms with marks and 2 ms with snapshots. Bringing what shaders
+  wrote back to the mirrors (48 MiB per submission here) adds 4 ms to the
+  copy-back. CPU and GPU together, that is even with marks (31.7 and
+  32.3 ms against 31.0 and 32.9, within the runs' spread) and 17% faster
+  with snapshots (36 ms against 43). The GPU's own time is a quarter
+  lower with marks, and a sixth of what it was with snapshots: time a
+  title's draws can use.
+- With all copies in video memory the marked path spends about 9 of its
+  11-12 GPU milliseconds marking: the written-pages bitmap is in system
+  memory and each store reads it across the bus (see
+  [further steps](#further-steps)). Without that cost, written copies in
+  video memory would gain with marks as they do with snapshots.
+
+So both switches are on by default where the host has GPU upload heaps:
+written copies in video memory were never slower beyond the runs'
+spread, faster with snapshots, and took less of the GPU. The synthetic world frame above shows the case where written copies in
+video memory cost more CPU time than they save: a frame whose shaders
+write gigabytes of declared ranges without marks. Translated shaders
+mark their writes through views, so such ranges are rare; where a title
+still has them, `VICTORY_GPU_UPLOAD_WRITES=0` keeps written copies in
+system memory.
+
 ## Video memory budget and residency
 
 Windows gives each process a **video memory budget**
@@ -310,9 +391,9 @@ with each frame-rate line, whether or not a pool asks.
 
 The tests show the mechanism. Whether it pays off in a title depends on
 how much of the title's GPU time goes to shaders reading these copies,
-and that needs a run of the title. Compare `VICTORY_GPU_TIMING=1` with
-and without the switches, together with the copy counters
-(`--features diagnostics`).
+and that needs a run of the title. Compare `VICTORY_GPU_TIMING=1` as it
+is and with `VICTORY_GPU_UPLOAD=0` (or `VICTORY_GPU_UPLOAD_WRITES=0`),
+together with the copy counters (`--features diagnostics`).
 
 ## Further steps
 
@@ -320,5 +401,9 @@ and without the switches, together with the copy counters
   used (read-mostly, written by shaders, or read back by the CPU).
 - Give snapshot ranges marks, or compare them on the GPU, so they no
   longer need their bytes brought back.
+- Keep the written-pages bitmap where shaders set it fast (video memory,
+  copied back for the CPU after each submission), or mark less often
+  than once per store: in the compute-heavy submission above, marking
+  takes most of the GPU's time once the copies are in video memory.
 - Detile textures on the GPU, so their upload crosses the bus once,
   still tiled.

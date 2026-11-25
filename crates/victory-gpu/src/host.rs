@@ -94,6 +94,14 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// [`SUBMISSION_US`] and the copy-backs' time ([`COPY_BACK`]) since the
+/// last call, in microseconds: preparing, waiting for the GPU, copying back
+/// (tests).
+#[cfg(test)]
+pub(crate) fn take_submission_us() -> [u64; 3] {
+    [&SUBMISSION_US[0], &SUBMISSION_US[1], &COPY_BACK[0]].map(|t| t.swap(0, Ordering::Relaxed))
+}
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -879,6 +887,27 @@ pub(crate) mod tests {
         fake.set(24 * GIB, 0);
         assert!(fits(0, 6 * GIB), "a quarter of a large budget");
         assert!(!fits(0, 6 * GIB + 1));
+    }
+
+    /// Copies go to GPU upload heaps by default where the host has them,
+    /// written buffers' too; `0` keeps them in system memory; a host
+    /// without the heaps keeps every copy there, whatever the switches say.
+    #[test]
+    fn copies_are_in_video_memory_by_default_where_the_host_can() {
+        use std::ffi::OsStr;
+        let (on, off) = (Some(OsStr::new("1")), Some(OsStr::new("0")));
+        for (supported, upload, writes, want) in [
+            (true, None, None, (true, true)),
+            (true, on, on, (true, true)),
+            (true, None, off, (true, false)),
+            (true, off, None, (false, false)),
+            (true, off, on, (false, false)),
+            (false, None, None, (false, false)),
+            (false, on, on, (false, false)),
+        ] {
+            let got = upload_placement(supported, upload, writes);
+            assert_eq!(got, want, "{supported} {upload:?} {writes:?}");
+        }
     }
 
     #[test]
@@ -4207,6 +4236,25 @@ fn upload_fits(budget: Option<&crate::budget::Budget>, own: u64, size: u64) -> b
     own + size <= limit
 }
 
+/// Where host copies of title buffers go, from whether the host has GPU
+/// upload heaps (`GPUUploadHeapSupported`, resizable BAR) and the values of
+/// `VICTORY_GPU_UPLOAD` and `VICTORY_GPU_UPLOAD_WRITES`: whether the copies
+/// of buffers shaders only read go to GPU upload heaps, and whether those of
+/// buffers shaders write go there too (with a mirror). Both by default where
+/// the host has the heaps: shaders read video memory 30 times as fast as
+/// system memory over PCI Express, and in a compute-heavy submission the
+/// GPU's time saved outweighs what the mirrors cost the CPU
+/// (`docs/gpu-memory.md`). `VICTORY_GPU_UPLOAD=0` keeps every copy in
+/// system memory, `VICTORY_GPU_UPLOAD_WRITES=0` those of written buffers.
+fn upload_placement(
+    supported: bool,
+    upload: Option<&std::ffi::OsStr>,
+    writes: Option<&std::ffi::OsStr>,
+) -> (bool, bool) {
+    let read_only = supported && crate::switch::on_unless_off(upload);
+    (read_only, read_only && crate::switch::on_unless_off(writes))
+}
+
 impl Host {
     /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: [`Host::shared_buffer`]s
     /// (host copies of title memory among them) in video memory the CPU maps
@@ -4250,8 +4298,8 @@ impl Host {
     /// system memory), the CPU writes it about as fast as system memory,
     /// and reading it from the CPU is very slow (~50 MB/s). For host copies
     /// of title memory that shaders only read. None when the host has no
-    /// such heaps (no resizable BAR, older runtimes), `VICTORY_GPU_UPLOAD`
-    /// is off, or the copies there would pass their share of the video
+    /// such heaps (no resizable BAR, older runtimes), `VICTORY_GPU_UPLOAD=0`
+    /// turned them off, or the copies there would pass their share of the video
     /// memory budget ([`UPLOAD_POOL`]). Kept resident before what the title
     /// streams ([`keep_resident`]).
     pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -4304,15 +4352,23 @@ impl Host {
         Some((buffer, data))
     }
 
-    /// Whether host copies that shaders only read go to GPU upload heaps:
-    /// `VICTORY_GPU_UPLOAD=1` (a prototype, off by default) and a host that
-    /// has them. Asked once.
+    /// Whether host copies that shaders only read go to GPU upload heaps
+    /// ([`upload_placement`]). Asked once.
     pub(crate) fn gpu_upload(&self) -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
+        self.upload_placement().0
+    }
+
+    /// Whether host copies that shaders write go to GPU upload heaps too,
+    /// with a system memory mirror for the CPU (`crate::shadow`;
+    /// [`upload_placement`]). Asked once.
+    pub(crate) fn gpu_upload_writes(&self) -> bool {
+        self.upload_placement().1
+    }
+
+    /// [`upload_placement`] for this host and the switches, once.
+    fn upload_placement(&self) -> (bool, bool) {
+        static ON: OnceLock<(bool, bool)> = OnceLock::new();
         *ON.get_or_init(|| {
-            if !crate::switch::on("VICTORY_GPU_UPLOAD") {
-                return false;
-            }
             let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
             // SAFETY: a feature query writing the structure of its size.
             let known = unsafe {
@@ -4323,27 +4379,19 @@ impl Host {
                 )
             }
             .is_ok();
-            let on = known && o.GPUUploadHeapSupported.as_bool();
-            tracing::info!(
-                on,
-                "host copies that shaders only read in GPU upload heaps (VICTORY_GPU_UPLOAD)"
+            let supported = known && o.GPUUploadHeapSupported.as_bool();
+            let (read_only, written) = upload_placement(
+                supported,
+                std::env::var_os("VICTORY_GPU_UPLOAD").as_deref(),
+                std::env::var_os("VICTORY_GPU_UPLOAD_WRITES").as_deref(),
             );
-            on
-        })
-    }
-
-    /// Whether host copies that shaders write go to GPU upload heaps too,
-    /// with a system memory mirror for the CPU (`crate::shadow`):
-    /// `VICTORY_GPU_UPLOAD_WRITES=1` with [`Host::gpu_upload`] on. Asked once.
-    pub(crate) fn gpu_upload_writes(&self) -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| {
-            let on = self.gpu_upload() && crate::switch::on("VICTORY_GPU_UPLOAD_WRITES");
             tracing::info!(
-                on,
-                "host copies that shaders write in GPU upload heaps (VICTORY_GPU_UPLOAD_WRITES)"
+                supported,
+                read_only,
+                written,
+                "host copies of title buffers in GPU upload heaps (VICTORY_GPU_UPLOAD, _WRITES)"
             );
-            on
+            (read_only, written)
         })
     }
 

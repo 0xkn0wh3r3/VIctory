@@ -1,7 +1,9 @@
 //! Host copies of title buffers (decision 0007, step 3 and "Copies of title
 //! memory"). Title buffers are title memory, which the host GPU cannot
 //! read, so a buffer a draw uses gets a persistent host buffer of its size
-//! on first use (system memory shaders may also write), and the ranges each
+//! on first use (in video memory the CPU writes through the PCI BAR where
+//! the host has GPU upload heaps, else in system memory; see
+//! `docs/gpu-memory.md`), and the ranges each
 //! submission reads (vertex, index and constant data, buffer views) are
 //! brought up to date from title memory before it runs: the 64 KiB pages
 //! the title wrote since they were last copied ([`crate::watch`]: read-only
@@ -1862,6 +1864,9 @@ pub(crate) fn near(va: u64) -> String {
 }
 
 #[cfg(test)]
+mod bench;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -2514,8 +2519,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// With `VICTORY_GPU_UPLOAD=1`, the copy of a buffer made without
     /// unordered access is in a GPU upload heap: a refresh writes the
     /// title's bytes there, and the GPU reads them (copied out into system
-    /// memory here). A buffer shaders may write keeps its copy in system
-    /// memory.
+    /// memory here). With `VICTORY_GPU_UPLOAD_WRITES=0`, a buffer shaders
+    /// may write keeps its copy in system memory.
     #[test]
     fn read_only_buffers_get_their_copies_in_video_memory() {
         if !rerun_with_gpu_upload(
