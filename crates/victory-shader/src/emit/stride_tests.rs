@@ -233,8 +233,10 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
 /// The same read through a structured view, as the runtime makes one today
 /// from a title's structured descriptor (`descriptor::host::buffer_srv`).
 /// WARP passes; NVIDIA hardware applies the view's stride a second time and
-/// fails until the runtime makes such views raw (#1835). It is kept so that
-/// the raw test host above does not hide that.
+/// fails (#1835). The test host makes this view itself, so the test does not
+/// follow the runtime: it is here so that the raw test host above does not
+/// hide what the runtime does today, and goes once the runtime makes such
+/// views raw.
 #[test]
 fn a_heap_buffer_read_by_element_through_the_runtimes_structured_view() {
     read_by_element(Stride::StructuredDesc(12));
