@@ -1102,6 +1102,64 @@ mod tests {
         false
     }
 
+    /// Read-only buffers come and go, more bytes of them in all than the
+    /// GPU upload budget, a few at a time: each one's copy still goes in a
+    /// GPU upload heap, and its bytes leave the budget once the last
+    /// reference to its buffer is gone (a clone, as descriptor tables hold,
+    /// keeps them charged). Counted for the whole run, copies went to
+    /// system memory for good after the budget's worth (#2120).
+    #[test]
+    fn upload_budget_is_given_back_when_copies_go() {
+        use windows::core::Interface;
+        if !rerun_with_gpu_upload("shadow::tests::upload_budget_is_given_back_when_copies_go") {
+            return;
+        }
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.gpu_upload() {
+            return; // no GPU upload heaps (resizable BAR) here
+        }
+        const LEN: usize = 128 << 20;
+        let p = crate::watch::tests::pool(LEN / PAGE);
+        let base = crate::host::upload_bytes();
+        // 2.5 GiB in all, past the 2 GiB budget.
+        for round in 0..20 {
+            register_read_only(p, p as u64, LEN as u64);
+            let copy = find(p as u64, LEN as u64).expect("a copy");
+            assert_eq!(
+                heap_type(&copy),
+                D3D12_HEAP_TYPE_GPU_UPLOAD,
+                "round {round}: in a GPU upload heap"
+            );
+            assert_eq!(
+                crate::host::upload_bytes(),
+                base + LEN as u64,
+                "round {round}: charged"
+            );
+            // A clone of the buffer, as a descriptor table holds, outlives
+            // the copy: still charged until it goes.
+            let held = copy.buffer.clone();
+            let weak = Arc::downgrade(&copy);
+            unregister(p, p as u64);
+            drop(copy);
+            assert!(weak.upgrade().is_none(), "round {round}: the copy is gone");
+            assert_eq!(
+                crate::host::upload_bytes(),
+                base + LEN as u64,
+                "round {round}: held"
+            );
+            assert!(!held.as_raw().is_null());
+            drop(held);
+            assert_eq!(
+                crate::host::upload_bytes(),
+                base,
+                "round {round}: given back"
+            );
+        }
+        crate::watch::tests::free(p);
+    }
+
     /// The heap type a copy's buffer is in.
     fn heap_type(copy: &Shadow) -> D3D12_HEAP_TYPE {
         let mut props = D3D12_HEAP_PROPERTIES::default();
