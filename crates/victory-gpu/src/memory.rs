@@ -104,10 +104,20 @@ struct Layout {
 }
 
 /// A 256 KiB dirty-page bitmap buffer kept zeroed while in [`BITMAP_POOL`].
+///
+/// In video memory where the card has room (`VICTORY_MARKS_IN_SYSTEM=1`
+/// keeps it in system memory): shaders' atomics then stay on the card.
+/// Atomics on a bitmap in system memory cost dispatches up to 250 times
+/// their time without marks on an RTX 5070 Ti, in video memory nothing
+/// (`crate::marks_bench`, #2804). The list then copies it at its end into
+/// read-back memory, which `data` maps, and clears it from zeros
+/// ([`HostList::mark_pages_in`]): `video` holds the bitmap, the read-back
+/// buffer and the zeros.
 struct Bitmap {
     _resource: ID3D12Resource,
     data: usize,
     gpu: u64,
+    video: Option<(ID3D12Resource, ID3D12Resource, ID3D12Resource)>,
 }
 
 // SAFETY: `data` is the persistent mapping of `_resource`, owned exclusively by
@@ -127,6 +137,9 @@ impl Bitmap {
         if let Some(bitmap) = BITMAP_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop() {
             return Some(bitmap);
         }
+        if let Some(bitmap) = Self::in_video_memory() {
+            return Some(bitmap);
+        }
         let (resource, data) = crate::host::host()?.shared_buffer(BITMAP_BYTES)?;
         crate::host::name(&resource, || "title memory written pages".into());
         // SAFETY: `data` is a newly mapped shared buffer of at least `BITMAP_WORDS` dwords.
@@ -137,6 +150,39 @@ impl Bitmap {
             _resource: resource,
             data: data as usize,
             gpu,
+            video: None,
+        })
+    }
+
+    /// A bitmap in video memory (zeroed, as committed resources are), its
+    /// read-back buffer, and the zeros every one is cleared from; None if
+    /// the card has no room or `VICTORY_MARKS_IN_SYSTEM=1`.
+    fn in_video_memory() -> Option<Self> {
+        if std::env::var_os("VICTORY_MARKS_IN_SYSTEM").is_some_and(|v| v == "1") {
+            return None;
+        }
+        static ZEROS: Mutex<Option<ID3D12Resource>> = Mutex::new(None);
+        let host = crate::host::host()?;
+        let bitmap = host.uav_buffer(BITMAP_BYTES)?;
+        crate::host::name(&bitmap, || "title memory written pages".into());
+        let (back, data) = host.readback_buffer(BITMAP_BYTES)?;
+        let zeros = {
+            let mut zeros = ZEROS.lock().unwrap_or_else(|e| e.into_inner());
+            if zeros.is_none() {
+                let (buffer, at) = host.upload_buffer(BITMAP_BYTES)?;
+                // SAFETY: a mapped upload buffer of `BITMAP_BYTES` bytes.
+                unsafe { std::ptr::write_bytes(at, 0, BITMAP_BYTES as usize) };
+                *zeros = Some(buffer);
+            }
+            zeros.clone()?
+        };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { bitmap.GetGPUVirtualAddress() };
+        Some(Self {
+            _resource: back.clone(),
+            data: data as usize,
+            gpu,
+            video: Some((bitmap, back, zeros)),
         })
     }
 }
@@ -163,6 +209,12 @@ impl PooledBitmap {
             .as_ref()
             .expect("bitmap present until drop")
             .data
+    }
+
+    /// The bitmap in video memory, its read-back buffer and its zeros, if
+    /// it is there.
+    fn video(&self) -> Option<&(ID3D12Resource, ID3D12Resource, ID3D12Resource)> {
+        self.bitmap.as_ref()?.video.as_ref()
     }
 }
 
@@ -635,6 +687,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     })
     .flatten()?;
     let pooled = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
+    if let Some((bitmap, back, zeros)) = pooled.video() {
+        list.mark_pages_in(bitmap, back, zeros);
+    }
     let dirty = pooled.gpu();
     list.defer_memory(key);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
@@ -1202,5 +1257,59 @@ void main() {
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+    }
+
+    /// Sets bit `n` of the bitmap at `u0`, as a shader's mark does.
+    const MARK: &str = r#"
+#define RS "UAV(u0), RootConstants(num32BitConstants=1, b0)"
+RWByteAddressBuffer dirty : register(u0);
+cbuffer c : register(b0) { uint n; }
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    dirty.InterlockedOr(n >> 5 << 2, 1u << (n & 31));
+}
+"#;
+
+    /// A page bitmap in video memory reaches the CPU after each run of its
+    /// list and starts the next clear: a list recorded again sees its own
+    /// run's marks only.
+    #[test]
+    fn page_marks_in_video_memory_reach_the_cpu_and_start_clear() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let Some(b) = Bitmap::in_video_memory() else {
+            return; // VICTORY_MARKS_IN_SYSTEM=1, or no room
+        };
+        let (bitmap, back, zeros) = b.video.clone().unwrap();
+        let (root, pso) = pipeline(MARK);
+        let list = host.new_list().unwrap();
+        let fresh = std::cell::Cell::new(true);
+        // Records marks of the bits `marks`, runs the list once and returns
+        // the first two words the CPU sees.
+        let run = |marks: &[u32]| -> [u32; 2] {
+            if !fresh.replace(false) {
+                list.reset();
+            }
+            list.mark_pages_in(&bitmap, &back, &zeros);
+            for &n in marks {
+                // SAFETY: an open list, live objects of ours.
+                unsafe {
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetPipelineState(&pso);
+                    list.list.SetComputeRootUnorderedAccessView(0, b.gpu);
+                    list.list.SetComputeRoot32BitConstant(1, n, 0);
+                    list.list.Dispatch(1, 1, 1);
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the read-back memory the list copied the bitmap into.
+            unsafe { [0, 1].map(|k| (b.data as *const u32).add(k).read_volatile()) }
+        };
+        assert_eq!(run(&[3, 33]), [1 << 3, 1 << 1]);
+        assert_eq!(run(&[5]), [1 << 5, 0], "cleared at the end of the run before");
+        assert_eq!(run(&[]), [0, 0]);
     }
 }
