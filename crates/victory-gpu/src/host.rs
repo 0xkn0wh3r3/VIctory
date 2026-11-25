@@ -915,6 +915,24 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        // Snapshots of copies in video memory read their mirrors: brought up
+        // to date at once, and kept so until the copy-backs.
+        let snapshots: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = runs
+            .iter()
+            .flat_map(|l| {
+                l.deferred()
+                    .copies
+                    .iter()
+                    .filter_map(|s| match s {
+                        Step::GpuWrite(shadow, address, len, false) => {
+                            Some((shadow.clone(), *address, *len))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        crate::shadow::snapshots_ahead(&snapshots);
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
@@ -1035,23 +1053,37 @@ impl Host {
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
         crate::shadow::copy_back_marks(&back);
+        // Per copy, the ranges lists whose writes stay out declared: their
+        // bytes stay out of what the others put back where they overlap.
+        let mut withheld: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+        for (shadow, address, len, goes_back) in &back {
+            if !goes_back {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                withheld
+                    .entry(key)
+                    .or_default()
+                    .push((*address, address + len));
+            }
+        }
         // What shaders wrote into copies in video memory, for the copy-backs
-        // below to read from their mirrors.
-        let ranges: Vec<_> = back
-            .iter()
-            .map(|(s, a, n, _)| (s.clone(), *a, *n))
-            .collect();
-        crate::shadow::pull(&ranges);
+        // below to read from their mirrors: in the ranges with snapshots
+        // (marked ones compare nothing; `copy_back_marks` pulled their pages).
+        crate::shadow::pull(&snapshots);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
-                let written = shadow.copy_back(address, len);
+                let held = withheld
+                    .get(&(std::sync::Arc::as_ptr(shadow) as usize))
+                    .map_or(&[][..], Vec::as_slice);
+                let written = shadow.copy_back(address, len, held);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
             }
         }
+        crate::shadow::snapshots_done(&snapshots);
         for list in runs {
             for work in &list.deferred().after {
                 work();
@@ -2778,8 +2810,27 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
-/// Bytes of host copies in GPU upload heaps ([`Host::gpu_upload_buffer`]).
+/// Bytes of host copies in GPU upload heaps now ([`Host::gpu_upload_buffer`]):
+/// charged when one is made, given back when D3D12 destroys it
+/// ([`give_back_upload`]).
 static UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called by D3D12 when a host copy in a GPU upload heap is destroyed (its
+/// last reference gone: the copy's, lists', and descriptor tables' clones
+/// of the resource): its `size` (the callback's data) leaves
+/// [`UPLOAD_BYTES`]. Counted for the whole run, the budget ran out after
+/// enough buffers came and went and every later copy stayed in system
+/// memory (64 copies of 32 MiB on an RTX 3050 Laptop, #2120).
+unsafe extern "system" fn give_back_upload(size: *mut std::ffi::c_void) {
+    UPLOAD_BYTES.fetch_sub(size as u64, Ordering::Relaxed);
+}
+
+/// [`UPLOAD_BYTES`], for tests.
+#[cfg(test)]
+pub(crate) fn upload_bytes() -> u64 {
+    UPLOAD_BYTES.load(Ordering::Relaxed)
+}
+
 /// Video memory host copies may take in GPU upload heaps; the rest stay in
 /// system memory.
 /// shortcut: a fixed amount; ask DXGI for the adapter's budget if 8 GB
@@ -2816,11 +2867,33 @@ impl Host {
             });
             return None;
         }
-        let made = self.mapped_buffer(size, true);
-        if made.is_none() {
+        let Some((buffer, data)) = self.mapped_buffer(size, true) else {
             UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            return None;
+        };
+        // The charge goes back when the buffer is destroyed, not when the
+        // copy drops: lists and descriptor tables may hold it longer.
+        // SAFETY: a live buffer; the callback's data is the size alone.
+        let watched = unsafe {
+            buffer
+                .cast::<windows::Win32::Graphics::Direct3D::ID3DDestructionNotifier>()
+                .and_then(|n| {
+                    n.RegisterDestructionCallback(Some(give_back_upload), size as *const _)
+                })
+        };
+        if watched.is_err() {
+            // Not given back when destroyed, it would count for good.
+            drop(buffer);
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            static UNWATCHED: std::sync::Once = std::sync::Once::new();
+            UNWATCHED.call_once(|| {
+                tracing::info!(
+                    "no destruction callback on this host: host copies stay in system memory"
+                )
+            });
+            return None;
         }
-        made
+        Some((buffer, data))
     }
 
     /// Whether host copies that shaders only read go to GPU upload heaps:
@@ -3009,6 +3082,7 @@ pub(crate) fn retire(resource: ID3D12Resource) {
 pub(crate) fn release_retired() {
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     drop(retired);
+    crate::shadow::settle_spares();
 }
 
 /// Diagnostics: a noted command running a shader `VICTORY_TRACE_SHADERS`
@@ -3361,7 +3435,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
                     }
                 }
                 for &(at, len) in &declared {
-                    copy.copy_back(at, len);
+                    copy.copy_back(at, len, &[]);
                 }
             }
             (took, copied)

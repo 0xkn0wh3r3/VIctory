@@ -31,8 +31,8 @@ pub const ANALYTICS: Guid = Guid::new(
     [0x81, 0x5d, 0x9a, 0x9a, 0x1e, 0x0c, 0x6c, 0x9b],
 );
 
-/// 38 characters (39 bytes with the NUL): the retail console ID, which the
-/// GDK documents as always `00000000.00000000.00000000.00000000.00`.
+/// 38 characters (39 bytes with the NUL): the documented retail console
+/// ID, `00000000.00000000.00000000.00000000.00`.
 const CONSOLE_ID: &str = "00000000.00000000.00000000.00000000.00";
 /// The retail sandbox.
 const SANDBOX: &str = "RETAIL";

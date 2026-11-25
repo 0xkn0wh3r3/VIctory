@@ -1287,6 +1287,10 @@ impl Host {
     /// of `size` (zeroed) at view-heap index 0; returns the UAV's texels.
     /// Cleared to 0 with a LESS test, every pixel is hidden: what the UAV
     /// holds afterwards the pixel program wrote for hidden pixels.
+    /// What [`Host::draw_behind_depth`] fills its UAV with before the draw:
+    /// a texel nothing stored keeps it.
+    pub const UAV_SEED: [f32; 4] = [0.25, 0.5, 0.75, 0.125];
+
     pub fn draw_behind_depth(
         &self,
         root: &ID3D12RootSignature,
@@ -1425,6 +1429,34 @@ impl Host {
             vb.Unmap(0, None);
             list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, clear, 0, None);
             list.SetDescriptorHeaps(&[Some(views.clone())]);
+            // The UAV holds a known value before the draw (a clear takes the
+            // view in a shader-visible heap and in one that is not), and the
+            // clear is done before the draw reads or writes it.
+            let cpu_views: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            let cpu_uav = cpu_views.GetCPUDescriptorHandleForHeapStart();
+            dev.CreateUnorderedAccessView(&uav, None, None, cpu_uav);
+            list.ClearUnorderedAccessViewFloat(
+                views.GetGPUDescriptorHandleForHeapStart(),
+                cpu_uav,
+                &uav,
+                &Self::UAV_SEED,
+                &[],
+            );
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::transmute_copy(&uav),
+                    }),
+                },
+            }]);
             list.SetGraphicsRootSignature(root);
             for (param, arg) in roots {
                 match arg {
