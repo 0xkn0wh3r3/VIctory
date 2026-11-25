@@ -450,20 +450,10 @@ pub(crate) enum View {
 /// old one go stale instead of naming whatever is made at the same address
 /// next.
 ///
-/// Views without a resource object have nothing that releases them, and a
-/// title copies descriptors as bytes, so nothing says when the last
-/// descriptor naming an entry is gone: such entries were kept for the run.
-/// Grand Theft Auto VI writes some 14,000 constant buffer views a frame,
-/// each at the address its constants have that frame: 2,450,139 entries
-/// after four minutes of play, about 1 GB with the index, and 11,000 more
-/// every second (measured on fxceless/victory-fork). So the two kinds that
-/// carry an address are not entries: their records name them whole
-/// ([`constant_words`], [`placed_words`]), and the table holds only what is
-/// bounded: views of resource objects (freed with the resource), samplers
-/// (as many as there are sampler states), and the shapes of placed views
-/// (their descriptions without the address: as many as the title has kinds
-/// of textures and buffers, however often it moves them).
-/// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+/// Constant buffer views and views of placed memory have no resource to
+/// free them, so their records name them whole instead ([`constant_words`],
+/// [`placed_words`]); the table keeps only the shapes of placed views, and
+/// those that do not fit.
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
@@ -508,14 +498,6 @@ const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
 /// access, the resource description, and the view's words but the two that
 /// hold the address (10 and 11).
 type Shape = (bool, [u32; 14], [u32; 14]);
-
-/// Whether constant buffer views and views of placed memory are named whole
-/// in their records ([`Views`]). On by default; `VICTORY_VIEW_INLINE=0`
-/// makes every view a table entry, as before.
-fn inline() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_INLINE").is_none_or(|v| v != "0"))
-}
 
 /// The two record words of the 62 bits `payload` of kind `kind`.
 fn kind_words(kind: u32, payload: u64) -> [u32; 2] {
@@ -637,24 +619,22 @@ impl Views {
 /// The two words that name `view` in a record: the view itself where its
 /// kind allows ([`Views`]), else its table entry.
 fn words_for(view: View) -> [u32; 2] {
-    if inline() {
-        match &view {
-            View::Constant(address, size) => {
-                if let Some(words) = constant_words(*address, *size) {
-                    return words;
-                }
+    match &view {
+        View::Constant(address, size) => {
+            if let Some(words) = constant_words(*address, *size) {
+                return words;
             }
-            View::Placed(unordered, resource, desc) => {
-                let (shape, address) = shape_of(*unordered, resource, desc);
-                if address >> PLACED_ADDRESS_BITS == 0 {
-                    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(shape) = views.shape(shape) {
-                        return placed_words(shape, address);
-                    }
-                }
-            }
-            _ => {}
         }
+        View::Placed(unordered, resource, desc) => {
+            let (shape, address) = shape_of(*unordered, resource, desc);
+            if address >> PLACED_ADDRESS_BITS == 0 {
+                let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(shape) = views.shape(shape) {
+                    return placed_words(shape, address);
+                }
+            }
+        }
+        _ => {}
     }
     VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(view)
 }
@@ -1196,14 +1176,10 @@ pub(crate) mod tests {
     }
 
     /// A title that writes constant buffer views and views of placed memory
-    /// at ever new addresses adds nothing to the table (it grew by 11,000
-    /// entries a second in the world); one shape stands for all the placed
-    /// views alike.
+    /// at ever new addresses adds nothing to the table; one shape stands
+    /// for all the placed views alike.
     #[test]
     fn views_at_new_addresses_add_no_entries() {
-        if !inline() {
-            return;
-        }
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
