@@ -825,6 +825,10 @@ pub(crate) struct HostList {
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
+    /// Page bitmaps in video memory the list's shaders mark
+    /// (`crate::memory`), with where the list copies each at its end and
+    /// the zeros it clears each from: (bitmap, read-back, zeros).
+    page_marks: Mutex<Vec<(ID3D12Resource, ID3D12Resource, ID3D12Resource)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1142,6 +1146,7 @@ impl Host {
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
+                page_marks: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1761,6 +1766,24 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // Page bitmaps in video memory go to where the CPU reads them after
+        // the list's run, and are cleared for the next.
+        let marks = self.page_marks.lock().unwrap_or_else(|e| e.into_inner());
+        for (bitmap, back, zeros) in marks.iter() {
+            // SAFETY: a plain query.
+            let bytes = unsafe { bitmap.GetDesc() }.Width;
+            // SAFETY: an open list; buffers of `bytes` bytes, the bitmap a
+            // UAV since `mark_pages_in`, the others in their heap's state.
+            unsafe {
+                use D3D12_RESOURCE_STATE_COPY_DEST as DEST;
+                use D3D12_RESOURCE_STATE_COPY_SOURCE as SOURCE;
+                let unordered = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                self.list.ResourceBarrier(&[transition(bitmap, unordered, SOURCE)]);
+                self.list.CopyBufferRegion(back, 0, bitmap, 0, bytes);
+                self.list.ResourceBarrier(&[transition(bitmap, SOURCE, DEST)]);
+                self.list.CopyBufferRegion(bitmap, 0, zeros, 0, bytes);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1782,6 +1805,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        self.page_marks.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2125,6 +2149,34 @@ impl HostList {
 
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
+    /// Shaders of the list mark pages in `bitmap`, a buffer in video memory
+    /// (`crate::memory`), from now on: it becomes a UAV here, and at the
+    /// list's end ([`HostList::close`]) it is copied into `back` (read-back
+    /// memory) and cleared from `zeros`. It starts each run clear: zeroed
+    /// when made, and cleared at the end of every run; a buffer decays to
+    /// the common state after each.
+    pub(crate) fn mark_pages_in(
+        &self,
+        bitmap: &ID3D12Resource,
+        back: &ID3D12Resource,
+        zeros: &ID3D12Resource,
+    ) {
+        // SAFETY: an open list; the bitmap is in the common state at the
+        // list's start, and nothing used it before in this one.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(
+                bitmap,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )])
+        };
+        self.keep(bitmap);
+        self.keep(back);
+        self.keep(zeros);
+        let mut marks = self.page_marks.lock().unwrap_or_else(|e| e.into_inner());
+        marks.push((bitmap.clone(), back.clone(), zeros.clone()));
+    }
+
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
     }
@@ -2713,6 +2765,44 @@ impl Host {
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         self.mapped_buffer(size, false)
+    }
+
+    /// A buffer in read-back memory, mapped, in the copy-destination state.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_buffer(size, true)
+    }
+
+    /// A GPU-only buffer of `size` bytes shaders write as a UAV, zeroed, in
+    /// the common state.
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; committed resources are zeroed.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        made.ok().and(buffer)
     }
 
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
