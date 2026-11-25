@@ -36,6 +36,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod frame_budget;
 mod hold;
 #[cfg(windows)]
 mod fx;
