@@ -8964,6 +8964,14 @@ impl<'a> Lower<'a> {
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
                     }
+                    // DXIL gathers from 2D textures, cubes and their arrays
+                    // (kinds 2, 5, 7, 9), with offsets only from the 2D ones.
+                    if !matches!(kind, 2 | 5 | 7 | 9) {
+                        return Err("a gather from a 1D or 3D image");
+                    }
+                    if offset_word && matches!(kind, 5 | 9) {
+                        return Err("a gather with offsets from a cube");
+                    }
                     if offset_word {
                         let w = addr_val(self, 0)?;
                         for (k, at) in [(0, 26), (1, 18)] {
@@ -8992,6 +9000,10 @@ impl<'a> Lower<'a> {
                 *slot = addr_val(self, k)?;
             }
             let mip = if name == "image_load_mip" {
+                // A UAV is one level of its resource; DXIL loads take none.
+                if uav {
+                    return Err("a load at a mip level from a UAV");
+                }
                 addr_val(self, coords)?
             } else if uav {
                 // Our declarations have four channels.
@@ -11507,6 +11519,76 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    /// Image instructions DXIL has no form of are refused, not emitted as
+    /// operations the validator rejects: a gather from a 1D (array) image
+    /// ("gather requires resource declared as texture/2D/Cube/2DArray/
+    /// CubeArray"), a gather with offsets from a cube ("out of bound offset
+    /// must be undef"), and a load at a mip level from a UAV ("uav load
+    /// don't support mipLevel/sampleIndex"). Each result is written to LDS,
+    /// so the refusal ends the translation. The 2D gather and the plain UAV
+    /// load lower.
+    #[test]
+    fn image_instructions_dxil_lacks_are_refused() {
+        // The view table's first eight dwords (s[12:19]) and the sampler
+        // table's first four (s[20:23]); then the instruction (v0 its
+        // addresses, v4 its first result) and ds_write_b32 v1, v4.
+        let program = |image: [u32; 2]| {
+            [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xBE86_0301, // s_mov_b32 s6, s1
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xF40C_0302,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+                0xF408_0503,
+                0xFA00_0000, // s_load_dwordx4 s[20:23], s[6:7], 0
+                image[0],
+                image[1],
+                0xD834_0000,
+                0x0000_0401, // ds_write_b32 v1, v4
+                S_ENDPGM,
+            ]
+        };
+        // MIMG words 1: v0 addresses, v4 data, s[12:19] image, s[20:23]
+        // sampler, a16.
+        const GATHER_1D_ARRAY: [u32; 2] = [0xF11C_0820, 0x40A3_0400]; // image_gather4_lz dmask:0x8 dim:1D_ARRAY
+        const GATHER_2D: [u32; 2] = [0xF11C_0808, 0x40A3_0400]; // image_gather4_lz dmask:0x8 dim:2D
+        const GATHER_O_CUBE: [u32; 2] = [0xF15C_0818, 0x40A3_0400]; // image_gather4_lz_o dmask:0x8 dim:CUBE
+        const LOAD_MIP_2D: [u32; 2] = [0xF004_0808, 0x40A3_0400]; // image_load_mip dmask:0x8 dim:2D
+        const LOAD_2D: [u32; 2] = [0xF000_0808, 0x40A3_0400]; // image_load dmask:0x8 dim:2D
+        let refused = |words: &[u32], layout, used, why: &str| {
+            let e = lower_with(words, layout, used)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(why), "{e}");
+        };
+        let (layout, used) = texture_tables();
+        assert!(lower_with(&program(GATHER_2D), layout.clone(), used.clone()).is_ok());
+        refused(
+            &program(GATHER_1D_ARRAY),
+            layout.clone(),
+            used.clone(),
+            "a gather from a 1D or 3D image",
+        );
+        refused(
+            &program(GATHER_O_CUBE),
+            layout,
+            used,
+            "a gather with offsets from a cube",
+        );
+        // The image as a UAV.
+        let (layout, mut used) = texture_tables();
+        used[0].kind = ResourceType::Uav;
+        assert!(lower_with(&program(LOAD_2D), layout.clone(), used.clone()).is_ok());
+        refused(
+            &program(LOAD_MIP_2D),
+            layout,
+            used,
+            "a load at a mip level from a UAV",
+        );
     }
 
     #[test]
