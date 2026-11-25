@@ -1078,6 +1078,25 @@ fn into_destination(
             }
         }
     }
+    // Every page known and still not written: the host refused a view of
+    // them (address space or commit short for a moment while a load maps
+    // many at once). Tried again a few times, waiting longer each time,
+    // before the request fails; unknown pages fail at once.
+    if super::xmem::unknown_pages(pages) == 0
+        && let Some(tries) = with_retries(HOST_RETRIES, std::thread::sleep, || {
+            super::xmem::write_physical(pages, offset, &data[..n])
+        })
+    {
+        let retried = HOST_RETRIED.fetch_add(1, Ordering::Relaxed) + 1;
+        if retried.is_power_of_two() {
+            tracing::info!(
+                retried,
+                tries,
+                "dstorage: physical pages written after the host refused a view"
+            );
+        }
+        return Ok(());
+    }
     tracing::warn!(
         offset,
         len,
@@ -1106,6 +1125,25 @@ static AUTO_SUBMITS: AtomicU32 = AtomicU32::new(0);
 
 /// Milliseconds a page list naming page 0 is read again for.
 const LATE_LIST_TRIES: u32 = 8;
+/// Writes of known physical pages tried again after the host refused a
+/// view of them, waiting 2, 4, ... 128 ms before each (254 ms in all).
+const HOST_RETRIES: u32 = 7;
+/// Requests whose physical pages were written after a retry.
+static HOST_RETRIED: AtomicU32 = AtomicU32::new(0);
+
+/// Runs `write` up to `tries` more times, `sleep`ing 2 ms before the
+/// first and twice as long before each next (at most 128 ms), until it
+/// succeeds: the try it succeeded at (from 1), or `None`.
+fn with_retries(
+    tries: u32,
+    mut sleep: impl FnMut(std::time::Duration),
+    mut write: impl FnMut() -> bool,
+) -> Option<u32> {
+    (1..=tries).find(|&k| {
+        sleep(std::time::Duration::from_millis(1 << k.min(7)));
+        write()
+    })
+}
 /// Page lists filled after their request started (written late).
 static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
 
@@ -1141,6 +1179,29 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    /// A write the host refuses for a moment is tried again after 2, 4, 8
+    /// ms..., at most `tries` times: one that succeeds on its third retry
+    /// waited 2 + 4 + 8 ms; one that never does, all seven (254 ms), and
+    /// fails.
+    #[test]
+    fn host_refusals_are_retried_with_longer_waits() {
+        let mut waits = Vec::new();
+        let mut left = 3;
+        let tries = with_retries(
+            HOST_RETRIES,
+            |d| waits.push(d.as_millis()),
+            || {
+                left -= 1;
+                left == 0
+            },
+        );
+        assert_eq!((tries, &waits[..]), (Some(3), &[2, 4, 8][..]));
+        waits.clear();
+        let never = with_retries(HOST_RETRIES, |d| waits.push(d.as_millis()), || false);
+        assert_eq!(never, None);
+        assert_eq!(waits, [2, 4, 8, 16, 32, 64, 128]);
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
