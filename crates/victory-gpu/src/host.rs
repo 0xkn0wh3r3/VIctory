@@ -981,10 +981,26 @@ impl Host {
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
         crate::shadow::copy_back_marks(&back);
+        // Per copy, the ranges lists whose writes stay out declared: their
+        // bytes stay out of what the others put back where they overlap.
+        let mut withheld: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+        for (shadow, address, len, goes_back) in &back {
+            if !goes_back {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                withheld
+                    .entry(key)
+                    .or_default()
+                    .push((*address, address + len));
+            }
+        }
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
-                let written = shadow.copy_back(address, len);
+                let held = withheld
+                    .get(&(std::sync::Arc::as_ptr(shadow) as usize))
+                    .map_or(&[][..], Vec::as_slice);
+                let written = shadow.copy_back(address, len, held);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             } else {
                 shadow.keep_writes(address, len);

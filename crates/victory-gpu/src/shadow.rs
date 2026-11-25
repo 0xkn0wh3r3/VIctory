@@ -325,25 +325,43 @@ impl Shadow {
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        self.copy_back_or_not(address, len, true)
+    ///
+    /// `withheld`: ranges (title addresses, `[from, to)`) of this copy that
+    /// lists whose writes stay out of title memory declared in the same
+    /// submission; their bytes are not put back, and stay in the copy.
+    pub(crate) fn copy_back(
+        &self,
+        address: usize,
+        len: usize,
+        withheld: &[(usize, usize)],
+    ) -> usize {
+        self.copy_back_or_not(address, len, Some(withheld))
     }
 
     /// After the submission ran: what its shaders wrote in the range stays
     /// in the copy and does not go into title memory (they computed it
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
-        self.copy_back_or_not(address, len, false);
+        self.copy_back_or_not(address, len, None);
     }
 
-    fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+    /// `back`: the withheld ranges of [`Shadow::copy_back`], or None to keep
+    /// the writes ([`Shadow::keep_writes`]).
+    fn copy_back_or_not(
+        &self,
+        address: usize,
+        len: usize,
+        back: Option<&[(usize, usize)]>,
+    ) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
-            && back
+        if let Some(withheld) = back
+            && let Some((taken, before)) = segments
+                .iter()
+                .find(|(at, bytes)| *at <= from && to <= at + bytes.len())
             && from < to
         {
             let before = &before[from - taken..to - taken];
@@ -371,23 +389,42 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                // The piece's bytes withheld lists declared (offsets in it):
+                // those stay out of title memory, and in the copy.
+                let piece = start + at;
+                let held: Vec<(usize, usize)> = withheld
+                    .iter()
+                    .map(|&(a, b)| (a.max(piece) - piece, b.min(piece + n).saturating_sub(piece)))
+                    .filter(|(a, b)| a < b)
+                    .collect();
+                let open = subtract(vec![(0, n)], &held);
+                if host != old && crate::host::read_into(piece as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+                    for &(a, b) in &open {
+                        let pairs = title[a..b]
+                            .iter_mut()
+                            .zip(host[a..b].iter_mut())
+                            .zip(&old[a..b]);
+                        for ((t, h), o) in pairs {
+                            if *h != *o && *t != *h {
+                                *t = *h;
+                                changed = true;
+                            }
+                            *h = *t;
                         }
-                        *h = *t;
                     }
                     if changed {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        let _writing = crate::watch::writing(piece, n);
+                        crate::host::write_mapped(piece as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
-                    synced.push((start + at) / PAGE);
+                    // Withheld bytes left the copy unlike title memory: not
+                    // current.
+                    if held.is_empty() {
+                        synced.push(piece / PAGE);
+                    }
                 }
                 at += n;
             }
@@ -1109,7 +1146,7 @@ mod tests {
         copy.write_host((p + 10) as u64, &[0xaa]);
         // SAFETY: a byte of our pool.
         unsafe { title(PAGE + 20).write_volatile(0x66) };
-        copy.copy_back(p, len);
+        copy.copy_back(p, len, &[]);
         // SAFETY: bytes of our pool.
         unsafe {
             assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
@@ -1142,11 +1179,19 @@ mod tests {
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
-        assert_eq!(copy.copy_back(p + 16, 64), 64, "the range's part of the piece");
-        assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE), PAGE, "the piece written");
-        assert_eq!(copy.copy_back(p + PAGE, PAGE), 0, "compared once");
-        assert_eq!(copy.copy_back(p + 3 * PAGE, 100), 0);
-        assert_eq!(copy.copy_back(p + 80, 8), 0);
+        assert_eq!(
+            copy.copy_back(p + 16, 64, &[]),
+            64,
+            "the range's part of the piece"
+        );
+        assert_eq!(
+            copy.copy_back(p + PAGE, 2 * PAGE, &[]),
+            PAGE,
+            "the piece written"
+        );
+        assert_eq!(copy.copy_back(p + PAGE, PAGE, &[]), 0, "compared once");
+        assert_eq!(copy.copy_back(p + 3 * PAGE, 100, &[]), 0);
+        assert_eq!(copy.copy_back(p + 80, 8, &[]), 0);
         // SAFETY: our pool.
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
@@ -1200,7 +1245,7 @@ mod tests {
         // SAFETY: dwords of the mapped bitmap.
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
-        assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        assert_eq!(copy.copy_back(p, len, &[]), 0, "nothing kept to compare");
         unregister(p, p as u64);
     }
 
@@ -1271,7 +1316,7 @@ mod tests {
         );
         for (_, a, n, back) in &declared {
             if *back {
-                copy.copy_back(*a, *n);
+                copy.copy_back(*a, *n, &[]);
             } else {
                 copy.keep_writes(*a, *n);
             }
@@ -1287,6 +1332,66 @@ mod tests {
         );
         assert_eq!(subtract(vec![(0, 10)], &[(0, 10)]), []);
         assert_eq!(subtract(vec![(0, 10)], &[]), [(0, 10)]);
+    }
+
+    /// Snapshot copy-back (unmarked ranges) of two lists' overlapping GPU
+    /// writes, one list's withheld (it read memory with no copy): what the
+    /// other declared goes back except the bytes the withheld one declared
+    /// too, which stay in the copy only. Both allowed, all of it goes back.
+    /// (Reported in review of #1986 by andrewpozdnakov7-jpg.)
+    #[test]
+    fn a_withheld_lists_bytes_stay_out_of_an_overlapping_copy_back() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        const A: [u32; 3] = [0x1111_1111, 0x2222_2222, 0x3333_3333];
+        const B: [u32; 2] = [0x4444_4444, 0x5555_5555];
+        for withheld in [false, true] {
+            let p = crate::watch::tests::pool(1);
+            register(p, p as u64, PAGE as u64);
+            let copy = find(p as u64, PAGE as u64).unwrap();
+            copy.update(p, PAGE);
+            let (src, data) = host.upload_buffer(32).unwrap();
+            // SAFETY: a mapped 32-byte upload buffer.
+            unsafe {
+                data.cast::<[u32; 5]>()
+                    .write([A[0], A[1], A[2], B[0], B[1]])
+            };
+            // A writes dwords 16-18 of the page, B dwords 18-19 after it.
+            let (a, b) = (host.new_list().unwrap(), host.new_list().unwrap());
+            copy.gpu_writes(&a, (p + 64) as u64, 12, false);
+            copy.gpu_writes(&b, (p + 72) as u64, 8, false);
+            b.defer_missed(move || withheld);
+            // SAFETY: open lists, live buffers, ranges inside both.
+            unsafe {
+                a.list.CopyBufferRegion(&copy.buffer, 64, &src, 0, 12);
+                b.list.CopyBufferRegion(&copy.buffer, 72, &src, 12, 8);
+            }
+            a.close();
+            b.close();
+            host.execute(&[&a, &b]);
+            // SAFETY: four dwords of our pool.
+            let title = unsafe { ((p + 64) as *const [u32; 4]).read_volatile() };
+            let gpu = copy.read_host((p + 64) as u64, 4);
+            assert_eq!(
+                gpu,
+                [A[0], A[1], B[0], B[1]],
+                "the copy holds both lists' writes"
+            );
+            if withheld {
+                assert_eq!(
+                    title,
+                    [A[0], A[1], 0, 0],
+                    "B's bytes stay out, also where A declared them"
+                );
+            } else {
+                assert_eq!(title, [A[0], A[1], B[0], B[1]], "both go back");
+            }
+            drop((a, b));
+            unregister(p, p as u64);
+            drop(copy);
+            crate::watch::tests::free(p);
+        }
     }
 
     /// Mark bits are handed out in runs and come back joined.
