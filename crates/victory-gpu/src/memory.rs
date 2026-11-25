@@ -529,11 +529,14 @@ mod tests {
     /// table and the heap's views, as translated shaders do, into `dst`
     /// from byte `at`.
     const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0), RootConstants(num32BitConstants=3, b0)"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0), RootConstants(num32BitConstants=4, b0), SRV(t1, space=2)"
 ByteAddressBuffer views[] : register(t0);
 ByteAddressBuffer table : register(t0, space2);
 RWByteAddressBuffer dst : register(u0);
-cbuffer c : register(b0) { uint lo; uint hi; uint at; }
+// The heap's view-stride table: past it, a paged heap's page table
+// (`victory_shader::emit::VIEW_PAGE_TABLE`), read as translated shaders do.
+ByteAddressBuffer strides : register(t1, space2);
+cbuffer c : register(b0) { uint lo; uint hi; uint at; uint paged; }
 [RootSignature(RS)]
 [numthreads(4, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -543,7 +546,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint block = inside ? table.Load(l1 * 4) : 0;
     uint entry = block << 12 | (a >> 16 & 0xFFF);
     uint2 e = table.Load2((4096 + 2 * entry) * 4);
-    dst.Store(at + id.x * 4, views[NonUniformResourceIndex(e.x)].Load(a - e.y));
+    uint slot = paged ? strides.Load(PAGE_TABLE + (e.x >> 8) * 4) << 8 | (e.x & 255) : e.x;
+    dst.Store(at + id.x * 4, views[NonUniformResourceIndex(slot)].Load(a - e.y));
 }
 "#;
 
@@ -557,11 +561,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         use windows::core::s;
         let host = crate::host::host().unwrap();
         let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        let source = format!(
+            "#define PAGE_TABLE {}\n{SOURCE}",
+            victory_shader::emit::VIEW_PAGE_TABLE
+        );
         // SAFETY: the source and names outlive the call; the errors are text.
         unsafe {
             let made = D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 s!("memory"),
                 None,
                 None,
@@ -641,15 +649,25 @@ void main(uint3 id : SV_DispatchThreadID) {
         let record = |reads: [usize; 2]| -> Vec<Map> {
             let maps: Vec<Map> = lists.iter().map(|l| bind(l, OURS).expect("a page table")).collect();
             for (k, (list, &address)) in lists.iter().zip(&reads).enumerate() {
-                let constants = [address as u32, (address >> 32) as u32, 16 * k as u32];
+                let paged = u32::from(crate::descriptor::view_pages());
+                let constants = [address as u32, (address >> 32) as u32, 16 * k as u32, paged];
                 // SAFETY: an open list, live objects of ours.
                 unsafe {
                     list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
                     list.list.SetComputeRootSignature(&root);
-                    list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+                    // The whole host heap, as translated shaders index it.
+                    list.list.SetComputeRootDescriptorTable(
+                        0,
+                        views.heap.GetGPUDescriptorHandleForHeapStart(),
+                    );
                     list.list.SetComputeRootShaderResourceView(1, maps[k].table);
                     list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
-                    list.list.SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+                    list.list
+                        .SetComputeRoot32BitConstants(3, 4, constants.as_ptr().cast(), 0);
+                    list.list.SetComputeRootShaderResourceView(
+                        4,
+                        views.strides().unwrap().GetGPUVirtualAddress(),
+                    );
                     list.list.SetPipelineState(&pso);
                     list.list.Dispatch(1, 1, 1);
                 }
