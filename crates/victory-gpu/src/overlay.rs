@@ -48,10 +48,10 @@ pub(crate) enum Work {
 
 static SKIPPED: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
 const WORK: [&str; 4] = [
-    "COMPUTE DISPATCHES",
-    "MESH DRAWS",
-    "VERTEX DRAWS",
-    "INDIRECT EXECUTION",
+    "COMPUTE PASSES",
+    "MESH-SHADER DRAWS",
+    "VERTEX/INDEX DRAWS",
+    "GPU-DRIVEN DRAWS + DISPATCHES",
 ];
 
 /// Whether the toggles leave `work` out (one relaxed load).
@@ -497,8 +497,8 @@ fn lines(times: &VecDeque<f32>, second: &Second, s: &System, pad: Option<&Pad>) 
         }
         None => out.push(("PAD NONE".to_owned(), Colour::Dim)),
     }
-    out.push(("ALT+1-5 TURN WORK OFF:".to_owned(), Colour::Dim));
-    let names = WORK.iter().chain(["CONSOLE SHADERS"].iter());
+    out.push(("ALT+1-5   [X] RUNS   [ ] SKIPPED".to_owned(), Colour::Dim));
+    let names = WORK.iter().chain(["TITLE SHADERS (ALL DRAWING)"].iter());
     let offs = SKIPPED
         .iter()
         .map(|s| s.load(Relaxed))
@@ -827,7 +827,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|(text, _)| text == " 5 [X] CONSOLE SHADERS")
+                .any(|(text, _)| text == " 5 [X] TITLE SHADERS (ALL DRAWING)")
         );
         let image = Image::panel(2, &lines, &times);
         assert_eq!(image.pixels.len(), (image.width * image.height) as usize);
