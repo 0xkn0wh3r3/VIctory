@@ -207,10 +207,21 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.in_place {
+            self.keep_in_place(list);
             return;
         }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
+    }
+
+    /// An in-place buffer has nothing to bring up to date, but `list`'s
+    /// commands name its GPU address: the list keeps the placed buffer (and
+    /// so its heap, which a placed resource holds) until it is reset, for
+    /// the title may release the buffer, or the heap be let go, before the
+    /// list runs.
+    fn keep_in_place(&self, list: &HostList) {
+        // By the buffer: kept, its address is not given out again meanwhile.
+        list.keep_once(windows::core::Interface::as_raw(&self.buffer) as usize, &self.buffer);
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
@@ -278,6 +289,7 @@ impl Shadow {
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         if self.in_place {
+            self.keep_in_place(list);
             return;
         }
         let len = len.min(self.left(address));
@@ -2007,6 +2019,54 @@ mod tests {
         assert!(old_gone, "the window in the stale heap is let go");
         assert!(survived, "the window in the new heap stays");
         assert_eq!(cached, Some(new), "the new heap stays cached");
+    }
+
+
+    /// A list that uses an in-place buffer keeps it (and so its heap) until
+    /// it is reset, though nothing is refreshed: the title may release the
+    /// buffer, or its heap be let go, before the list runs.
+    #[test]
+    fn a_list_keeps_the_in_place_buffers_it_uses() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::core::{IUnknown, Interface};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let Some(host) = host() else { return };
+        // SAFETY: our own allocation.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        touch(base, 1 << 20);
+        let Some((buffer, gpu, heap)) = in_place_buffer(base as u64, 64 << 10) else {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // no heaps from process memory on this host
+        };
+        let seen = buffer.clone();
+        // References to the buffer (besides the one asking).
+        let refs = || {
+            let u: IUnknown = seen.cast().unwrap();
+            let vtable = u.vtable();
+            // SAFETY: a live object; one reference added and taken back.
+            unsafe {
+                (vtable.AddRef)(u.as_raw());
+                (vtable.Release)(u.as_raw()) - 1
+            }
+        };
+        let shadow = Shadow::new_with(buffer, base as *mut u8, gpu, base as u64, 64 << 10, Some(heap));
+        let list = host.new_list().unwrap();
+        let before = refs();
+        shadow.refresh(&list, base as u64, 256);
+        shadow.refresh(&list, base as u64 + 256, 256);
+        shadow.gpu_writes(&list, base as u64, 4096, false);
+        assert_eq!(refs(), before + 1, "kept once by the list");
+        drop(shadow);
+        assert_eq!(refs(), before, "the list holds it after the copy is gone");
+        list.close();
+        list.reset();
+        assert_eq!(refs(), before - 1, "let go when the list is reset");
+        drop(seen);
+        let_go_in_place(base as u64, 1 << 20);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
 

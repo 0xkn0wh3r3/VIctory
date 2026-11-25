@@ -662,6 +662,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Keys of what [`HostList::keep_once`] kept.
+    kept_once: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1762,6 +1764,18 @@ impl HostList {
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
+        }
+    }
+
+    /// [`HostList::keep`], once per `key` until the list is reset (for
+    /// objects the list's commands name many times; `key` must not be given
+    /// to another object while this one is kept: its address, say).
+    pub(crate) fn keep_once(&self, key: usize, object: &impl Interface) {
+        let mut deferred = self.deferred();
+        if deferred.kept_once.insert(key)
+            && let Ok(object) = object.cast::<windows::core::IUnknown>()
+        {
+            deferred.kept.push(object);
         }
     }
 
