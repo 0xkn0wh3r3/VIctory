@@ -302,7 +302,9 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return;
     }
-    let Some(buffer) = host.default_buffer(total) else { return };
+    let Some(buffer) = copy_buffer(total) else {
+        return;
+    };
     list.keep(&buffer);
     crate::texture::host_writes(list, to);
     crate::list::ensure_state(list, from, COPY_SOURCE);
@@ -341,6 +343,53 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         logged.push((from as usize, to as usize));
         tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, subresources = n, "aliased texture copied");
     }
+}
+
+/// The buffers [`alias_copy`] copies through (with their sizes), kept for
+/// reuse: one is free again once no list holds it (a list keeps it until
+/// it is reset). Made for each list and dropped at its reset, they held a
+/// texture's size of video memory per list in flight, made anew each
+/// frame: a frame of lists reading a big aliased texture came and went in
+/// gigabytes.
+static COPY_BUFFERS: Mutex<Vec<(ID3D12Resource, u64)>> = Mutex::new(Vec::new());
+
+/// The most video memory free copy buffers keep.
+const COPY_BUFFER_BYTES: u64 = 512 << 20;
+
+/// A GPU-only buffer of at least `size` bytes (at most twice that) no list
+/// holds: a kept one, or a new one. The buffer starts in the copy
+/// destination state (new) or decays to the common one when its last
+/// submission ends, from which a copy into it promotes it.
+fn copy_buffer(size: u64) -> Option<ID3D12Resource> {
+    let mut pool = COPY_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    // A list takes a reference only here, under the lock: one no list
+    // holds stays free until it is handed out.
+    let free = pool
+        .iter()
+        .filter(|(b, n)| {
+            *n >= size && *n <= size.saturating_mul(2) && crate::shadow::others(b) == 0
+        })
+        .min_by_key(|(_, n)| *n);
+    if let Some((buffer, _)) = free {
+        return Some(buffer.clone());
+    }
+    let buffer = host()?.default_buffer(size)?;
+    crate::host::name(&buffer, || format!("aliased texture copies {size:#x}"));
+    pool.push((buffer.clone(), size));
+    // Free ones past the limit go, smallest first (the big ones are the
+    // ones worth keeping).
+    let mut kept: u64 = pool.iter().map(|(_, n)| n).sum();
+    if kept > COPY_BUFFER_BYTES {
+        pool.sort_by_key(|(_, n)| *n);
+        pool.retain(|(b, n)| {
+            if kept > COPY_BUFFER_BYTES && crate::shadow::others(b) == 0 {
+                kept -= n;
+                return false;
+            }
+            true
+        });
+    }
+    Some(buffer)
 }
 
 /// Has `resource`'s host copy brought up to date at the submission that
@@ -968,6 +1017,34 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copy buffer goes to one list at a time and back to the next once
+    /// that list lets it go; a much smaller copy gets one of its own size.
+    #[test]
+    fn copy_buffers_are_reused_once_free() {
+        use windows::core::Interface;
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        // An odd size, so that no other test's buffer fits.
+        let size = (3 << 20) + 4096;
+        let a = copy_buffer(size).unwrap();
+        let b = copy_buffer(size).unwrap();
+        assert_ne!(
+            a.as_raw(),
+            b.as_raw(),
+            "a held buffer is not handed out again"
+        );
+        let raw = a.as_raw();
+        drop(a);
+        let c = copy_buffer(size).unwrap();
+        assert_eq!(c.as_raw(), raw, "a free one is");
+        drop((b, c));
+        let small = copy_buffer(64 << 10).unwrap();
+        // SAFETY: a live buffer.
+        let width = unsafe { small.GetDesc() }.Width;
+        assert!(width <= 2 * (64 << 10), "not one over twice its size");
+    }
 
     fn layout(w: u32, h: u32, mips: u32) -> victory_formats::texture::Layout {
         use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};

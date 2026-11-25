@@ -81,6 +81,21 @@ struct Vram {
     ahead: Mutex<Vec<(usize, usize)>>,
 }
 
+/// The references `buffer` has besides the caller's. (`Release` returns the
+/// count left; COM documents it for tests because another thread may take
+/// or drop references meanwhile. Here no other one can take a reference
+/// when none is held: 0 stays 0.)
+pub(crate) fn others(buffer: &ID3D12Resource) -> u32 {
+    use windows::core::Interface;
+    // SAFETY: a live COM object; one reference taken and given back.
+    unsafe {
+        let raw = buffer.as_raw();
+        let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+        ((**unknown).AddRef)(raw);
+        ((**unknown).Release)(raw).saturating_sub(1)
+    }
+}
+
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, crate::fx::Set<usize>);
 
