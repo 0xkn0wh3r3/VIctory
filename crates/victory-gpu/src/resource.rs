@@ -2681,9 +2681,9 @@ mod tests {
             flags: RENDER_TARGET,
             ..desc
         };
-        let target = make_texture(&target, 0, std::ptr::null()).expect("a render target");
+        let target = make_texture(&target, 0, std::ptr::null(), None).expect("a render target");
         assert_eq!(kept(&target.texture), Some(Residency::Frame));
-        let streamed = make_texture(&desc, 0, std::ptr::null()).expect("a texture");
+        let streamed = make_texture(&desc, 0, std::ptr::null(), None).expect("a texture");
         // Placed in a heap of textures, it takes the heap's priority.
         let want = if streamed.placement.is_some() { None } else { Some(Residency::Streamed) };
         assert_eq!(kept(&streamed.texture), want);
