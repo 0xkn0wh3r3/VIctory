@@ -1733,9 +1733,13 @@ impl Host {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            // While the overlay shows, between two timestamps (its GPU
+            // busy time).
+            let timed = crate::overlay::time_lists(&self.device, &self.queue, group);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                self.queue
+                    .ExecuteCommandLists(timed.as_deref().unwrap_or(group));
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -1746,6 +1750,9 @@ impl Host {
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            if timed.is_some() {
+                crate::overlay::time_read();
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
