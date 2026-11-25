@@ -612,8 +612,12 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |runs, t, l| {
+            let from = &tiled[t..][..runs.span];
+            let to = &mut linear[l..][..runs.bytes];
+            // SAFETY: the row's runs lie in its `span` tiled bytes and its
+            // `bytes` linear bytes, both just bounds-checked.
+            unsafe { runs.copy::<true>(from.as_ptr(), to.as_mut_ptr()) };
         })
     }
 
@@ -627,12 +631,16 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |runs, t, l| {
+            let from = &linear[l..][..runs.bytes];
+            let to = &mut tiled[t..][..runs.span];
+            // SAFETY: as in `detile`.
+            unsafe { runs.copy::<false>(from.as_ptr(), to.as_mut_ptr()) };
         })
     }
 
-    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
+    /// Visits the subresource's rows as (its runs, the row's tiled byte
+    /// offset, its linear byte offset).
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
@@ -642,7 +650,7 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
-        mut copy: impl FnMut(usize, usize, usize),
+        mut row: impl FnMut(&Runs, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
@@ -683,7 +691,9 @@ impl Layout {
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
         let mut runs = Vec::new();
-        if !linear {
+        if linear {
+            runs.push((0, 0, bytes));
+        } else {
             let mut first_linear = 0;
             let mut first_tiled = self.column(m, 0) as usize;
             for x in 1..m.width {
@@ -697,47 +707,97 @@ impl Layout {
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
         }
-        // A mip can end partway through the last run. Check the other runs
-        // once so each row can copy them with a compile-time length.
-        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
-        let run_len = body
-            .first()
-            .map(|run| run.2)
-            .filter(|&len| body.iter().all(|run| run.2 == len));
+        let runs = Runs::new(runs, bytes);
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
             for y in 0..m.height {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy(tiled_row as usize, linear_row, bytes);
+                let tiled_row = if linear {
+                    base + u64::from(y) * u64::from(m.pitch) * n as u64
                 } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    match run_len {
-                        Some(8) => copy_runs::<8>(body, tiled_row, linear_row, &mut copy),
-                        Some(16) => copy_runs::<16>(body, tiled_row, linear_row, &mut copy),
-                        Some(32) => copy_runs::<32>(body, tiled_row, linear_row, &mut copy),
-                        _ => copy_runs::<0>(body, tiled_row, linear_row, &mut copy),
-                    }
-                    copy_runs::<0>(last, tiled_row, linear_row, &mut copy);
-                }
+                    base + self.row(m, y, inner)
+                };
+                row(&runs, tiled_row as usize, linear_row);
             }
         }
         Ok(())
     }
 }
 
-/// Copy micro-tile runs inline at a known width, or use each run's length for N = 0.
-fn copy_runs<const N: usize>(
+/// The contiguous runs every row of a subresource is made of, as (offset
+/// in the tiled row, offset in the linear row, length): each inside the
+/// row's `span` tiled bytes and its `bytes` linear bytes, so a row is
+/// bounds-checked once and its runs copied without checks.
+struct Runs {
+    runs: Vec<(usize, usize, usize)>,
+    /// The length every run but the last has, if they share one: a mip can
+    /// end partway through its last run.
+    len: Option<usize>,
+    /// Tiled bytes from the row's start to the end of its furthest run.
+    span: usize,
+    /// Linear bytes per row, which the runs cover.
+    bytes: usize,
+}
+
+impl Runs {
+    /// `runs` is not empty and lies in `bytes` linear bytes.
+    fn new(runs: Vec<(usize, usize, usize)>, bytes: usize) -> Runs {
+        let body = &runs[..runs.len() - 1];
+        let len = body
+            .first()
+            .map(|run| run.2)
+            .filter(|&len| body.iter().all(|run| run.2 == len));
+        let span = runs.iter().map(|&(t, _, len)| t + len).max().unwrap_or(0);
+        assert!(runs.iter().all(|&(_, l, len)| l + len <= bytes));
+        Runs {
+            runs,
+            len,
+            span,
+            bytes,
+        }
+    }
+
+    /// Copies a row's runs: tiled to linear if `DETILE`, else linear to
+    /// tiled.
+    ///
+    /// # Safety
+    /// `from` and `to` are the row's bytes, not overlapping: `span` of the
+    /// tiled side, `bytes` of the linear side.
+    unsafe fn copy<const DETILE: bool>(&self, from: *const u8, to: *mut u8) {
+        let (body, last) = self.runs.split_at(self.runs.len() - 1);
+        // SAFETY: the caller's.
+        unsafe {
+            match self.len {
+                Some(8) => copy_runs::<8, DETILE>(body, from, to),
+                Some(16) => copy_runs::<16, DETILE>(body, from, to),
+                Some(32) => copy_runs::<32, DETILE>(body, from, to),
+                _ => copy_runs::<0, DETILE>(body, from, to),
+            }
+            copy_runs::<0, DETILE>(last, from, to);
+        }
+    }
+}
+
+/// Copies micro-tile runs at a known width `N`, or each run's own length
+/// for `N` = 0.
+///
+/// # Safety
+/// As [`Runs::copy`], and `N` (if not 0) is every run's length.
+unsafe fn copy_runs<const N: usize, const DETILE: bool>(
     runs: &[(usize, usize, usize)],
-    tiled_row: usize,
-    linear_row: usize,
-    copy: &mut impl FnMut(usize, usize, usize),
+    from: *const u8,
+    to: *mut u8,
 ) {
     for &(tiled, linear, len) in runs {
         let len = if N == 0 { len } else { N };
-        copy(tiled_row + tiled, linear_row + linear, len);
+        let (src, dst) = if DETILE {
+            (tiled, linear)
+        } else {
+            (linear, tiled)
+        };
+        // SAFETY: the run lies inside both rows (the caller's).
+        unsafe { std::ptr::copy_nonoverlapping(from.add(src), to.add(dst), len) };
     }
 }
 
@@ -1366,3 +1426,4 @@ mod tests {
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
     }
 }
+
