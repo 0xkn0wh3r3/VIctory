@@ -2992,6 +2992,8 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     compositor: Option<Compositor>,
+    /// The debug overlay (Alt+Z), drawn into each frame it shows.
+    overlay: crate::overlay::Overlay,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3041,6 +3043,11 @@ impl Meter {
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+        });
+        crate::overlay::second(crate::overlay::Second {
+            draws,
+            prepare_ms: cpu,
+            gpu_wait_ms: gpu,
         });
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
@@ -3281,6 +3288,8 @@ impl Host {
                 ));
                 list.ResourceBarrier(&before);
                 list.CopyResource(&back, texture);
+                let shape = (width, height, format);
+                p.overlay.record(self, list, &back, shape, p.hwnd, D3D12_RESOURCE_STATE_COPY_DEST);
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
@@ -3416,11 +3425,15 @@ impl Host {
                     );
                     list.DrawInstanced(3, 1, 0, 0);
                 }
+                // The debug overlay goes over the composed frame.
+                let shape = (width, height, format);
+                let drawn = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                let drawn = p.overlay.record(self, list, &back, shape, p.hwnd, drawn);
                 #[cfg(feature = "diagnostics")]
                 let (capture, probe) = {
                     list.ResourceBarrier(&[transition(
                         &back,
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        drawn,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                     )]);
                     let capture = (cfg!(test) || crate::capture::wanted(frame))
@@ -3439,7 +3452,7 @@ impl Host {
                     let _ = frame;
                     list.ResourceBarrier(&[transition(
                         &back,
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        drawn,
                         D3D12_RESOURCE_STATE_PRESENT,
                     )]);
                     (None::<()>, None::<()>)
@@ -3514,6 +3527,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 compositor: None,
+                overlay: crate::overlay::Overlay::default(),
             })
         }
     }
