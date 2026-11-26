@@ -503,9 +503,44 @@ struct Physical {
     /// follows writes through one view to the others, `aliases`).
     shown: HashMap<(usize, usize), Vec<usize>>,
     /// Placeholders that are some view's own, left by unmapping it whole:
-    /// address and length ([`lean`]). The title may have joined one with
-    /// others since; a map there then splits as before.
-    holes: HashMap<usize, usize>,
+    /// address and length ([`lean`]). Only a hint: the title may have
+    /// joined or released one since (with the host's own calls, which we
+    /// do not see), and a map there then splits as before. A map drops
+    /// every one its range meets, and there are at most [`MOST_HOLES`].
+    holes: BTreeMap<usize, usize>,
+}
+
+/// Placeholders [`Physical::holes`] holds at most; past that it starts
+/// afresh. 8 GiB of pages unmapped one by one.
+const MOST_HOLES: usize = 1 << 17;
+
+impl Physical {
+    /// Forgets the placeholders recorded in `[base, base + len)`, and one
+    /// reaching into it: whether `[base, base + len)` was one of them.
+    fn take_holes(&mut self, base: usize, len: usize) -> bool {
+        let end = base + len;
+        let below = self
+            .holes
+            .range(..base)
+            .next_back()
+            .filter(|&(&at, &size)| at + size > base)
+            .map(|(&at, _)| at);
+        let inside: Vec<usize> = self.holes.range(base..end).map(|(&at, _)| at).collect();
+        let mut own = false;
+        for at in below.into_iter().chain(inside) {
+            let size = self.holes.remove(&at);
+            own |= at == base && size == Some(len);
+        }
+        own
+    }
+
+    /// Records the placeholder an unmapped view left ([`lean`]).
+    fn hole(&mut self, at: usize, size: usize) {
+        if self.holes.len() >= MOST_HOLES {
+            self.holes.clear();
+        }
+        self.holes.insert(at, size);
+    }
 }
 
 impl Slice {
@@ -934,7 +969,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     };
     // A placeholder an unmap left is mapped over as it is; if the title
     // has joined it with others since, the map fails and splits as before.
-    let own = physical.holes.remove(&base) == Some(len) && lean();
+    let own = physical.take_holes(base, len) && lean();
     let mut view = MEMORY_MAPPED_VIEW_ADDRESS {
         Value: std::ptr::null_mut(),
     };
@@ -1121,8 +1156,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             )
         });
         // Unmapped whole, its placeholder is its own until mapped over.
-        if gone != 0 && at >= base && at + size <= end {
-            physical.holes.insert(at, size);
+        if gone != 0 && at >= base && at + size <= end && lean() {
+            physical.hole(at, size);
         }
         if at < base {
             map(physical, at, base - at, slice.clone());
@@ -1641,7 +1676,24 @@ mod tests {
         let second = a.wrapping_byte_add(PAGE);
         assert_eq!(XMemMapPhysicalPages(second, 1, pages.as_ptr()), second);
         assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(physical().holes.get(&(a as usize)), Some(&PAGE));
+        assert_eq!(physical().holes.get(&(second as usize)), Some(&PAGE));
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+
+        // A map forgets every placeholder its range meets, also one that
+        // begins below it: they are no longer what is there.
+        // SAFETY: placeholders of ours, nothing mapped in them.
+        let joined = unsafe { VirtualFree(a, 2 * PAGE, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) };
+        assert_ne!(joined, 0);
+        let two = allocate(2);
+        assert_eq!(XMemMapPhysicalPages(a, 2, two.as_ptr()), a);
+        assert_eq!(physical().holes.get(&(second as usize)), None);
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(physical().holes.get(&(a as usize)), Some(&(2 * PAGE)));
+        assert_eq!(XMemMapPhysicalPages(second, 1, two.as_ptr()), second);
+        assert_eq!(physical().holes.get(&(a as usize)), None);
+        assert_eq!(XMemMapPhysicalPages(second, 1, std::ptr::null()), second);
+        assert_eq!(XMemFreePhysicalPages(2, two.as_ptr()), 1);
     }
 
     /// What mapping pages costs with and without [`lean`]: 64 pages, each
