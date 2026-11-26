@@ -676,6 +676,50 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
     assert!(what.contains("lane-mask join"), "{what}");
 }
 
+/// A wave64 compare copied word by word into s[2:3] and read by a select,
+/// then s3 written again and read by a second select. Copied from vcc_hi,
+/// the pair is still the compare; set to 0, it is a pair no lane mask was
+/// tracked as, and the second select is refused rather than read as the
+/// first one's compare.
+#[test]
+fn a_wave64_select_after_its_high_word_changes_is_not_the_old_mask() {
+    let program = |high: u32| {
+        build_wave(
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+                0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+                0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                0xBE83_036B, // s_mov_b32 s3, vcc_hi
+                0xD501_0003,
+                0x0009_0280, // v_cndmask_b32 v3, 0, 1, s[2:3]
+                high,        // s_mov_b32 s3, vcc_hi (or 0)
+                0xD501_0004,
+                0x0009_0280, // v_cndmask_b32 v4, 0, 1, s[2:3]
+                0xE070_1000,
+                0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+                0xE070_1100,
+                0x800A_0410, // buffer_store_dword v4, v16, s[40:43], 0 offen offset:256
+                0xBF81_0000, // s_endpgm
+            ],
+            true,
+        )
+    };
+    let shader = program(0xBE83_036B).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let Err(e) = program(0xBE83_0380) else {
+        panic!("a select on s2 and a cleared s3 took the compare's mask");
+    };
+    assert!(e.to_string().contains("untracked mask"), "{e}");
+}
+
 /// A register array (v3-v14) indexed through M0 in waterfall loops, as
 /// `tiled_lighting:CS_PrescalarizeLightLoop` builds its per-tile light
 /// masks: each lane's index (clamped to 0-11 by `v_med3_u32`) becomes M0 in

@@ -460,6 +460,8 @@ pub struct Structured {
     pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    /// Exact Wave64 pairs of `other`.
+    paired_other: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -479,6 +481,19 @@ impl Structured {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
             None => self.masks.get(&low),
+        }
+        .copied()
+    }
+
+    /// The lane's bit of a mask a select reads: in Wave64, of the pair of
+    /// both dwords it reads, from `masks` or `other`.
+    pub(crate) fn select_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
+        match high {
+            Some(high) => {
+                let k = (low, high);
+                self.paired_masks.get(&k).or_else(|| self.paired_other.get(&k))
+            }
+            None => self.masks.get(&low).or_else(|| self.other.get(&low)),
         }
         .copied()
     }
@@ -881,6 +896,7 @@ impl<'a> Lanes<'a> {
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_other: if self.p.wave64 { self.other } else { Map::default() },
             active: self.active,
             restored: self.restored.into_iter().collect(),
             discards: self

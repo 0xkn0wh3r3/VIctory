@@ -6530,17 +6530,20 @@ impl<'a> Lower<'a> {
             "v_cndmask_b32" => {
                 let cond = match v.src.get(2) {
                     Some(&Operand::Scalar { code, .. }) => {
-                        let m = inst
-                            .read(Reg::S(code))
-                            .and_then(|m| {
-                                self.x
-                                    .st
-                                    .masks
-                                    .get(&m)
-                                    .or_else(|| self.x.st.other.get(&m))
-                                    .copied()
-                            })
-                            .ok_or("a select on an untracked mask")?;
+                        const UNTRACKED: Why = "a select on an untracked mask";
+                        let lo = inst.read(Reg::S(code)).ok_or(UNTRACKED)?;
+                        let hi = match self.x.native.wave64 {
+                            true => Some(inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?),
+                            false => None,
+                        };
+                        let m = self.x.st.select_bits(lo, hi).ok_or(UNTRACKED)?;
+                        // An opaque mask is read with its low dword's own pair.
+                        if hi.is_some()
+                            && hi != self.pair_high(lo)
+                            && self.x.st.bools.support(m).contains(&Atom::Opaque(lo))
+                        {
+                            return Err(UNTRACKED);
+                        }
                         self.boolean(m, c)?
                     }
                     Some(&Operand::Const(k)) => {
