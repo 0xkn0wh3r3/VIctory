@@ -572,6 +572,7 @@ fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderEr
     }
     loop {
         let execs = l.masks_in_order();
+        l.join_args();
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
@@ -890,7 +891,6 @@ impl<'a> Lanes<'a> {
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
-        self.join_args();
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
@@ -975,7 +975,9 @@ impl<'a> Lanes<'a> {
 
     /// The pair each edge brings into a join left as a phi atom, resolved
     /// as a mask (back edges are not followed where the join is met), so
-    /// that the join's lowering finds it by both dwords.
+    /// that the join's lowering finds it by both dwords. Runs before
+    /// [`Self::wrong_joins`], which checks the joins this resolves to a
+    /// constant too.
     fn join_args(&mut self) {
         let mut n = 0;
         while n < self.b.atoms.len() {
@@ -1033,15 +1035,20 @@ impl<'a> Lanes<'a> {
         }
         // A scalar pair can be parked in two VGPR lanes and restored one
         // dword at a time. The spill pass turns these into scalar moves.
-        // Recover the original lane predicate only when the two words
-        // still come from the same known mask, in their original order.
+        // Copies hold the bits of what they copy: the pair is the pair of
+        // its two words' sources, in that order (swapped or mixed words
+        // make another pair, not the original mask).
         if self.p.wave64 {
             let source = (self.move_source(k.0), self.move_source(k.1));
-            if source != k
-                && let Some(&m) = self.masks.get(&source)
-            {
-                self.masks.insert(k, m);
-                return (m, true);
+            if source != k {
+                let (m, derived) = self.mask(source);
+                let cache = if derived {
+                    &mut self.masks
+                } else {
+                    &mut self.other
+                };
+                cache.insert(k, m);
+                return (m, derived);
             }
         }
         let p = self.p;
@@ -1802,6 +1809,42 @@ mod tests {
             };
             assert_eq!(bits(&insts[1], VCC) == bits(&insts[6], 6), same);
         }
+    }
+
+    /// A uniform loop whose header joins s[2:3] (a compare on entry) as a
+    /// phi atom, its back edge bringing the mask an inner loop's header
+    /// joins: all lanes (EXEC) on the inner loop's entry, the compare from
+    /// its back edge. Nothing else reads the inner join; resolved for the
+    /// outer join's back edge, it must still be checked on its own back
+    /// edge, so it is not all lanes.
+    #[test]
+    fn a_join_resolved_for_another_join_s_back_edge_is_checked_on_its_own() {
+        let p = build(
+            &[
+                0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+                0xBE82_046A, // s_mov_b64 s[2:3], vcc
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xD501_0003,
+                0x0009_0280, // outer: v_cndmask_b32 v3, 0, 1, s[2:3]
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0xBE88_0380, // s_mov_b32 s8, 0
+                0xBF09_8208, // inner: s_cmp_ge_u32 s8, 2
+                0xBF85_0003, // s_cbranch_scc1 latch
+                0xBE82_046A, // s_mov_b64 s[2:3], vcc
+                0x8008_8108, // s_add_u32 s8, s8, 1
+                0xBF82_FFFB, // s_branch inner
+                0x8007_8107, // latch: s_add_u32 s7, s7, 1
+                0xBF0A_8207, // s_cmp_lt_u32 s7, 2
+                0xBF85_FFF4, // s_cbranch_scc1 outer
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let has = |b: &ir::Block, r| Some(b.phis.iter().find(|ph| ph.reg == Reg::S(r))?.value);
+        let inner = p.blocks.iter().find(|b| has(b, 8).is_some()).unwrap();
+        let joined = s.select_bits(has(inner, 2).unwrap(), has(inner, 3));
+        assert!(joined.is_some_and(|m| m != Bool::TRUE), "{joined:?}");
     }
 
     #[test]

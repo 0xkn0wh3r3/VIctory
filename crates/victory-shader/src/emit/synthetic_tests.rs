@@ -756,11 +756,13 @@ const COPIED_VCC: &[u32] = &[0xBE86_036B, 0xBEEB_0306]; // s_mov_b32 s6, vcc_hi;
 /// read with both dwords, so neither takes the old mask of their low
 /// dword. Copied through another SGPR and back, the pair is still the mask:
 /// both lower, the carry-in and a loop's back edge being the pair's first
-/// reader.
+/// reader, and the join too where the copy is at its start, after the
+/// phis.
 #[test]
 fn wave64_joins_and_carry_ins_read_both_dwords_of_their_mask() {
-    let join = |change: &[u32]| {
-        let skip = 0xBF85_0002 + change.len() as u32;
+    // `change` on the edge into the join, or with `inside` at its start.
+    let join = |change: &[u32], inside: bool| {
+        let skip = 0xBF85_0002 + if inside { 0 } else { change.len() as u32 };
         let mut w = vec![
             0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
             0xBE82_046A, // s_mov_b64 s[2:3], vcc
@@ -773,10 +775,12 @@ fn wave64_joins_and_carry_ins_read_both_dwords_of_their_mask() {
         w.extend([0xD501_0003, 0x0009_0280]); // join: v_cndmask_b32 v3, 0, 1, s[2:3]
         wave64_program(&w)
     };
-    join(KEPT).expect("lower");
-    join(COPIED).expect("lower");
-    let e = join(&[0xBE83_0380]).expect_err("a join took the copied compare's high dword");
-    assert!(e.contains("lane-mask join of an untracked mask"), "{e}");
+    for inside in [false, true] {
+        join(KEPT, inside).expect("lower");
+        join(COPIED, inside).expect("lower");
+        let e = join(&[0xBE83_0380], inside).expect_err("a join took the old high dword");
+        assert!(e.contains("lane-mask join of an untracked mask"), "{e}");
+    }
 
     // A uniform loop narrowing s[2:3] by a compare each pass, read at its
     // header: the back edge brings the narrowed pair.
