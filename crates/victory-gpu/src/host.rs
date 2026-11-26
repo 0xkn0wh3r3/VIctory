@@ -2816,7 +2816,9 @@ impl HostList {
             left();
             return Prelude::None;
         }
-        if copies.is_empty() {
+        // Plain barriers only (recorded on any thread): with an aliasing
+        // barrier or discards to make (`crate::alias`), it is recorded below.
+        if copies.is_empty() && !alias && discards.is_empty() {
             let barriers = states
                 .values()
                 .filter_map(|(first, _, copy)| {
