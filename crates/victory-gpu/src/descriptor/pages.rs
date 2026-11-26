@@ -76,20 +76,32 @@ struct Placed {
     /// Host pages taken back, given out before `next`.
     free: Vec<u32>,
     /// Per page of slots, whether the title has records there that its
-    /// host page lacks (taken back, or written with no room): made from
-    /// them when it is placed.
-    lost: Vec<bool>,
+    /// host page lacks, and why: made from them when it is placed.
+    lost: Vec<Lost>,
     /// Pages placed that are to be made from the title's records.
     remake: Vec<u32>,
-    /// Pages taken back, and placed again, so far.
+    /// Pages taken back so far.
     taken_back: u64,
+    /// Pages placed after they were taken back, and after they were
+    /// written with no room, so far.
     placed_again: u64,
+    placed_late: u64,
     /// Submissions (as counted in `Pages::now`) and when they ended: the
     /// first is the last that ended at least `MIN_AGE` ago, if any did.
     ended: VecDeque<(u32, Instant)>,
     /// Free host pages below which pages are taken back, and up to which.
     low: u32,
     high: u32,
+}
+
+/// Why a page of slots lacks records the title has.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lost {
+    No,
+    /// Taken back ([`Pages::take_back`]).
+    TakenBack,
+    /// Written when no host page was free.
+    Refused,
 }
 
 // A page's bits are whole words.
@@ -141,7 +153,7 @@ impl Pages {
         Self {
             placed: Mutex::new(Placed {
                 written: vec![0; pages * (PAGE / 64) as usize],
-                lost: vec![false; pages],
+                lost: vec![Lost::No; pages],
                 host,
                 next,
                 first: next,
@@ -153,6 +165,7 @@ impl Pages {
                 remake: Vec::new(),
                 taken_back: 0,
                 placed_again: 0,
+                placed_late: 0,
                 ended: VecDeque::new(),
                 low: end / LOW_WATER,
                 high: (end / HIGH_WATER).min(free),
@@ -199,7 +212,9 @@ impl Pages {
                 let Some(host) = self.place_at(p, page) else {
                     let (new, page_new) = p.note(index);
                     p.refused_slots += u64::from(new);
-                    p.lost[page] = true;
+                    if p.lost[page] == Lost::No {
+                        p.lost[page] = Lost::Refused;
+                    }
                     if page_new {
                         p.refused += 1;
                         if p.refused == 1 {
@@ -252,12 +267,20 @@ impl Pages {
         self.stamp_page(page);
         // Slots written while it had no place count from now.
         p.slots += p.written_in(page as u32);
-        if std::mem::take(&mut p.lost[page]) {
+        let lost = std::mem::replace(&mut p.lost[page], Lost::No);
+        if lost != Lost::No {
             p.remake.push(page as u32);
-            p.placed_again += 1;
-            if p.placed_again.is_power_of_two() {
+            let count = match lost {
+                Lost::TakenBack => &mut p.placed_again,
+                _ => &mut p.placed_late,
+            };
+            *count += 1;
+            // Logged where either total reaches a power of two.
+            if count.is_power_of_two() {
                 tracing::info!(
-                    pages = p.placed_again,
+                    pages = p.placed_again + p.placed_late,
+                    taken_back = p.placed_again,
+                    refused = p.placed_late,
                     in_use = p.in_use(),
                     "view heap pages placed again: their slots are made from the title's records"
                 );
@@ -282,7 +305,7 @@ impl Pages {
         let page = page as usize;
         match p.host.get(page) {
             None => false,
-            Some(&NULL_PAGE) => p.lost[page] && self.place_at(&mut p, page).is_some(),
+            Some(&NULL_PAGE) => p.lost[page] != Lost::No && self.place_at(&mut p, page).is_some(),
             Some(_) => true,
         }
     }
@@ -296,7 +319,7 @@ impl Pages {
         for &page in read {
             let page = page as usize;
             self.stamp_page(page);
-            if p.host.get(page) == Some(&NULL_PAGE) && p.lost[page] {
+            if p.host.get(page) == Some(&NULL_PAGE) && p.lost[page] != Lost::No {
                 again.push(page as u32);
             }
         }
@@ -340,7 +363,7 @@ impl Pages {
             .map(|(_, page)| {
                 let host = std::mem::replace(&mut p.host[page as usize], NULL_PAGE);
                 self.enter(page as usize, NULL_PAGE);
-                p.lost[page as usize] = true;
+                p.lost[page as usize] = Lost::TakenBack;
                 p.slots -= p.written_in(page);
                 p.bits(page).fill(0);
                 p.taken_back += 1;
@@ -587,7 +610,7 @@ mod tests {
         assert!(pages.slot(at(2, 1), true).is_some());
         assert_eq!(pages.remakes(), [2]);
         let p = pages.lock();
-        assert_eq!((p.taken_back, p.placed_again), (6, 2));
+        assert_eq!((p.taken_back, p.placed_again, p.placed_late), (6, 2, 0));
         assert_eq!(p.slots, 1, "the slot written since");
     }
 
@@ -611,6 +634,34 @@ mod tests {
         assert_eq!(pages.read(&[1]), [1]);
         assert!(pages.place(1));
         assert_eq!(pages.remakes(), [1]);
-        assert_eq!(pages.lock().slots, 1, "the slot written with no room");
+        let p = pages.lock();
+        assert_eq!(p.slots, 1, "the slot written with no room");
+        assert_eq!((p.taken_back, p.placed_again, p.placed_late), (1, 0, 1));
+    }
+
+    /// A page taken back and then written with no room is counted placed
+    /// again, not placed late, once it has room.
+    #[test]
+    fn pages_taken_back_then_refused_room_count_as_placed_again() {
+        let mut table = vec![0u32; PAGES];
+        let pages = pages(&mut table, 3);
+        pages.set_water(1, 1);
+        pages.slot(at(0, 0), true);
+        let mut t = Instant::now();
+        let mut taken = Vec::new();
+        for _ in 0..MIN_AGE_SUBMISSIONS + 20 {
+            t += SECOND;
+            taken.extend(pages.take_back(t));
+        }
+        assert_eq!(taken, [(0, 2)]);
+        // Its host page not yet free: no room for it, nor a new page.
+        assert_eq!(pages.slot(at(0, 4), true), None);
+        assert_eq!(pages.slot(at(1, 0), true), None);
+        pages.give(&[2]);
+        assert!(pages.place(0));
+        assert_eq!(pages.remakes(), [0]);
+        let p = pages.lock();
+        assert_eq!((p.placed_again, p.placed_late), (1, 0));
+        assert_eq!((p.lost[0], p.lost[1]), (Lost::No, Lost::Refused));
     }
 }
