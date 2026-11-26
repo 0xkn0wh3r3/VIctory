@@ -183,6 +183,9 @@ pub(crate) struct Shader {
     /// Paged view heaps: per heap handle, the heap page it is in and the
     /// block that computed it (`emit`, "Read marks").
     pub page_index: std::collections::HashMap<V, (V, usize)>,
+    /// Heap indices `Lower::buffer_guard` sent to a null buffer view, and
+    /// the slot each was read at: its page is the one the read marks.
+    pub guarded_slots: std::collections::HashMap<V, V>,
     /// The pages of the handles the instruction being lowered reads, marked
     /// once it is (`Lower::inst`).
     pub page_reads: Vec<V>,
@@ -254,6 +257,7 @@ impl Shader {
             lds: None,
             view_pages: VIEW_PAGES.with(std::cell::Cell::get),
             page_index: std::collections::HashMap::new(),
+            guarded_slots: std::collections::HashMap::new(),
             page_reads: Vec::new(),
             pages_marked: std::collections::HashSet::new(),
             guards: 0,
@@ -590,6 +594,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
+        let read_at = self.guarded_slots.get(&index).copied();
         let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
@@ -600,7 +605,12 @@ impl Shader {
             let table = self.root_srv_handle(VIEW_STRIDES);
             let shift = self.m.i32(VIEW_PAGE_SLOTS.trailing_zeros());
             let page = self.m.bin(block, Bin::LShr, index, shift);
-            page_of = Some(page);
+            // A read sent to a null buffer view marks the page it named, so
+            // a buffer view in a page taken back is placed again.
+            page_of = Some(match read_at {
+                Some(slot) => self.m.bin(block, Bin::LShr, slot, shift),
+                None => page,
+            });
             let four = self.m.i32(4);
             let at = self.m.bin(block, Bin::Mul, page, four);
             let base = self.m.i32(VIEW_PAGE_TABLE);

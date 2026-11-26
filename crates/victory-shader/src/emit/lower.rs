@@ -5583,7 +5583,11 @@ impl<'a> Lower<'a> {
         // The null unordered access view sits just below the null SRV.
         let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
-        self.s.m.select(c, none, null, index)
+        let guarded = self.s.m.select(c, none, null, index);
+        if guarded != index && guarded != null {
+            self.s.guarded_slots.insert(guarded, index);
+        }
+        guarded
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type
