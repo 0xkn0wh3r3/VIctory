@@ -135,11 +135,14 @@ const SHADER_VISIBLE: u32 = 1;
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> =
     std::sync::RwLock::new(Vec::new());
 
-/// The most slots any shader-visible view heap has had (it only grows):
-/// shaders' read marks at or past it name no slot of a heap, which
-/// [`make_read`] and the eviction stamps pass over, so the scans of the
-/// marks after each submission stop there (`crate::shadow::take_reads`),
-/// instead of at `HEAP_VIEWS` (2^21 slots, two 256 KiB bitmaps).
+/// The end of the view slots in use (it only grows): the most slots any
+/// shader-visible view heap has had, or past them the dynamic slots a host
+/// heap has handed out (tables made afresh, whose texture views shaders
+/// read too). Shaders' read marks at or past it name no slot that
+/// [`make_read`] or the eviction stamps act on, so the scans of the marks
+/// after each submission stop there (`crate::shadow::take_reads`), instead
+/// of at `HEAP_VIEWS` (2^21 slots, two 256 KiB bitmaps). A host copy's
+/// pairs are buffer views, which take no read marks.
 #[cfg(windows)]
 static VIEW_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -147,6 +150,12 @@ static VIEW_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 #[cfg(windows)]
 pub(crate) fn view_slots() -> u32 {
     VIEW_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A host heap handed out view slots below `end` ([`VIEW_SLOTS`]).
+#[cfg(windows)]
+pub(crate) fn view_slots_reach(end: u32) {
+    VIEW_SLOTS.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it

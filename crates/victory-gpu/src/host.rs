@@ -738,8 +738,9 @@ pub(crate) mod tests {
 
     /// Shaders that use title memory mark their reads in their own bitmap:
     /// read marks of both bitmaps are taken, each slot once until it is
-    /// forgotten, and a forgotten slot's next read is taken again. A mark
-    /// past every view heap's slots names none and is not taken.
+    /// forgotten, and a forgotten slot's next read is taken again; also at
+    /// a dynamic slot past the title's. A mark past every slot in use names
+    /// none and is not taken.
     #[test]
     fn read_marks_of_both_bitmaps_are_taken() {
         let Some(host) = host() else { return };
@@ -755,6 +756,13 @@ pub(crate) mod tests {
         crate::shadow::tests::mark_read(false, past);
         assert!(!crate::shadow::take_reads().contains(&past), "past every heap's slots");
         let (plain, memory) = (62, 63);
+        // A dynamic slot (a table made afresh), past the title's 64.
+        let host_heap = crate::descriptor::heap(heap).host().expect("a host view heap");
+        let dynamic = host_heap.dynamic(1).expect("a dynamic slot");
+        assert!(dynamic >= 64);
+        crate::shadow::tests::mark_read(false, dynamic);
+        assert!(crate::shadow::take_reads().contains(&dynamic), "a dynamic slot's read");
+        host_heap.release(dynamic, 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
         let taken = crate::shadow::take_reads();
