@@ -151,6 +151,58 @@ pub(crate) enum Why {
     Completed,
 }
 
+impl Why {
+    /// Every reason, by its index: the frame line counts releases by them.
+    const ALL: [Why; 7] = [
+        Why::Submission,
+        Why::Signal,
+        Why::Wait,
+        Why::Fence,
+        Why::Present,
+        Why::Timer,
+        Why::Completed,
+    ];
+
+    /// The reason's name in the frame line.
+    fn name(self) -> &'static str {
+        match self {
+            Why::Submission => "submission",
+            Why::Signal => "signal",
+            Why::Wait => "wait",
+            Why::Fence => "fence",
+            Why::Present => "present",
+            Why::Timer => "timer",
+            Why::Completed => "completed",
+        }
+    }
+}
+
+// Every reason is in `Why::ALL`, at its own index: one added later and left
+// out would count past the frame line's counts.
+const _: () = {
+    let mut i = 0;
+    while i < Why::ALL.len() {
+        assert!(Why::ALL[i] as usize == i);
+        i += 1;
+    }
+    assert!(Why::Completed as usize + 1 == Why::ALL.len());
+};
+
+/// How many released segments each reason released, by name, in
+/// [`Why::ALL`]'s order (those that released none left out).
+fn released_by(released: &[(u32, std::time::Duration, Why)]) -> Vec<(&'static str, u32)> {
+    let mut by = [0u32; Why::ALL.len()];
+    for &(_, _, why) in released {
+        by[why as usize] += 1;
+    }
+    Why::ALL
+        .iter()
+        .zip(by)
+        .filter(|&(_, n)| n > 0)
+        .map(|(why, n)| (why.name(), n))
+        .collect()
+}
+
 #[cfg(windows)]
 use crate::hold::Item;
 
@@ -291,10 +343,7 @@ fn account_frame(frame: u64) {
         return;
     }
     let longest = a.released.iter().map(|r| r.1).max().unwrap_or_default();
-    let mut by = [0u32; 6];
-    for r in &a.released {
-        by[r.2 as usize] += 1;
-    }
+    let by = released_by(&a.released);
     tracing::info!(
         frame,
         submissions = a.submissions,
@@ -308,8 +357,8 @@ fn account_frame(frame: u64) {
         fence_waits,
         fence_wait_ms = fence_waited.as_secs_f64() * 1e3,
         "held work this frame (submissions; host submissions, segments; lists cut at waits; lists reset or released \
-         while held, each keeping its own host list; segments that waited, released by \
-         submission/signal/wait/fence/present/timer {by:?}; time in the pump outside host submissions; events the          title waited on for fence values and their summed waits); held at the present: {}",
+         while held, each keeping its own host list; segments that waited, and how many each reason released \
+         {by:?}; time in the pump outside host submissions; events the          title waited on for fence values and their summed waits); held at the present: {}",
         blocked.len()
     );
     tracing::debug!(
@@ -867,6 +916,36 @@ pub(crate) mod tests {
             0x80
         } else {
             0x70
+        }
+    }
+
+    /// Held work released by every reason, a completion's among them, is
+    /// counted by reason in the frame line, and the frame's line is made
+    /// (the count of a reason past the counts once panicked at the present).
+    #[test]
+    fn every_reason_held_work_is_released_by_is_counted_in_the_frame_line() {
+        let ms = std::time::Duration::from_millis;
+        let released: Vec<(u32, std::time::Duration, Why)> = Why::ALL
+            .iter()
+            .map(|&why| (0, ms(1), why))
+            .chain([(2, ms(3), Why::Completed)])
+            .collect();
+        let by = released_by(&released);
+        assert_eq!(by.len(), Why::ALL.len(), "{by:?}");
+        assert_eq!(by.last(), Some(&("completed", 2)));
+        assert!(
+            by.iter().take(Why::ALL.len() - 1).all(|&(_, n)| n == 1),
+            "{by:?}"
+        );
+        assert_eq!(
+            released_by(&[(0, ms(1), Why::Completed)]),
+            [("completed", 1)]
+        );
+        #[cfg(windows)]
+        {
+            account().released.extend(released);
+            account_frame(1);
+            assert!(account().released.is_empty(), "the frame took them");
         }
     }
 
