@@ -82,6 +82,15 @@ fn digest(bytes: &[u8]) -> Digest {
     xxhash_rust::xxh3::xxh3_128(bytes)
 }
 
+/// Whether a texture in `layout` at `memory` has a base pipe/bank XOR. In an
+/// XOR layout the GPU takes one from base-address bits 8-15 of the
+/// texture's descriptor: Mesa ORs a surface's `tile_swizzle` into them
+/// (`va |= tile_swizzle << 8`). The render-target XOR tables assume none,
+/// so they hold only for a texture at a 64 KiB boundary.
+fn pipe_bank_xor(memory: *const u8, layout: &victory_formats::texture::Layout) -> bool {
+    layout.desc.swizzle.xor() && memory as usize & 0xFFFF != 0
+}
+
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
 /// are its mips), the bytes of the texture's memory it lies in, rounded out
 /// to the layout's blocks; empty if the layout cannot say.
@@ -1019,6 +1028,14 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
+    if pipe_bank_xor(memory, &layout) {
+        once!(
+            ?desc,
+            ?memory,
+            "texture contents in an XOR mode with a base pipe/bank XOR not uploaded"
+        );
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -1375,6 +1392,34 @@ mod tests {
         }
         // SAFETY: unmaps what was mapped above.
         unsafe { buffer.Unmap(0, None) };
+    }
+
+    /// A render-target XOR texture off a 64 KiB boundary has a base
+    /// pipe/bank XOR the tables do not include, and is not staged; one on
+    /// a boundary, and linear textures anywhere, have none.
+    #[test]
+    fn a_base_pipe_bank_xor_is_refused() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let layout = |swizzle| {
+            Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 256,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap()
+        };
+        let (xor, linear) = (layout(Swizzle::SW_64KB_R_X), layout(Swizzle::LINEAR));
+        let at = |address: usize| address as *const u8;
+        assert!(!pipe_bank_xor(at(0x3_0000), &xor));
+        assert!(pipe_bank_xor(at(0x3_0100), &xor));
+        assert!(pipe_bank_xor(at(0x3_8000), &xor));
+        assert!(!pipe_bank_xor(at(0x3_0100), &linear));
     }
 
     #[test]
