@@ -12,6 +12,7 @@ mod shader;
 #[cfg(windows)]
 mod splash;
 mod startup;
+mod slowest;
 mod translate;
 
 use std::num::NonZeroUsize;
