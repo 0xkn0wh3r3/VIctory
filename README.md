@@ -163,6 +163,13 @@ default worker count.
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+Host copies of title buffers are in video memory where the GPU has GPU
+upload heaps (resizable BAR), in every build; those of buffers shaders
+write only on NVIDIA. `VICTORY_GPU_UPLOAD=0` keeps them all in system
+memory, `VICTORY_GPU_UPLOAD_WRITES=0` those of buffers shaders write, and
+`VICTORY_GPU_UPLOAD_WRITES=1` puts those in video memory on any GPU
+([GPU memory](docs/gpu-memory.md)).
+
 ### Windows shader-test validator
 
 The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
