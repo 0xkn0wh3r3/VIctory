@@ -274,6 +274,17 @@ struct Account {
 }
 
 #[cfg(windows)]
+impl Account {
+    fn releases_by_reason(&self) -> [u32; Why::Completed as usize + 1] {
+        let mut counts = [0; _];
+        for &(_, _, why) in &self.released {
+            counts[why as usize] += 1;
+        }
+        counts
+    }
+}
+
+#[cfg(windows)]
 fn account() -> std::sync::MutexGuard<'static, Account> {
     static ACCOUNT: std::sync::OnceLock<std::sync::Mutex<Account>> = std::sync::OnceLock::new();
     ACCOUNT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
@@ -291,10 +302,7 @@ fn account_frame(frame: u64) {
         return;
     }
     let longest = a.released.iter().map(|r| r.1).max().unwrap_or_default();
-    let mut by = [0u32; 6];
-    for r in &a.released {
-        by[r.2 as usize] += 1;
-    }
+    let by = a.releases_by_reason();
     tracing::info!(
         frame,
         submissions = a.submissions,
@@ -309,7 +317,7 @@ fn account_frame(frame: u64) {
         fence_wait_ms = fence_waited.as_secs_f64() * 1e3,
         "held work this frame (submissions; host submissions, segments; lists cut at waits; lists reset or released \
          while held, each keeping its own host list; segments that waited, released by \
-         submission/signal/wait/fence/present/timer {by:?}; time in the pump outside host submissions; events the          title waited on for fence values and their summed waits); held at the present: {}",
+         submission/signal/wait/fence/present/timer/completed {by:?}; time in the pump outside host submissions; events the          title waited on for fence values and their summed waits); held at the present: {}",
         blocked.len()
     );
     tracing::debug!(
@@ -757,6 +765,21 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 pub(crate) mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn frame_counts_releases_by_reason() {
+        use Why::*;
+        let mut frame = Account::default();
+        assert_eq!(frame.releases_by_reason(), [0; 7]);
+
+        let reasons = [Submission, Signal, Wait, Fence, Present, Timer, Completed];
+        for (i, why) in reasons.into_iter().enumerate() {
+            let release = (0, std::time::Duration::ZERO, why);
+            frame.released.extend(std::iter::repeat_n(release, i + 1));
+        }
+        assert_eq!(frame.releases_by_reason(), [1, 2, 3, 4, 5, 6, 7]);
+    }
 
     /// Held by tests that submit through title queues: their work stays in
     /// flight after they submit, and a test holding the host GPU
