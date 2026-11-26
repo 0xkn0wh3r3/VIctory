@@ -1541,7 +1541,7 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64, HeapId)
     let host = host()?;
     // Where the host opens a sub-range, only the buffer's own pages become
     // a heap: nothing else of the allocation is pinned, and the placed
-    // buffer holds its heap, so the heap goes with the buffer.
+    // buffer holds its heap (`place_in`), so the heap goes with the buffer.
     if !whole_allocations_only()
         && let Ok(dev13) = host.device.cast::<ID3D12Device13>()
     {
@@ -1651,10 +1651,23 @@ fn place_in(
     }
     .ok()?;
     let buffer = buffer?;
+    // The buffer holds its heap: its pin (`pin_heap`) goes when the heap is
+    // destroyed, which must not be while anything is placed in it. Native
+    // D3D12 keeps the heap for its placed resources, but vkd3d-proton
+    // destroys it, for its destruction callbacks, once its own references
+    // go, and the sub-range path keeps none.
+    // SAFETY: a live buffer and heap; the buffer's private data holds a
+    // reference to the heap until the buffer goes.
+    unsafe { buffer.SetPrivateDataInterface(&HOLDS_ITS_HEAP, heap) }.ok()?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     Some((buffer, gpu))
 }
+
+/// The private data by which a buffer placed over title memory holds its
+/// heap.
+const HOLDS_ITS_HEAP: windows::core::GUID =
+    windows::core::GUID::from_u128(0x6f1d_2c3a_9b84_4e57_a0c2_51e8_7d93_b41f);
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
@@ -2849,6 +2862,47 @@ pub(crate) mod tests {
         assert_eq!(crate::pinned::held_over(base as usize, LEN as usize), 0);
         // SAFETY: our allocation, no heap on it.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A buffer placed over title memory keeps its heap, and so the heap's
+    /// pin, for as long as the buffer lives, also once nothing else holds the
+    /// heap (vkd3d-proton destroyed it when `in_place_buffer` returned), and
+    /// the pin goes with the buffer. On both paths: a sub-range heap per
+    /// buffer, and a whole-allocation heap the cache has let go of.
+    #[test]
+    fn a_buffer_in_place_holds_its_heap_and_pin() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if host().is_none() {
+            return;
+        }
+        const LEN: usize = 1 << 20;
+        for whole in [false, true] {
+            let _whole = whole.then(WholeAllocations::on);
+            // SAFETY: our own allocation.
+            let base = unsafe {
+                VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+            } as usize;
+            assert_ne!(base, 0);
+            touch(base, LEN);
+            let Some((buffer, _, id)) = in_place_buffer(base as u64, LEN as u64) else {
+                // SAFETY: our allocation.
+                unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+                return; // the host refuses process memory as a heap
+            };
+            // Nothing but the buffer holds the heap now.
+            let_go_heap(id);
+            for _ in 0..3 {
+                assert_eq!(crate::pinned::held_over(base, LEN), 1, "whole allocation: {whole}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            drop(buffer);
+            assert_eq!(crate::pinned::held_over(base, LEN), 0, "whole allocation: {whole}");
+            // SAFETY: our allocation, no heap on it.
+            assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
+        }
     }
 
     /// Where the host opens sub-ranges, a buffer in place is a heap over its
