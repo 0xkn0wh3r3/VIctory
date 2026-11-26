@@ -222,6 +222,29 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
+        // A pipeline library the host rejects (made on another adapter or
+        // driver, or damaged) is expected: `pipeline::library` opens an
+        // empty one instead and says so. Not stored, it is no error a later
+        // check of the messages finds.
+        if let Some(queue) = &messages {
+            let mut expected = [
+                D3D12_MESSAGE_ID_CREATEPIPELINELIBRARY_INVALIDLIBRARYBLOB,
+                D3D12_MESSAGE_ID_CREATEPIPELINELIBRARY_DRIVERVERSIONMISMATCH,
+                D3D12_MESSAGE_ID_CREATEPIPELINELIBRARY_ADAPTERVERSIONMISMATCH,
+                D3D12_MESSAGE_ID_CREATEPIPELINELIBRARY_UNSUPPORTED,
+            ];
+            let filter = D3D12_INFO_QUEUE_FILTER {
+                DenyList: D3D12_INFO_QUEUE_FILTER_DESC {
+                    NumIDs: expected.len() as u32,
+                    pIDList: expected.as_mut_ptr(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            if let Err(e) = queue.PushStorageFilter(&filter) {
+                tracing::debug!(error = %e, "expected pipeline library messages not filtered");
+            }
+        }
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
@@ -1181,7 +1204,7 @@ static COMPLETED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// (`crate::queue`). Inside a pump the lock is taken and nothing runs here:
 /// that pump tests its queues again itself.
 fn pump_after_completions() {
-    if COMPLETED.swap(false, Ordering::Relaxed) {
+    if COMPLETED.swap(false, Ordering::AcqRel) {
         crate::queue::pump_held_if_free(crate::queue::Why::Completed);
     }
 }
@@ -1787,7 +1810,6 @@ impl Host {
     /// our upload list; `quiet`: no submission whose shaders mark reads is
     /// in flight after it (`crate::shadow::take_reads`).
     fn finish(&self, record: InFlight, runs: &[&HostList], quiet: bool) {
-        COMPLETED.store(true, Ordering::Relaxed);
         let waiting = std::time::Instant::now();
         self.wait_for(record.value);
         SUBMISSION_US[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1934,6 +1956,11 @@ impl Host {
         for (fence, value) in signals {
             set_title_fence(fence, value);
         }
+        // Last, once all it writes and signals has landed: a pump that takes
+        // the flag sees all of it (set first, another thread's pump could
+        // take it before this one's fences moved, and this one's own find
+        // it taken).
+        COMPLETED.store(true, Ordering::Release);
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -4033,11 +4060,12 @@ impl Host {
                 (capture, probe)
             };
             // The frame's textures stay alive until the list has run: the
-            // title may release or give them up meanwhile.
+            // title may release or give them up meanwhile. Not the back
+            // buffer: the swap chain keeps it, and holding it past the frame
+            // would make a resize fail (every list completes before one).
             for &(texture, _) in planes {
                 copy.keep(texture);
             }
-            copy.keep(&back);
             copy.close();
             self.submit(0, vec![copy.clone()]);
             // What diagnostics read back is read once the frame has run.
