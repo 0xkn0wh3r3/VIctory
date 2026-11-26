@@ -307,13 +307,10 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
-        Shadow::new_at(buffer, data, gpu, start, len, None, None)
-    }
-
-    /// [`Shadow::new`] of a copy in a run of a shared buffer (`data` and
-    /// `gpu` are the run's), or of one in video memory with `data` its
-    /// mirror (`vram`).
+    /// A host copy of `[start, start + len)`: `buffer` and its GPU address,
+    /// `data` where the CPU maps it, or in a run of a shared buffer (`data`
+    /// and `gpu` are the run's), or in video memory with `data` its mirror
+    /// (`vram`).
     fn new_at(
         buffer: ID3D12Resource,
         data: *mut u8,
@@ -1527,35 +1524,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             changed();
             return entry.shadow.clone();
         }
-        let host = host()?;
-        let upload = entry
-            .read_only
-            .then(|| host.gpu_upload_buffer(size))
-            .flatten();
-        let in_upload = upload.is_some();
-        // A buffer shaders may write: in video memory too, with a mirror.
-        let mut vram = None;
-        let (buffer, data) = match upload {
-            Some(made) => made,
-            None => {
-                let mirror = host.shared_buffer(size)?;
-                match (!entry.read_only && host.gpu_upload_writes())
-                    .then(|| host.gpu_upload_buffer(size))
-                    .flatten()
-                {
-                    Some((video, video_data)) => {
-                        vram = Some(Vram {
-                            mirror: mirror.0,
-                            data: video_data,
-                            stale: Mutex::new(vec![0; (size as usize).div_ceil(PAGE).div_ceil(64)]),
-                            ahead: Mutex::new(Vec::new()),
-                        });
-                        (video, mirror.1)
-                    }
-                    None => mirror,
-                }
-            }
-        };
+        let (buffer, data, vram, in_upload) = copy_buffer(size, entry.read_only)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1582,11 +1551,49 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
+/// A host copy's buffer of `size` bytes, where the host places copies:
+/// - `read_only` (shaders only read it): a GPU upload heap where the host
+///   puts read-only copies there ([`Host::gpu_upload`](crate::host::Host)),
+///   with `true` last;
+/// - otherwise video memory with a mirror in system memory, which the CPU
+///   reads and writes ([`Vram`]), where the host puts written copies there;
+/// - else system memory.
+///
+/// The buffer the GPU uses and the CPU's mapping (the mirror's, if any).
+fn copy_buffer(
+    size: u64,
+    read_only: bool,
+) -> Option<(ID3D12Resource, *mut u8, Option<Vram>, bool)> {
+    let host = host()?;
+    if read_only && let Some((buffer, data)) = host.gpu_upload_buffer(size) {
+        return Some((buffer, data, None, true));
+    }
+    let (mirror, data) = host.shared_buffer(size)?;
+    let video = (!read_only && host.gpu_upload_writes())
+        .then(|| host.gpu_upload_buffer(size))
+        .flatten();
+    Some(match video {
+        Some((video, video_data)) => {
+            let vram = Vram {
+                mirror,
+                data: video_data,
+                stale: Mutex::new(vec![0; (size as usize).div_ceil(PAGE).div_ceil(64)]),
+                ahead: Mutex::new(Vec::new()),
+            };
+            (video, data, Some(vram), false)
+        }
+        None => (mirror, data, None, false),
+    })
+}
+
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
+/// gets copies of the aligned windows it touches, placed as written
+/// buffers' copies are (shaders may write any of it): in video memory with
+/// a mirror where the host puts those there.
 /// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
+/// allocations if memory use grows (memory made again at an address keeps
+/// the window's copy, current only where the runtime reported the remap).
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
@@ -1599,16 +1606,18 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    // Shaders may write any of it: placed as a written buffer's copy.
+    let (buffer, data, vram, _) = copy_buffer(len, false)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
+        video_memory = vram.is_some(),
         "loose memory copied to the host"
     );
-    let shadow = Shadow::new(buffer, data, gpu, start, len);
+    let shadow = Shadow::new_at(buffer, data, gpu, start, len, None, vram);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -2159,6 +2168,43 @@ pub(crate) mod tests {
         if bitmap(false).is_some() {
             gpu_writes_reach_title_memory(true);
         }
+    }
+
+    /// With written copies in video memory, title memory outside any buffer
+    /// gets its window's copy there too, with a mirror: the GPU reads what
+    /// the title wrote, and what shaders wrote reaches title memory.
+    #[test]
+    fn loose_memory_is_in_video_memory_with_a_mirror() {
+        const NAME: &str = "shadow::tests::loose_memory_is_in_video_memory_with_a_mirror";
+        if !rerun_with_gpu_upload(NAME, true) {
+            return;
+        }
+        let Some(host) = host() else { return };
+        if !host.gpu_upload_writes() {
+            return;
+        }
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, len) };
+        for (i, b) in title.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let copy = find(p as u64, len as u64).expect("a copy of the window");
+        assert!(copy.range().1 >= WINDOW, "the window's copy");
+        assert!(copy.mirrored());
+        assert_eq!(heap_type(&copy), D3D12_HEAP_TYPE_GPU_UPLOAD);
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        copy.gpu_writes(&list, (p + PAGE) as u64, 64, false);
+        gpu_store(&list, &copy, p + PAGE, &[0xA5; 64]);
+        list.close();
+        host.execute(&[&list]);
+        assert!(gpu_bytes(&copy, p, 4096) == title[..4096], "the GPU read the title's bytes");
+        assert!(title[PAGE..PAGE + 64].iter().all(|&b| b == 0xA5), "the GPU's bytes went back");
+        assert_eq!(title[PAGE + 64], ((PAGE + 64) % 251) as u8, "the rest as it was");
+        drop((copy, list));
+        crate::watch::tests::free(p);
     }
 
     /// A list whose writes stay out of title memory (a program using title

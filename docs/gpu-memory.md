@@ -321,6 +321,37 @@ mark their writes through views, so such ranges are rare; where a title
 still has them, `VICTORY_GPU_UPLOAD_WRITES=0` keeps written copies in
 system memory.
 
+### Title memory outside buffers
+
+Titles also hand the GPU memory that belongs to no buffer object (Grand
+Theft Auto VI's interface vertices, from its own allocator). Such memory
+gets copies of the 4 MiB windows it touches (`shadow::loose`). Shaders may
+write any of it, so a window's copy is placed as a written buffer's is: in
+video memory with a mirror where the host puts those there (NVIDIA with
+GPU upload heaps by default, `VICTORY_GPU_UPLOAD_WRITES=1` elsewhere), else
+in system memory.
+
+The same compute-heavy submission with every byte of its title memory
+outside any buffer (`VICTORY_TEST_BENCH_LOOSE=1`), RTX 5070 Ti, median of
+three runs, ms:
+
+| windows' copies | writes found by | title writes | total | prepare | GPU | copy-back |
+|---|---|---|---|---|---|---|
+| system memory | write marks | none | 66.3 | 0.0 | 48.3 | 17.9 |
+| system memory | write marks | 16 MiB per submission | 72.9 | 3.1 | 49.8 | 19.4 |
+| system memory | snapshots | none | 95.4 | 18.2 | 50.7 | 26.5 |
+| system memory | snapshots | 16 MiB per submission | 103.1 | 22.3 | 51.7 | 27.8 |
+| video memory, with mirrors | write marks | none | 30.6 | 0.0 | 9.8 | 21.4 |
+| video memory, with mirrors | write marks | 16 MiB per submission | 32.5 | 1.9 | 10.0 | 20.9 |
+| video memory, with mirrors | snapshots | none | 39.8 | 14.0 | 2.1 | 23.2 |
+| video memory, with mirrors | snapshots | 16 MiB per submission | 44.4 | 16.9 | 2.1 | 25.2 |
+
+A submission takes 54-57% less: the GPU's time drops from about 50 ms to
+10 (2 with snapshots), and copy-back stays within a few ms. Making the
+windows' copies the first time costs more (133-159 ms against 20-34 for
+system memory). Copies of single views off their buffer's elements
+(`shadow::exact`, ~2 KB each, in shared buffers) stay in system memory.
+
 ## Unified hosts: title memory in place
 
 On a host whose GPU shares memory with the CPU (an AMD or Intel APU, an

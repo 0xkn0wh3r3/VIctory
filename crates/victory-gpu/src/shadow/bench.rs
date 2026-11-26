@@ -7,7 +7,9 @@
 //! `cargo test --release -p victory-gpu --lib compute_heavy -- --ignored --nocapture`
 //!
 //! `VICTORY_TEST_ADAPTER=<part of a GPU's name>` runs it on another GPU of
-//! the machine (an integrated one).
+//! the machine (an integrated one). `VICTORY_TEST_BENCH_LOOSE=1` makes the
+//! title memory no buffer's: every access goes through the copies of its
+//! 4 MiB windows ([`loose`]), placed as written buffers' copies are.
 
 use super::*;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -134,6 +136,10 @@ struct Buffer {
 impl Buffer {
     fn new(len: usize, read_only: bool) -> Buffer {
         let title = crate::watch::tests::pool(len / PAGE);
+        if loose_only() {
+            let copy = find(title as u64, len as u64).expect("a window's copy");
+            return Buffer { title, len, copy };
+        }
         if read_only {
             register_read_only(title, title as u64, len as u64);
         } else {
@@ -151,8 +157,18 @@ impl Buffer {
     }
 }
 
+/// `VICTORY_TEST_BENCH_LOOSE`: the title memory is no buffer's.
+fn loose_only() -> bool {
+    crate::switch::on("VICTORY_TEST_BENCH_LOOSE")
+}
+
 impl Drop for Buffer {
     fn drop(&mut self) {
+        if loose_only() {
+            // Windows' copies are never freed: memory made again at the same
+            // address would find the last mode's. Kept: each mode its own.
+            return;
+        }
         unregister(self.title, self.title as u64);
         crate::watch::tests::free(self.title);
     }
@@ -378,6 +394,8 @@ fn compute_heavy_submissions_by_copy_placement() {
                 }
             } else {
                 let video = |b: &Buffer| heap_type(&b.copy) == D3D12_HEAP_TYPE_GPU_UPLOAD;
+                // Windows are placed as written buffers' copies.
+                let upload = upload && !loose_only() || config == 2;
                 assert!(read_only.iter().all(|b| video(b) == upload), "read-only placement");
                 assert!(written.iter().all(|b| video(b) == (config == 2)), "written placement");
             }
