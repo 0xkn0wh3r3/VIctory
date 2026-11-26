@@ -2902,6 +2902,7 @@ uint ps() : SV_Target { return 1; }
                     root_cbvs: Vec::new(),
                     root_srvs: Vec::new(),
                     root_uavs: Vec::new(),
+                    written_root_uavs: Vec::new(),
                     memory: false,
                     memory_writes: false,
                     view_addresses: false,
