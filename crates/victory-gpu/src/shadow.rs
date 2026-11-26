@@ -1181,14 +1181,26 @@ fn in_place_enabled() -> bool {
     *ON.get_or_init(|| match std::env::var_os("VICTORY_IN_PLACE") {
         Some(v) => v == "1",
         None => {
-            let unified = host().is_some_and(|h| h.memory.uma && h.memory.in_place.is_ok());
-            if unified {
-                tracing::info!(
-                    "title memory in place: the host GPU shares memory with the CPU \
-                     (VICTORY_IN_PLACE=0 keeps copies)"
-                );
+            let Some(host) = host().filter(|h| h.memory.uma) else {
+                return false;
+            };
+            match crate::unified::self_test(&host.device) {
+                Ok(()) => {
+                    tracing::info!(
+                        "title memory in place: the host GPU shares memory with the CPU \
+                         (VICTORY_IN_PLACE=0 keeps copies)"
+                    );
+                    true
+                }
+                Err(why) => {
+                    tracing::warn!(
+                        %why,
+                        "the host GPU shares memory with the CPU, but title memory does not \
+                         open in place there: copies kept"
+                    );
+                    false
+                }
             }
-            unified
         }
     })
 }
@@ -2783,7 +2795,7 @@ pub(crate) mod tests {
         if std::env::var_os("VICTORY_IN_PLACE").is_some() {
             return;
         }
-        let unified = host.memory.uma && host.memory.in_place.is_ok();
+        let unified = host.memory.uma && crate::unified::self_test(&host.device).is_ok();
         assert_eq!(in_place_enabled(), unified, "{}", host.memory);
     }
 
