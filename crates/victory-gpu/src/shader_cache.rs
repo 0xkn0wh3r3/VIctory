@@ -213,9 +213,10 @@ fn cached(
     )
 }
 
-/// The entry format: VSH2 added the written root UAVs (an entry of VSH1
-/// is translated again).
-const MAGIC: &[u8; 4] = b"VSH2";
+/// The entry format: VSH2 added the written root UAVs, VSH3 the group
+/// base of dispatches run in parts (an entry of an older one is
+/// translated again).
+const MAGIC: &[u8; 4] = b"VSH3";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -476,7 +477,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(
             cached(&cache, &build, container, translate),

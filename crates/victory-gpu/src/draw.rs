@@ -821,6 +821,8 @@ impl State {
                                 None => return false,
                             }
                         }
+                        // The first part of a dispatch (`dispatch_parts`).
+                        None if u.root == RootType::Other(victory_shader::emit::GROUP_BASE) => 0,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -1170,11 +1172,36 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        if y > HOST_GROUPS || z > HOST_GROUPS {
+            once!(
+                x,
+                y,
+                z,
+                "a dispatch of more groups in y or z than the host runs"
+            );
+        }
+        // The console runs more groups in x than the host does at once: the
+        // host runs such a dispatch in parts, the program's group x starting
+        // at each part's first group (`GROUP_BASE`, 0 as bound). A program
+        // that does not read its group x runs alike in every part.
+        let base = group_base(p);
         let timed = list.time_start();
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        for (first, count) in dispatch_parts(x) {
+            // SAFETY: an open list with everything set; the parameter and
+            // dword are the pipeline's.
+            unsafe {
+                if let Some((param, index)) = base.filter(|_| first > 0) {
+                    list.list.SetComputeRoot32BitConstant(param, first, index);
+                }
+                list.list.Dispatch(count, y, z);
+            }
+        }
         if let Some(k) = timed {
             list.time_end(k, p.timed(Kind::Dispatch, Some([x, y, z])));
+        }
+        if let Some((param, index)) = base.filter(|_| x > HOST_GROUPS) {
+            // SAFETY: as above; the next dispatch starts at group 0.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, index) };
         }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
@@ -1929,6 +1956,35 @@ impl State {
     }
 }
 
+use victory_shader::emit::HOST_GROUPS;
+
+/// The parts a dispatch of `x` groups in x runs in on the host: each
+/// part's first group and its count, at most [`HOST_GROUPS`]; one empty
+/// part for none.
+fn dispatch_parts(x: u32) -> impl Iterator<Item = (u32, u32)> {
+    (0..x.div_ceil(HOST_GROUPS).max(1)).map(move |i| {
+        let first = i * HOST_GROUPS;
+        (first, (x - first).min(HOST_GROUPS))
+    })
+}
+
+/// Where a compute pipeline's program takes the first group of a part of
+/// its dispatch ([`victory_shader::emit::GROUP_BASE`]): the root parameter
+/// of its user data and the dword in it. None for a program that does not
+/// read its group x.
+fn group_base(p: &HostPipeline) -> Option<(u32, u32)> {
+    let stage = p.stages.first().filter(|_| p.compute)?;
+    let (param, _) = stage.user_data?;
+    let base = RootType::Other(victory_shader::emit::GROUP_BASE);
+    let u = stage
+        .translated()
+        .host
+        .user_data
+        .iter()
+        .find(|u| u.root == base)?;
+    Some((param, u.index))
+}
+
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
@@ -2128,6 +2184,20 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dispatch of more groups in x than the host runs at once is run in
+    /// parts of at most 65,535 that together cover each group once.
+    #[test]
+    fn large_dispatches_run_in_parts() {
+        let parts = |x| dispatch_parts(x).collect::<Vec<_>>();
+        assert_eq!(parts(0), [(0, 0)]);
+        assert_eq!(parts(100), [(0, 100)]);
+        assert_eq!(parts(65_535), [(0, 65_535)]);
+        assert_eq!(parts(65_536), [(0, 65_535), (65_535, 1)]);
+        assert_eq!(parts(115_200), [(0, 65_535), (65_535, 49_665)]);
+        let last = parts(u32::MAX).pop().unwrap();
+        assert_eq!(last.0 + last.1, u32::MAX);
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
