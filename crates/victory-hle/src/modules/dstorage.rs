@@ -1421,28 +1421,61 @@ mod tests {
 
     #[test]
     fn more_than_half_a_queue_submits_itself() {
-        let (_dir, file) = file_with(&pattern(64));
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type: 0,
-            capacity: 4,
+            capacity: 8,
             priority: 1,
             name: c"small".as_ptr(),
             unknown: 1,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        let array = status_array(2);
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
-        enqueue_status(queue, array, 0); // two of four: half, not submitted
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(result(array, 0), E_PENDING);
-        enqueue_status(queue, array, 1); // three of four: submitted
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(wait(array, 1), S_OK);
-        assert_eq!(out, pattern(64)[8..24]);
+        // Status entries only: a submitted status with no read before it is
+        // written by the submit itself.
+        let array = status_array(6);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(result(array, 0), S_OK);
+        for index in 1..=4 {
+            enqueue_status(queue, array, index);
+        }
+        // Four of eight since the Submit: half, not submitted.
+        for index in 1..=4 {
+            assert_eq!(result(array, index), E_PENDING, "{index}");
+        }
+        enqueue_status(queue, array, 5); // five of eight: submitted
+        for index in 1..=5 {
+            assert_eq!(result(array, index), S_OK, "{index}");
+        }
+    }
+
+    #[test]
+    fn a_full_queue_has_submitted_itself() {
+        // (capacity, most entries held, entries that submit)
+        let expected = [
+            (0, 1, 1),
+            (1, 1, 1),
+            (2, 1, 1),
+            (3, 2, 2),
+            (4, 3, 3),
+            (8, 7, 5),
+        ];
+        for (capacity, most, submits_at) in expected {
+            let lane = Lane::new(0, capacity);
+            assert_eq!(
+                (lane.most(), lane.submits_at()),
+                (most, submits_at),
+                "{capacity}"
+            );
+        }
+        // A queue blocks once it holds `most` entries: those enqueued since
+        // the last submission must have been submitted by then.
+        for capacity in 0..=1024 {
+            let lane = Lane::new(0, capacity);
+            assert!(lane.submits_at() <= lane.most(), "{capacity}");
+        }
     }
 
     #[test]
