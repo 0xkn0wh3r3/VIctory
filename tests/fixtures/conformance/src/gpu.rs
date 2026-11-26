@@ -19,6 +19,7 @@
 //! front, and not where a cube hides it).
 
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 use crate::rt::{Guid, Hresult, S_OK};
 use crate::scene::{self, HEIGHT, WIDTH};
@@ -147,8 +148,14 @@ fn frame_bytes(width: u32, height: u32) -> u64 {
 pub const DRAWS_A_STEP: usize = 64;
 /// Views the checked frame's heap holds; the stress scale's come after.
 const VIEWS: u64 = 16;
-/// The terrain's view (constants slot 5), in the demo's window only.
+/// In the demo's window only: the terrain's constants (slot 5), the sky
+/// texture, and the backdrop's constants (slot 6).
 const TERRAIN_VIEW: u64 = 9;
+const SKY_VIEW: u64 = 10;
+const BACKDROP_VIEW: u64 = 11;
+/// Constant slots before the stress scale's: the scene, the checked
+/// frame's 4 draws, the terrain, the backdrop.
+const SLOTS: usize = 7;
 
 /// The draws the stress scale adds to the checked frame's four.
 pub fn extra_draws(scale: u32) -> usize {
@@ -307,6 +314,68 @@ pub struct Run {
     pub window_image: Vec<f32>,
 }
 
+/// Time the demo's frames spend in calls into VIctory, by kind of work
+/// (summed over frames): where the translation layer's time goes.
+#[derive(Clone, Copy, Default)]
+struct Costs {
+    /// Whole frames recorded and run (`frame`), of which:
+    frame: Duration,
+    /// constants written into title memory (the stress scale's draws),
+    constants: Duration,
+    /// views made in the shader-visible heap (CreateConstantBufferView),
+    views: Duration,
+    /// lists closed, run and waited for; the rest of `frame` is recording.
+    submit: Duration,
+    /// Of `submit`: Close, ExecuteCommandLists, and Signal with the wait
+    /// for the fence (SetEventOnCompletion with no event).
+    close: Duration,
+    execute: Duration,
+    signal_wait: Duration,
+    /// PresentX.
+    present: Duration,
+    /// Waiting for the next frame tick (WaitFrameEventX).
+    wait: Duration,
+}
+
+impl Costs {
+    fn since(&self, earlier: &Costs) -> Costs {
+        Costs {
+            frame: self.frame - earlier.frame,
+            constants: self.constants - earlier.constants,
+            views: self.views - earlier.views,
+            submit: self.submit - earlier.submit,
+            close: self.close - earlier.close,
+            execute: self.execute - earlier.execute,
+            signal_wait: self.signal_wait - earlier.signal_wait,
+            present: self.present - earlier.present,
+            wait: self.wait - earlier.wait,
+        }
+    }
+
+    /// Milliseconds a frame over `frames` frames.
+    fn per_frame(&self, frames: u64) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / frames.max(1) as f64;
+        let record = self
+            .frame
+            .saturating_sub(self.constants + self.views + self.submit);
+        format!(
+            "VIctory {:.2} ms a frame: submissions {:.2} (Close {:.2}, ExecuteCommandLists {:.2}, \
+             Signal and fence wait {:.2}), views {:.2}, constants {:.2}, recording {:.2}, \
+             present {:.2}; waiting for the frame tick {:.2}",
+            ms(self.frame + self.present),
+            ms(self.submit),
+            ms(self.close),
+            ms(self.execute),
+            ms(self.signal_wait),
+            ms(self.views),
+            ms(self.constants),
+            ms(record),
+            ms(self.present),
+            ms(self.wait)
+        )
+    }
+}
+
 /// Everything the frame uses.
 struct Gpu {
     /// The frame's size in pixels.
@@ -321,6 +390,8 @@ struct Gpu {
     shown_common: bool,
     /// Whether the copy list has been closed once (it starts open).
     copy_closed: bool,
+    /// Where the window's frames spend their time.
+    costs: Costs,
     device: Obj,
     queue: Obj,
     allocators: [Obj; 2],
@@ -346,6 +417,9 @@ struct Gpu {
     constants_cpu: *mut u8,
     texture: Obj,
     upload: Obj,
+    /// The window's sky texture and its upload buffer (null without scenery).
+    sky: Obj,
+    sky_upload: Obj,
     target: Obj,
     depth: Obj,
     shown: Obj,
@@ -451,9 +525,21 @@ impl Gpu {
     /// Closes list `n`, runs it and waits for it with the fence; whether the
     /// fence reached the value signalled.
     fn submit(&mut self, n: usize) -> (Hresult, bool) {
+        let started = Instant::now();
+        let run = self.submit_untimed(n);
+        self.costs.submit += started.elapsed();
+        run
+    }
+
+    fn submit_untimed(&mut self, n: usize) -> (Hresult, bool) {
         let list = self.lists[n];
+        let started = Instant::now();
         let hr = call!(list, 0x48, fn() -> Hresult,);
+        let closed = Instant::now();
         call!(self.queue, 0x50, fn(u32, *const Obj), 1, &list);
+        let executed = Instant::now();
+        self.costs.close += closed - started;
+        self.costs.execute += executed - closed;
         self.fence_value += 1;
         call!(
             self.queue,
@@ -471,6 +557,7 @@ impl Gpu {
             std::ptr::null_mut()
         );
         let done = call!(self.fence, 0x40, fn() -> u64,);
+        self.costs.signal_wait += executed.elapsed();
         (hr, done >= self.fence_value)
     }
 
@@ -765,6 +852,7 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         scenery,
         shown_common: false,
         copy_closed: false,
+        costs: Costs::default(),
         device,
         queue,
         allocators,
@@ -790,6 +878,8 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         constants_cpu: std::ptr::null_mut(),
         texture: null,
         upload: null,
+        sky: null,
+        sky_upload: null,
         target: null,
         depth: null,
         shown: null,
@@ -855,7 +945,7 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
     g.constants = g.resource(
         t,
         2,
-        buffer(256 * (6 + extra_draws(scale) as u64), 0),
+        buffer(256 * (SLOTS + extra_draws(scale)) as u64, 0),
         GENERIC_READ,
         None,
         "constant buffer",
@@ -877,6 +967,28 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         None,
         "texture",
     );
+    if scenery {
+        let sky_bytes = u64::from(scene::SKY_WIDTH * scene::SKY_HEIGHT * 4);
+        g.sky_upload = g.resource(
+            t,
+            2,
+            buffer(sky_bytes, 0),
+            GENERIC_READ,
+            None,
+            "sky upload buffer",
+        );
+        g.sky = g.resource(
+            t,
+            1,
+            texture(scene::SKY_WIDTH, scene::SKY_HEIGHT, RGBA8, 0),
+            COPY_DEST,
+            None,
+            "sky texture",
+        );
+        if g.sky.is_null() || g.sky_upload.is_null() {
+            return None;
+        }
+    }
     let clear = scene::CLEAR.map(|c| f32::from(c) / 255.0);
     g.target = g.resource(
         t,
@@ -961,7 +1073,16 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         .collect();
     let mapped = write(g.vertices, vertex_data)
         && write(g.indices, &index_data)
-        && write(g.upload, &scene::texels());
+        && write(
+            g.upload,
+            // The window's grid in place of the checked frame's checkerboard.
+            &if scenery {
+                scene::grid_texels()
+            } else {
+                scene::texels()
+            },
+        )
+        && (!scenery || write(g.sky_upload, &scene::sky_texels()));
     g.constants_cpu = g.map(g.constants);
     t.check(
         mapped && !g.constants_cpu.is_null(),
@@ -979,15 +1100,20 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         let desc = [constants + 256 * n, 256];
         call!(device, 0x88, fn(*const [u64; 2], u64), &desc, view(n));
     }
-    // The terrain's constants (slot 5) at view 9, for the demo's window.
+    // The window's terrain (slot 5) and backdrop (slot 6), and its sky.
     if scenery {
-        let desc = [constants + 256 * 5, 256];
+        for (slot, at) in [(5, TERRAIN_VIEW), (6, BACKDROP_VIEW)] {
+            let desc = [constants + 256 * slot, 256];
+            call!(device, 0x88, fn(*const [u64; 2], u64), &desc, view(at));
+        }
+        let srv = [RGBA8, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
         call!(
             device,
-            0x88,
-            fn(*const [u64; 2], u64),
-            &desc,
-            view(TERRAIN_VIEW)
+            0x90,
+            fn(Obj, *const [u32; 10], u64),
+            g.sky,
+            &srv,
+            view(SKY_VIEW)
         );
     }
     // Format, 2D, the default component mapping, then (from 16 bytes) the
@@ -1124,8 +1250,13 @@ impl Gpu {
     /// output to the read-back buffer, unless `present`, which leaves the
     /// texture shown in the state for presenting instead.
     fn frame(&mut self, at: f32, first: bool, present: bool) -> (Hresult, Hresult, bool) {
-        let (scene, draws) = scene::frame(at);
-        // SAFETY: the constant buffer is mapped and at least 1,536 bytes long.
+        let (scene, draws) = if self.scenery {
+            scene::window_frame(at)
+        } else {
+            scene::frame(at)
+        };
+        // SAFETY: the constant buffer is mapped, [`SLOTS`] slots of 256 bytes
+        // at least.
         unsafe {
             let base = self.constants_cpu;
             std::ptr::copy_nonoverlapping((&raw const scene).cast::<u8>(), base, 256);
@@ -1140,6 +1271,12 @@ impl Gpu {
             std::ptr::copy_nonoverlapping(
                 (&raw const terrain).cast::<u8>(),
                 base.add(256 * 5),
+                256,
+            );
+            let backdrop = scene::backdrop();
+            std::ptr::copy_nonoverlapping(
+                (&raw const backdrop).cast::<u8>(),
+                base.add(256 * 6),
                 256,
             );
         }
@@ -1180,6 +1317,31 @@ impl Gpu {
                 std::ptr::null()
             );
             self.barrier(list, self.texture, COPY_DEST, PIXEL);
+            if self.scenery {
+                let dst = CopyLocation {
+                    resource: self.sky,
+                    ..dst
+                };
+                let src = CopyLocation {
+                    resource: self.sky_upload,
+                    width: scene::SKY_WIDTH,
+                    height: scene::SKY_HEIGHT,
+                    row_pitch: scene::SKY_WIDTH * 4,
+                    ..src
+                };
+                call!(
+                    list,
+                    0x80,
+                    fn(*const CopyLocation, u32, u32, u32, *const CopyLocation, *const u32),
+                    &dst,
+                    0,
+                    0,
+                    0,
+                    &src,
+                    std::ptr::null()
+                );
+                self.barrier(list, self.sky, COPY_DEST, PIXEL);
+            }
         }
         if self.shown_common {
             self.barrier(list, self.shown, COMMON, UNORDERED);
@@ -1209,6 +1371,23 @@ impl Gpu {
         self.bind_pass(list);
         let view_gpu = self.view_gpu;
         let table = move |n: u64| view_gpu + n * VIEW_SIZE;
+        if self.scenery {
+            // The sky first, behind everything, with its own texture.
+            let m = self.geometry.meshes[4];
+            call!(list, 0x120, fn(u32, u64), 1, table(BACKDROP_VIEW));
+            call!(list, 0x120, fn(u32, u64), 2, table(SKY_VIEW));
+            call!(
+                list,
+                0x68,
+                fn(u32, u32, u32, i32, u32),
+                m.indices,
+                1,
+                m.first_index,
+                m.base_vertex,
+                0
+            );
+            call!(list, 0x120, fn(u32, u64), 2, table(5));
+        }
         for (n, &(mesh, _)) in draws.iter().enumerate() {
             let m = self.geometry.meshes[mesh];
             call!(list, 0x120, fn(u32, u64), 1, table(n as u64 + 1));
@@ -1253,27 +1432,36 @@ impl Gpu {
             done &= reached;
             self.reset(0, std::ptr::null_mut());
             self.bind_pass(list);
-            for (j, (mesh, mesh_constants)) in chunk.iter().enumerate() {
-                let n = k * DRAWS_A_STEP + j;
-                let slot = 6 + n;
-                let view = VIEWS + n as u64;
+            // In three passes, each timed: the constants, the views, the
+            // draws (the same calls as one pass, in another order).
+            let first = k * DRAWS_A_STEP;
+            let started = Instant::now();
+            for (j, (_, mesh_constants)) in chunk.iter().enumerate() {
                 // SAFETY: the constant buffer is mapped, 256 bytes a slot
-                // for each of the scale's draws after the first 6.
+                // for each of the scale's draws after the first [`SLOTS`].
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         (&raw const *mesh_constants).cast::<u8>(),
-                        self.constants_cpu.add(256 * slot),
+                        self.constants_cpu.add(256 * (SLOTS + first + j)),
                         256,
                     );
                 }
-                let desc = [constants + 256 * slot as u64, 256];
+            }
+            let written = Instant::now();
+            for j in 0..chunk.len() {
+                let desc = [constants + 256 * (SLOTS + first + j) as u64, 256];
                 call!(
                     self.device,
                     0x88,
                     fn(*const [u64; 2], u64),
                     &desc,
-                    self.view_cpu + view * VIEW_SIZE
+                    self.view_cpu + (VIEWS + (first + j) as u64) * VIEW_SIZE
                 );
+            }
+            self.costs.constants += written - started;
+            self.costs.views += written.elapsed();
+            for (j, (mesh, _)) in chunk.iter().enumerate() {
+                let view = VIEWS + (first + j) as u64;
                 let m = self.geometry.meshes[*mesh];
                 call!(list, 0x120, fn(u32, u64), 1, table(view));
                 call!(
@@ -1463,7 +1651,7 @@ pub fn run(
         let started = std::time::Instant::now();
         let mut shown = 0u64;
         let mut presented = S_OK;
-        let draws = 4 + usize::from(g.scenery) + extra_draws(g.scale);
+        let draws = 4 + 2 * usize::from(g.scenery) + extra_draws(g.scale);
         let submissions = 1 + extra_draws(g.scale) / DRAWS_A_STEP;
         let per_frame = format!(
             "{}x{}, scale {}: {draws} draws and {submissions} submissions a frame",
@@ -1472,20 +1660,27 @@ pub fn run(
         println!("demo: {per_frame}");
         // A line every 5 seconds: frames shown and time per frame since the
         // last (a run until the window closes never reaches the report).
-        let (mut mark, mut marked) = (std::time::Instant::now(), 0u64);
+        let (mut mark, mut marked, mut costs) = (Instant::now(), 0u64, g.costs);
         while started.elapsed().as_secs() < u64::from(window_seconds) {
             if mark.elapsed().as_secs() >= 5 {
                 let frames = shown - marked;
                 let ms = mark.elapsed().as_secs_f64() * 1000.0 / frames.max(1) as f64;
                 println!(
-                    "demo: {:.1} fps, {ms:.2} ms a frame ({per_frame})",
-                    1000.0 / ms
+                    "demo: {:.1} fps, {ms:.2} ms a frame; {} ({per_frame})",
+                    1000.0 / ms,
+                    g.costs.since(&costs).per_frame(frames)
                 );
-                (mark, marked) = (std::time::Instant::now(), shown);
+                (mark, marked, costs) = (Instant::now(), shown, g.costs);
             }
+            let before = Instant::now();
             let token = g.begin();
+            let begun = Instant::now();
             g.frame(started.elapsed().as_secs_f32(), fresh && shown == 0, true);
+            let framed = Instant::now();
             let hr = g.present(token);
+            g.costs.wait += begun - before;
+            g.costs.frame += framed - begun;
+            g.costs.present += framed.elapsed();
             if hr != S_OK {
                 presented = hr;
             }
@@ -1499,8 +1694,9 @@ pub fn run(
             presented,
             S_OK,
             &format!(
-                "gpu: PresentX ({shown} frames, {:.2} ms a frame, at {per_frame})",
-                started.elapsed().as_secs_f64() * 1000.0 / shown.max(1) as f64
+                "gpu: PresentX ({shown} frames, {:.2} ms a frame, at {per_frame}; {})",
+                started.elapsed().as_secs_f64() * 1000.0 / shown.max(1) as f64,
+                g.costs.per_frame(shown)
             ),
         );
     }

@@ -48,9 +48,9 @@ pub struct Draw {
 pub struct Geometry {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u16>,
-    /// Ground, cube, pyramid, and the terrain beyond the ground (drawn
-    /// only in the demo's window, never in the checked frame).
-    pub meshes: [Draw; 4],
+    /// Ground, cube, pyramid; then, drawn only in the demo's window (never
+    /// in the checked frame), the terrain and the sky's backdrop.
+    pub meshes: [Draw; 5],
 }
 
 type V3 = [f32; 3];
@@ -121,7 +121,9 @@ impl Geometry {
             // How far beyond the 16 x 16 ground's far and side edges.
             let away = (z - 8.0).max(x.abs() - 8.0).max(0.0);
             let rise = smoothstep(0.0, 18.0, away);
-            let peaks = 2.0 + 11.0 * (away / 55.0).min(1.0);
+            // Low in the middle, so the sun shows between the ridges.
+            let valley = 0.22 + 0.78 * smoothstep(5.0, 30.0, x.abs());
+            let peaks = (2.0 + 11.0 * (away / 55.0).min(1.0)) * valley;
             -0.02 + rise * peaks * noise.ridged(x * 0.045, z * 0.045, 5).powf(1.6)
         };
         let base = self.vertices.len() as u16;
@@ -135,8 +137,8 @@ impl Geometry {
                 self.vertices.push(Vertex {
                     position: [x, height(x, z), z],
                     normal: normalize([-sx, 2.0 * dx.min(dz), -sz]),
-                    // One light texel: the terrain takes its albedo only.
-                    uv: [0.02, 0.02],
+                    // The grid texture across it, a cell to a unit.
+                    uv: [x / 4.0, z / 4.0],
                 });
             }
         }
@@ -150,6 +152,31 @@ impl Geometry {
                 self.indices.extend([a, b, c, a, c, d]);
             }
         }
+    }
+
+    /// The sky behind everything: a quad far down the view, facing it, whose
+    /// texture is the sky and the sun ([`sky_texels`]). Its normal is the
+    /// window's light, so that with [`backdrop`]'s constants it shows its
+    /// texture as it is.
+    fn push_backdrop(&mut self) {
+        let base = self.vertices.len() as u16;
+        let (x, top, bottom, z) = BACKDROP;
+        let normal = synth_light();
+        for (p, uv) in [
+            ([-x, top, z], [0.001, 0.001]),
+            ([x, top, z], [0.999, 0.001]),
+            ([x, bottom, z], [0.999, 0.999]),
+            ([-x, bottom, z], [0.001, 0.999]),
+        ] {
+            self.vertices.push(Vertex {
+                position: p,
+                normal,
+                uv,
+            });
+        }
+        // Top left, top right, bottom right, bottom left: clockwise as the
+        // camera sees it.
+        self.indices.extend([0, 1, 2, 0, 2, 3].map(|i| base + i));
     }
 
     fn mesh(&mut self, build: impl FnOnce(&mut Geometry)) -> Draw {
@@ -179,7 +206,7 @@ impl Geometry {
         let mut g = Geometry {
             vertices: Vec::new(),
             indices: Vec::new(),
-            meshes: [none; 4],
+            meshes: [none; 5],
         };
         // A 16 x 16 ground, the texture repeated 4 times across it.
         let ground = g.mesh(|g| g.push_quad([0.0; 3], [0.0, 1.0, 0.0], 8.0, 4.0));
@@ -229,7 +256,8 @@ impl Geometry {
             }
         });
         let terrain = g.mesh(|g| g.push_terrain());
-        g.meshes = [ground, cube, pyramid, terrain];
+        let backdrop = g.mesh(|g| g.push_backdrop());
+        g.meshes = [ground, cube, pyramid, terrain, backdrop];
         g
     }
 }
@@ -422,11 +450,147 @@ pub fn crowd(t: f32, count: usize) -> Vec<(usize, MeshConstants)> {
 pub fn terrain() -> MeshConstants {
     MeshConstants {
         world: world([0.0; 3], 1.0, 0.0),
-        albedo_shininess: [0.36, 0.5, 0.3, 6.0],
-        specular: [0.04, 0.04, 0.04, 0.0],
+        albedo_shininess: [0.9, 0.6, 1.0, 6.0],
+        specular: [0.15, 0.05, 0.2, 0.0],
         emissive: [0.0; 4],
         _pad: [0.0; 36],
     }
+}
+
+/// The demo window's look: synthwave. Its sky texture's size in texels.
+pub const SKY_WIDTH: u32 = 768;
+pub const SKY_HEIGHT: u32 = 256;
+/// The backdrop: half its width, its top and bottom, and how far down the
+/// view it stands (95.5 from the window's eye: inside the far plane at 100).
+const BACKDROP: (f32, f32, f32, f32) = (130.0, 64.0, -20.0, 88.0);
+/// The sun on the backdrop: its centre's height and its radius.
+const SUN: (f32, f32) = (15.0, 15.0);
+/// The window's light: its colour and the ambient light.
+const SYNTH_LIGHT_COLOUR: V3 = [0.85, 0.55, 0.95];
+const SYNTH_AMBIENT: V3 = [0.42, 0.28, 0.62];
+
+/// Towards the window's light: from above, in front and to the left.
+fn synth_light() -> V3 {
+    normalize([-0.3, 0.8, -0.5])
+}
+
+/// The demo window's frame at time `t`: [`frame`]'s draws, seen from low
+/// down the grid towards the horizon, in synthwave light and colours.
+pub fn window_frame(t: f32) -> (SceneConstants, Vec<(usize, MeshConstants)>) {
+    let (mut scene, mut draws) = frame(t);
+    let eye = [0.0, 1.6, -7.5];
+    let light = synth_light();
+    scene.view_projection = view_projection(eye, [0.0, 1.75, 10.0]);
+    scene.eye = [eye[0], eye[1], eye[2], 1.0];
+    scene.light = [light[0], light[1], light[2], 0.0];
+    let [r, g, b] = SYNTH_LIGHT_COLOUR;
+    scene.light_colour = [r, g, b, 0.0];
+    let [r, g, b] = SYNTH_AMBIENT;
+    scene.ambient = [r, g, b, 0.0];
+    // Ground, pyramid, then the two cubes (see `frame`).
+    draws[0].1.albedo_shininess = [1.0, 1.0, 1.0, 16.0];
+    draws[0].1.specular = [0.3, 0.1, 0.4, 0.0];
+    draws[1].1.emissive = [1.0, 0.45, 0.75, 0.0];
+    draws[2].1.albedo_shininess = [1.0, 0.35, 0.85, 48.0];
+    draws[3].1.albedo_shininess = [0.25, 0.95, 1.0, 24.0];
+    (scene, draws)
+}
+
+/// The backdrop's constants: an albedo that undoes the window's light on it
+/// (its normal is the light, so the light's term is whole), no specular:
+/// it shows the sky texture as it is.
+pub fn backdrop() -> MeshConstants {
+    let lit = |c: usize| 1.0 / (SYNTH_AMBIENT[c] + SYNTH_LIGHT_COLOUR[c]);
+    MeshConstants {
+        world: world([0.0; 3], 1.0, 0.0),
+        albedo_shininess: [lit(0), lit(1), lit(2), 1.0],
+        specular: [0.0; 4],
+        emissive: [0.0; 4],
+        _pad: [0.0; 36],
+    }
+}
+
+/// The sky's texels, rows of RGBA8 ([`SKY_WIDTH`] x [`SKY_HEIGHT`]): a dusk
+/// gradient from indigo to hot pink at the horizon, stars, and a striped
+/// sun, yellow above and pink below, with a glow about it.
+pub fn sky_texels() -> Vec<u8> {
+    let (half, top, bottom, _) = BACKDROP;
+    let (sun_y, sun_r) = SUN;
+    let mix = |a: V3, b: V3, t: f32| -> V3 {
+        let t = t.clamp(0.0, 1.0);
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ]
+    };
+    let mut out = Vec::with_capacity((SKY_WIDTH * SKY_HEIGHT * 4) as usize);
+    for j in 0..SKY_HEIGHT {
+        for i in 0..SKY_WIDTH {
+            // The texel's place on the backdrop, in world units.
+            let x = -half + (i as f32 + 0.5) / SKY_WIDTH as f32 * 2.0 * half;
+            let y = top - (j as f32 + 0.5) / SKY_HEIGHT as f32 * (top - bottom);
+            let up = y / top;
+            let mut c = if y < 0.0 {
+                [24.0, 6.0, 44.0]
+            } else if up < 0.3 {
+                mix([255.0, 70.0, 120.0], [170.0, 30.0, 140.0], up / 0.3)
+            } else {
+                mix([170.0, 30.0, 140.0], [18.0, 6.0, 48.0], (up - 0.3) / 0.7)
+            };
+            // Stars, high up: a few texels by a hash of their place.
+            let hash = (i.wrapping_mul(73_856_093) ^ j.wrapping_mul(19_349_663)) % 1000;
+            if up > 0.4 && hash < 3 {
+                c = mix(c, [255.0, 230.0, 255.0], 0.4 + 0.2 * hash as f32);
+            }
+            let d = (x * x + (y - sun_y) * (y - sun_y)).sqrt();
+            if d < sun_r {
+                // Stripes cut across its lower half, wider towards the bottom.
+                let below = sun_y - y;
+                let gap = ((below - 1.5) / (sun_r - 1.5)).clamp(0.0, 1.0) * 0.6;
+                let striped = below > 0.0 && (below % 2.4) / 2.4 < gap;
+                if !striped {
+                    c = mix(
+                        [255.0, 40.0, 150.0],
+                        [255.0, 225.0, 80.0],
+                        (y - (sun_y - sun_r)) / (2.0 * sun_r),
+                    );
+                }
+            } else if d < sun_r + 7.0 {
+                let glow = (1.0 - (d - sun_r) / 7.0).powi(2) * 0.5;
+                c = mix(c, [255.0, 80.0, 160.0], glow);
+            }
+            out.extend([c[0] as u8, c[1] as u8, c[2] as u8, 255]);
+        }
+    }
+    out
+}
+
+/// The window's grid, rows of RGBA8 ([`TEXTURE`] x [`TEXTURE`], as
+/// [`texels`]): dark violet with glowing magenta lines every 16 texels, so
+/// four cells to a repeat of the texture.
+pub fn grid_texels() -> Vec<u8> {
+    let background = [16.0f32, 6.0, 34.0];
+    let line = [255.0f32, 50.0, 210.0];
+    let glow = |at: u32| {
+        let f = (at as f32 + 0.5) % 16.0;
+        let d = f.min(16.0 - f);
+        if d < 1.0 {
+            1.0
+        } else {
+            (-(d - 1.0) * 1.2).exp() * 0.6
+        }
+    };
+    let mut out = Vec::with_capacity((TEXTURE * TEXTURE * 4) as usize);
+    for y in 0..TEXTURE {
+        for x in 0..TEXTURE {
+            let k = glow(x).max(glow(y));
+            let c: [f32; 3] =
+                std::array::from_fn(|n| background[n] + (line[n] - background[n]) * k);
+            out.extend([c[0] as u8, c[1] as u8, c[2] as u8, 255]);
+        }
+    }
+    out
 }
 
 fn smoothstep(from: f32, to: f32, x: f32) -> f32 {
