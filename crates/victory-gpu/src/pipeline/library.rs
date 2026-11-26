@@ -323,7 +323,7 @@ pub(crate) fn save(now: bool) {
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
-        let _locked = Timed(std::time::Instant::now(), &SAVES[2]);
+        let locked = std::time::Instant::now();
         // SAFETY: a plain size query on a live library.
         let size = unsafe { l.library.GetSerializedSize() };
         let Some(mut bytes) = zeroed(size) else {
@@ -340,6 +340,7 @@ pub(crate) fn save(now: bool) {
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
+                SAVES[2].fetch_add(locked.elapsed().as_micros() as u64, Ordering::Relaxed);
                 (bytes, prebuilt)
             }
             Err(e) => {
@@ -374,15 +375,6 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
-    }
-}
-
-/// Adds the time since `.0` to `.1`, in µs, when dropped.
-struct Timed<'a>(std::time::Instant, &'a AtomicU64);
-
-impl Drop for Timed<'_> {
-    fn drop(&mut self) {
-        self.1.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 }
 
