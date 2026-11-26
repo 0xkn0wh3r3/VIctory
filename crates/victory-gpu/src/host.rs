@@ -514,6 +514,20 @@ pub(crate) mod tests {
         }
     }
 
+    /// Preludes go on threads only with four or more of them holding
+    /// [`super::PARALLEL_PRELUDE_BARRIERS`] barriers in all: eight of 40
+    /// barriers each are recorded one after another, eight of 400 on threads.
+    #[test]
+    fn small_submissions_record_their_preludes_in_order() {
+        use super::{PARALLEL_PRELUDE_BARRIERS, on_threads};
+        assert!(!on_threads(8, 8 * 40));
+        assert!(on_threads(8, 8 * 400));
+        assert!(!on_threads(8, PARALLEL_PRELUDE_BARRIERS - 1));
+        assert!(on_threads(4, PARALLEL_PRELUDE_BARRIERS));
+        assert!(!on_threads(3, 3 * 2000));
+        assert!(!on_threads(0, 0));
+    }
+
     /// Replays transitions in the order the GPU runs them from the states
     /// in `states` (resources not in it are not checked), by the debug
     /// layer's rule: each barrier's before-state is the resource's current
@@ -1369,7 +1383,20 @@ impl Host {
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            match list.plan_prelude() {
+            let prelude = list.plan_prelude();
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                match &prelude {
+                    Prelude::None => {}
+                    Prelude::Recorded(_) => add(C::Preludes, 1),
+                    Prelude::Barriers(b) => {
+                        add(C::Preludes, 1);
+                        add(C::PreludeBarriers, b.len() as u64);
+                    }
+                }
+            }
+            match prelude {
                 Prelude::None => {}
                 Prelude::Recorded(prelude) => lists.push(Some(prelude)),
                 Prelude::Barriers(barriers) if parallel => {
@@ -1380,8 +1407,12 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        for (at, prelude) in record_preludes(&later) {
-            lists[at] = prelude;
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
+            for (at, prelude) in record_preludes(&later) {
+                lists[at] = prelude;
+            }
         }
         batch.flush();
         let prepared = std::time::Instant::now();
@@ -2580,10 +2611,14 @@ enum Prelude {
 }
 
 /// Barriers a submission's preludes hold in all before they are recorded on
-/// several threads: starting them costs more than recording fewer (eight
-/// preludes of 40 barriers: 200 us in order, 430 us on threads; of 400:
-/// 700 us, 550 us).
+/// several threads; fewer are recorded one after another.
 const PARALLEL_PRELUDE_BARRIERS: usize = 2048;
+
+/// Whether `preludes` preludes of `barriers` barriers in all are recorded on
+/// several threads: four or more, with [`PARALLEL_PRELUDE_BARRIERS`] in all.
+fn on_threads(preludes: usize, barriers: usize) -> bool {
+    preludes >= 4 && barriers >= PARALLEL_PRELUDE_BARRIERS
+}
 
 /// Whether the submission of `runs` records its lists' preludes of barriers
 /// on several threads (`VICTORY_PARALLEL_PRELUDES=1`; off by default): with
@@ -2602,17 +2637,18 @@ fn parallel_preludes(runs: &[&HostList]) -> bool {
 
 /// Records the preludes of barriers `later` holds (where each goes among a
 /// submission's lists, its list, its barriers): on several threads when
-/// there are four or more and [`PARALLEL_PRELUDE_BARRIERS`] in all, else
-/// one after another. All are recorded when it returns, before the lists go
-/// to the GPU in their order.
+/// [`on_threads`], else one after another. All are recorded when it
+/// returns, before the lists go to the GPU in their order.
 fn record_preludes(later: &[LaterPrelude<'_>]) -> Vec<(usize, Option<ID3D12CommandList>)> {
     let barriers: usize = later.iter().map(|(_, _, b)| b.len()).sum();
-    if later.len() < 4 || barriers < PARALLEL_PRELUDE_BARRIERS {
+    if !on_threads(later.len(), barriers) {
         return later
             .iter()
             .map(|(at, list, b)| (*at, list.record_prelude(b)))
             .collect();
     }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ThreadedPreludes, later.len() as u64);
     let recorded: Vec<Mutex<Option<ID3D12CommandList>>> =
         later.iter().map(|_| Mutex::new(None)).collect();
     crate::texture::in_parallel(later.len(), |k| {
