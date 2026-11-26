@@ -470,6 +470,53 @@ pub(crate) mod tests {
         assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
     }
 
+    #[test]
+    fn read_marks_wait_for_their_view_slots() {
+        use crate::shadow::{reads_since, take_reads, tests::mark_read};
+
+        // Other tests grow the process-wide view-slot bound. Start with fresh bitmaps and heaps.
+        const CHILD: &str = "VICTORY_TEST_READ_MARK_TAIL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "host::tests::read_marks_wait_for_their_view_slots";
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        };
+        let heap = crate::descriptor::host::HostHeap::new(false, 64).unwrap();
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(heap.dynamic(1), Some(64));
+        assert_eq!(crate::descriptor::view_slots(), 65);
+        mark_read(false, 64);
+        mark_read(true, 64);
+        mark_read(false, 65);
+        mark_read(true, 95);
+        mark_read(true, 96);
+        let first = (take_reads(), reads_since());
+        assert_eq!(heap.dynamic(31), Some(65));
+        assert_eq!(crate::descriptor::view_slots(), 96);
+        let grown = (take_reads(), reads_since());
+        assert_eq!(heap.dynamic(1), Some(96));
+        let last = (take_reads(), reads_since());
+        assert_eq!(
+            [first, grown, last],
+            [
+                (vec![64], vec![64]),
+                (vec![65, 95], vec![65, 95]),
+                (vec![96], vec![96]),
+            ]
+        );
+        assert!(take_reads().is_empty() && reads_since().is_empty());
+    }
+
     /// The textures shaders read through the heap since the last eviction
     /// pass are named again at each pass (a slot's read is reported as new
     /// only once), and the marks are cleared for the next.
