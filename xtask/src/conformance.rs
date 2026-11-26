@@ -11,7 +11,9 @@
 //! overlay (frame rate, frame times) in its top left corner.
 //!
 //! `cargo xtask demo` (`cargo demo`) shows only the GPU frame, until its
-//! window is closed: to leave running, or to show.
+//! window is closed: to leave running, or to show. `--scale <n>` multiplies
+//! the work each frame gives VIctory (draws, views, constants written into
+//! title memory, submissions) to find where the translation layer slows.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,6 +56,12 @@ struct Shown {
     /// 1440p, 4k (2160p), or <width>x<height> (multiples of 8).
     #[arg(long, default_value = "1440p", value_parser = resolution)]
     resolution: (u32, u32),
+    /// Stress VIctory's translation layer: each step past 1 adds 64 draws
+    /// to a frame, each with its constants written into title memory and
+    /// its view made in the heap that frame, and one more submission
+    /// (1: the checked frame's work).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1024))]
+    scale: u32,
     /// Leave VIctory's overlay (frame rate and frame times) hidden in the
     /// window; Alt+Z still shows it.
     #[arg(long)]
@@ -62,6 +70,10 @@ struct Shown {
     /// frames).
     #[arg(long)]
     debug: bool,
+    /// Save the checked frames (and, after a timed window, the window's
+    /// last) in this folder as PPM images.
+    #[arg(long, value_name = "DIR")]
+    dump: Option<PathBuf>,
 }
 
 pub fn conformance(root: &Path, args: Conformance) -> Result<()> {
@@ -85,10 +97,22 @@ fn run(root: &Path, window: Option<&str>, shown: &Shown, mut test_args: Vec<Stri
         let (width, height) = shown.resolution;
         env.push(("VICTORY_CONFORMANCE_WINDOW", window.into()));
         env.push(("VICTORY_CONFORMANCE_SIZE", format!("{width}x{height}")));
+        env.push(("VICTORY_CONFORMANCE_SCALE", shown.scale.to_string()));
         env.push((
             "VICTORY_OVERLAY",
             if shown.no_overlay { "0" } else { "1" }.into(),
         ));
+    }
+    if let Some(dir) = &shown.dump {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let dir = dir.canonicalize()?;
+        // Wine sees the Mac's files on its Z: drive.
+        let named = if cfg!(target_os = "macos") {
+            wine_path(&dir)
+        } else {
+            dir.display().to_string()
+        };
+        env.push(("VICTORY_CONFORMANCE_DUMP", named));
     }
     if !test_args.iter().any(|a| a == "--nocapture") {
         test_args.push("--nocapture".into());

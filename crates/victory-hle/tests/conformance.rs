@@ -181,8 +181,11 @@ struct GpuRun {
     window_seconds: u32,
     window_width: u32,
     window_height: u32,
+    window_scale: u32,
     image: *const f32,
     image_len: usize,
+    window_image: *const f32,
+    window_image_len: usize,
 }
 
 /// Runs the title's GPU frame against `reference`: its TAP report and the
@@ -191,7 +194,8 @@ fn call_gpu(
     reference: Option<&[f32]>,
     window_seconds: u32,
     (window_width, window_height): (u32, u32),
-) -> (String, Vec<f32>) {
+    window_scale: u32,
+) -> (String, Vec<f32>, Vec<f32>) {
     let e = exports();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut run = GpuRun {
@@ -200,8 +204,11 @@ fn call_gpu(
         window_seconds,
         window_width,
         window_height,
+        window_scale,
         image: std::ptr::null(),
         image_len: 0,
+        window_image: std::ptr::null(),
+        window_image_len: 0,
     };
     // SAFETY: the export's signature in the fixture; the report and image
     // stay valid until the next call, which the lock holds off.
@@ -216,7 +223,12 @@ fn call_gpu(
         } else {
             std::slice::from_raw_parts(run.image, run.image_len).to_vec()
         };
-        (report, image)
+        let window_image = if run.window_image.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(run.window_image, run.window_image_len).to_vec()
+        };
+        (report, image, window_image)
     }
 }
 
@@ -226,8 +238,10 @@ fn call_gpu(
 /// `VICTORY_CONFORMANCE_WINDOW=<seconds>` keeps presenting it, animated,
 /// in a window that long (`until-closed`: until the window is closed, which
 /// ends the process), drawn at `VICTORY_CONFORMANCE_SIZE=<width>x<height>`
-/// (2560x1440 unless set; multiples of 8). `VICTORY_CONFORMANCE_DUMP=<folder>`
-/// saves both frames there as PPM images.
+/// (2560x1440 unless set; multiples of 8), with `VICTORY_CONFORMANCE_SCALE`
+/// times the work a frame (1 unless set; up to 1024). `VICTORY_CONFORMANCE_DUMP=<folder>`
+/// saves the checked frames there as PPM images (and the
+/// window's last, `window.ppm`, after a timed window).
 #[test]
 fn the_gpu_frame_matches_warp() {
     let reference = match reference::render() {
@@ -246,14 +260,19 @@ fn the_gpu_frame_matches_warp() {
         end_when_the_window_closes();
     }
     let size = window_size();
-    let (tap, image) = call_gpu(reference.as_deref(), window, size);
+    let scale = window_scale();
+    let (tap, image, window_image) = call_gpu(reference.as_deref(), window, size, scale);
     println!("{tap}");
     if let Some(dir) = std::env::var_os("VICTORY_CONFORMANCE_DUMP") {
         let dir = PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
-        save_ppm(&dir.join("victory.ppm"), &image);
+        let checked = (scene::WIDTH, scene::HEIGHT);
+        save_ppm(&dir.join("victory.ppm"), &image, checked);
         if let Some(r) = &reference {
-            save_ppm(&dir.join("warp.ppm"), r);
+            save_ppm(&dir.join("warp.ppm"), r, checked);
+        }
+        if !window_image.is_empty() {
+            save_ppm(&dir.join("window.ppm"), &window_image, size);
         }
     }
     if let Err(why) = accept(&tap, &[]) {
@@ -261,9 +280,9 @@ fn the_gpu_frame_matches_warp() {
     }
 }
 
-/// An RGBA float frame as a binary PPM (RGB8).
-fn save_ppm(path: &Path, image: &[f32]) {
-    let mut out = format!("P6\n{} {}\n255\n", scene::WIDTH, scene::HEIGHT).into_bytes();
+/// An RGBA float frame of `width` x `height` as a binary PPM (RGB8).
+fn save_ppm(path: &Path, image: &[f32], (width, height): (u32, u32)) {
+    let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
     for p in image.chunks(4) {
         out.extend(
             p[..3]
@@ -475,4 +494,17 @@ fn end_when_the_window_closes() {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     });
+}
+
+/// The window's stress scale: `VICTORY_CONFORMANCE_SCALE` (1 to 1024), 1
+/// unless set. Each step adds 64 draws to a frame, with as many views made
+/// and constants written, and a submission.
+fn window_scale() -> u32 {
+    let Ok(asked) = std::env::var("VICTORY_CONFORMANCE_SCALE") else {
+        return 1;
+    };
+    match asked.trim().parse() {
+        Ok(scale @ 1..=1024) => scale,
+        _ => panic!("VICTORY_CONFORMANCE_SCALE={asked}: 1 to 1024"),
+    }
 }
