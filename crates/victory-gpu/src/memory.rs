@@ -680,17 +680,17 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // the title's own data (garbage pointers in title threads, run c1),
         // nor while any list using title memory misses ([`withholding`]).
         let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
+        // The pages from copies in video memory, into their mirrors, withheld
+        // or not: the copies keep the GPU's bytes either way.
+        let pulled: Vec<_> = writes
+            .iter()
+            .map(|&(k, at)| (copies[k].clone(), at as usize, 1 << 16))
+            .collect();
+        crate::shadow::pull(&pulled);
         if withheld > 0 {
             for &(_, at) in &writes {
                 drop_withheld(at as usize, 1 << 16);
             }
-        } else {
-            // The pages from copies in video memory, into their mirrors.
-            let pulled: Vec<_> = writes
-                .iter()
-                .map(|&(k, at)| (copies[k].clone(), at as usize, 1 << 16))
-                .collect();
-            crate::shadow::pull(&pulled);
         }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {

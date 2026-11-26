@@ -398,6 +398,29 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
 
+    /// Shaders of `list` may also write `[address, address + len)` of the
+    /// copy, past the range they declare (a root view has no size): nothing
+    /// of it goes back to title memory, and after the submission
+    /// [`Shadow::written_unseen`] marks it.
+    pub(crate) fn may_write(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.vram.is_none() || len == 0 {
+            return;
+        }
+        let copy = self.clone();
+        list.defer_after(move || copy.written_unseen(address as usize, len as usize));
+    }
+
+    /// After a submission whose shaders may have written `[address, address
+    /// + len)` of the copy where no [`pull`] brings it: for a copy in video
+    /// memory, the mirror's pages there count as stale, so the CPU reads
+    /// video memory's bytes there first ([`Shadow::freshen`]).
+    pub(crate) fn written_unseen(&self, address: usize, len: usize) {
+        let (from, to) = self.inside(address, len);
+        if from < to {
+            self.stale(from, to);
+        }
+    }
+
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
     /// per copy and submission, segments covering the ranges the submission
@@ -1133,26 +1156,26 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             (copy, page)
         })
     };
-    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
-    if !held.is_empty() {
-        let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
-            crate::memory::drop_withheld(page, PAGE);
-        }
-    }
-    if marked.is_empty() {
+    if marked.is_empty() && held.is_empty() {
         return;
     }
-    let pages: Vec<(Arc<Shadow>, usize)> = {
-        let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
-    };
+    let m = marks();
+    let pages: Vec<(Arc<Shadow>, usize)> = marked.iter().filter_map(|&n| page_of(&m, n)).collect();
+    let held: Vec<(Arc<Shadow>, usize)> = held.into_iter().filter_map(|n| page_of(&m, n)).collect();
+    drop(m);
+    // Into the mirrors, held back or not: the copies keep the GPU's bytes
+    // either way.
     pull(
         &pages
             .iter()
+            .chain(&held)
             .map(|(copy, page)| (copy.clone(), *page, PAGE))
             .collect::<Vec<_>>(),
     );
+    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
+    for (_, page) in held {
+        crate::memory::drop_withheld(page, PAGE);
+    }
     for (copy, page) in pages {
         if withheld
             .iter()
@@ -1174,10 +1197,10 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
 /// Before the CPU reads what shaders may have written: the title address
 /// ranges `(copy, address, len)` of copies in video memory are copied into
 /// their mirrors, by the GPU, at once (one list for all; ranges of other
-/// copies are skipped).
-// shortcut: shaders' writes outside every declared range and marked page
-// (to the copy, not to title memory) stay in video memory: the mirror keeps
-// the bytes from before until a later range brings them.
+/// copies are skipped). Where shaders may write with nothing pulled after
+/// (past a root view's declared range, through the heap's views of copies
+/// without marks), the mirror's pages count as stale instead
+/// ([`Shadow::written_unseen`]).
 pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) {
     // Whole pages, so that the pages pulled are current in the mirror.
     let mut runs: Vec<(&Shadow, usize, usize)> = Vec::new();
@@ -2140,6 +2163,92 @@ pub(crate) mod tests {
         // SAFETY: our pool's bytes.
         let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
         assert_eq!(title[2 * PAGE + 100..2 * PAGE + 108], [0x4D; 8]);
+        unregister(p, p as u64);
+    }
+
+    /// Shaders write past the range their list declares (as through a root
+    /// view): the bytes stay out of title memory, and the mirror is stale
+    /// there. A later list declaring them snapshots the GPU's bytes, so its
+    /// copy-back neither puts them back nor over a byte the title wrote
+    /// during the submission.
+    #[test]
+    fn writes_past_declared_ranges_leave_the_mirror_stale() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::writes_past_declared_ranges_leave_the_mirror_stale",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return;
+        }
+        let (p, len, copy) = mirrored_buffer(2);
+        copy.freshen(0, len);
+        // Page 0 declared, page 1 written past it.
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        copy.gpu_writes(&list, p as u64, PAGE as u64, false);
+        copy.may_write(&list, (p + PAGE) as u64, PAGE as u64);
+        gpu_store(&list, &copy, p + PAGE + 8, &[0x77; 4]);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: our pool's bytes.
+        let title = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        let before = |at: usize| (at % 251) as u8;
+        assert_eq!(title(PAGE + 8), before(PAGE + 8), "not declared: not in title memory");
+        assert_eq!(copy.stale_pages(), [1], "the mirror is behind there");
+        // Page 1 declared; the title writes one of the GPU's bytes meanwhile.
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, (p + PAGE) as u64, PAGE as u64);
+        copy.gpu_writes(&list, (p + PAGE) as u64, PAGE as u64, false);
+        // SAFETY: our pool's bytes.
+        list.defer_host(move || unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(0x55) });
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(title(PAGE + 8), 0x55, "the title's byte");
+        assert_eq!(title(PAGE + 9), before(PAGE + 9), "the earlier GPU bytes stay out");
+        unregister(p, p as u64);
+    }
+
+    /// Pages shaders using title memory marked while their results are held
+    /// back stay out of title memory, and the mirror has the GPU's bytes
+    /// there, as video memory does.
+    #[test]
+    fn held_back_marked_pages_come_back_to_the_mirror() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::held_back_marked_pages_come_back_to_the_mirror",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        let (true, Some(memory)) = (host.gpu_upload_writes(), bitmap(true)) else {
+            return;
+        };
+        let (p, len, copy) = mirrored_buffer(2);
+        copy.freshen(0, len);
+        let list = host.new_list().unwrap();
+        gpu_store(&list, &copy, p + PAGE + 8, &[0x66; 4]);
+        list.close();
+        host.execute(&[&list]);
+        let (bit, _) = copy.mark_entry((p + PAGE) as u64).expect("marked memory");
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(memory.data as *mut u32).add(bit as usize / 32) |= 1 << (bit % 32) };
+        copy_back_marks(&[], true);
+        // SAFETY: our pool's bytes, and the mirror's.
+        let (title, mirror) = unsafe {
+            (
+                ((p + PAGE + 8) as *const u8).read_volatile(),
+                std::slice::from_raw_parts(copy.data.add(PAGE + 8), 4),
+            )
+        };
+        assert_eq!(title, ((PAGE + 8) % 251) as u8, "held back");
+        assert_eq!(mirror, [0x66; 4], "the mirror has the GPU's bytes");
         unregister(p, p as u64);
     }
 

@@ -327,6 +327,18 @@ pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, 
     }
 }
 
+/// After a submission: what the heap's unordered access views reach of
+/// copies without marks, which shaders may have written with nothing pulled
+/// after ([`Shadow::written_unseen`]).
+pub(crate) fn written_unseen(viewed: &Viewed) {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    for (shadow, address, len, uav, _) in inner.hulls.values() {
+        if *uav && !shadow.marked() {
+            shadow.written_unseen(*address as usize, *len as usize);
+        }
+    }
+}
+
 /// Draws and dispatches run with heap-indexing shaders, those of them
 /// writing through the heap, textures uploaded for heaps (diagnostics).
 static HEAP_DRAWS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
