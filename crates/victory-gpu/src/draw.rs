@@ -2745,6 +2745,97 @@ uint ps() : SV_Target { return 1; }
         }
     }
 
+    #[test]
+    fn fresh_tables_follow_buffer_owners_within_one_list() {
+        // Other unit tests create buffers too. A separate process makes the
+        // cache hits below independent of their changes to the global owner count.
+        const CHILD: &str = "VICTORY_TEST_FRESH_TABLE_OWNERS";
+        if std::env::var_os(CHILD).is_none() {
+            let thread = std::thread::current();
+            let test = thread
+                .name()
+                .expect("the test runner names its test thread");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        };
+        let guest_heap = crate::descriptor::tests::capped_view_heap(16, 4);
+        let heap = crate::descriptor::heap(guest_heap);
+        let host_heap = heap.host().unwrap();
+        let table = heap.start + 8 * 32;
+        let outer = crate::resource::test_buffer(512);
+        let (data, _) = crate::resource::buffer_bytes(outer).unwrap();
+        let address = data as u64 + 256;
+        let outer_copy = crate::shadow::find(address, 64).unwrap();
+        // One R32_UINT SRV of the 16 DWORDs at offset 256, written just once.
+        let srv = [42, 1, 0x1688, 0, 64, 0, 16, 0, 0, 0];
+        crate::descriptor::create_srv(std::ptr::null(), outer, &srv, table);
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[guest_heap]);
+        state.set_table(true, 0, table);
+        let used = [used(ResourceType::Srv)];
+        let mut bind_twice = |expected: &ID3D12Resource| {
+            let bindings = state.tables(&list, &used, true);
+            let [(0, offset)] = bindings.as_slice() else {
+                panic!("expected one fresh table")
+            };
+            assert_eq!(offset % 32, 0);
+            let slot = offset / 32;
+            assert_eq!(
+                host_heap.kept_resource(slot).as_ref(),
+                Some(expected),
+                "table at slot {slot}"
+            );
+            assert_eq!(
+                state.tables(&list, &used, true),
+                bindings,
+                "unchanged owner reuses the table"
+            );
+            slot
+        };
+
+        let first = bind_twice(&outer_copy.buffer);
+        let inner = buffer_at_address(address, 64);
+        let inner_copy = crate::shadow::find(address, 64).unwrap();
+        assert_ne!(inner_copy.buffer, outer_copy.buffer);
+        let second = bind_twice(&inner_copy.buffer);
+        let release =
+            |object| crate::object::slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        assert_eq!(release(inner), 0);
+        assert_eq!(
+            crate::shadow::find(address, 64).unwrap().buffer,
+            outer_copy.buffer
+        );
+        let third = bind_twice(&outer_copy.buffer);
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_ne!(first, third);
+        // The recorded tables keep their original resources until the list completes.
+        assert_eq!(
+            host_heap.kept_resource(first).as_ref(),
+            Some(&outer_copy.buffer)
+        );
+        assert_eq!(
+            host_heap.kept_resource(second).as_ref(),
+            Some(&inner_copy.buffer)
+        );
+        list.close();
+        host.execute(&[&list]);
+        drop(state);
+        release(guest_heap);
+        release(outer);
+    }
+
     /// Slots of a shader-visible view heap of ours.
     struct Slots(ID3D12DescriptorHeap, u32);
 

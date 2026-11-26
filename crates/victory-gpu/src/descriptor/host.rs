@@ -961,6 +961,13 @@ impl HostHeap {
         self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
     }
 
+    #[cfg(test)]
+    pub(crate) fn kept_resource(&self, index: u32) -> Option<ID3D12Resource> {
+        self.kept.lock().unwrap()[index as usize]
+            .as_ref()
+            .map(|(resource, _)| resource.clone())
+    }
+
     /// Whether slot `index` holds a host view of a resource (tests).
     #[cfg(test)]
     pub(crate) fn kept(&self, index: u32) -> bool {
