@@ -395,14 +395,15 @@ fn copy_buffer(size: u64) -> Option<ID3D12Resource> {
 /// Has `resource`'s host copy brought up to date at the submission that
 /// runs `list`: its staging buffer detiled again if the memory changed, and
 /// then copied into the host texture by the submission's own upload list,
-/// once for all its lists (`crate::bindless::uploads`).
+/// once for all its lists (`crate::bindless::uploads`). `first` is the
+/// first mip level the use reads ([`note_reads`]): a shader view's
+/// ([`first_level`]), 0 for a copy or a read-back.
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
-pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    // Copies and bound tables read the texture whole.
+pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        note_reads(&copy, 0);
+        note_reads(&copy, first);
     }
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
@@ -471,6 +472,15 @@ pub(crate) fn uploads(resource: This) -> u64 {
 pub(crate) fn copied(resource: This) -> u64 {
     let staging = crate::resource::host_copy(resource).and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
     staging.map_or(0, |s| s.copied.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The first level `resource`'s staging uploads, the bytes of its memory
+/// it reads and its whole layout's (tests, as [`uploads`]).
+#[cfg(test)]
+pub(crate) fn staged_from(resource: This) -> Option<(u32, usize, u64)> {
+    let copy = crate::resource::host_copy(resource)?;
+    let staging = copy.staging.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    staging.map(|s| (s.first, s.prefix, s.layout.size))
 }
 
 
@@ -936,7 +946,7 @@ pub(crate) fn first_level(view: Option<&[u32; 10]>) -> u32 {
 }
 
 /// Something reads `copy` from level `first` on (a shader view, or 0 for a
-/// copy or a bound table): a staging made from a later level is made again.
+/// copy or a read-back): a staging made from a later level is made again.
 pub(crate) fn note_reads(copy: &crate::resource::HostTexture, first: u32) {
     use std::sync::atomic::Ordering::Relaxed;
     if copy.read_from.load(Relaxed) <= first || copy.read_from.fetch_min(first, Relaxed) <= first {
