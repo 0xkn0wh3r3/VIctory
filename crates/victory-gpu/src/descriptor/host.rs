@@ -141,12 +141,13 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// (a capped heap, NVIDIA, paged or not): the title's slots keep their
+/// room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// Title slots of a paged view heap at most: its dynamic slots past them
 /// end below the null buffer views, among the slots shaders index.
-const PAGED_TITLE_VIEWS: u32 = victory_shader::emit::NULL_BUFFER_VIEW - 1 - DYNAMIC;
+const PAGED_TITLE_VIEWS: u32 = victory_shader::emit::NULL_BUFFER_VIEW - 1 - MIN_DYNAMIC;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -221,9 +222,10 @@ impl HostHeap {
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
         let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
         let (heap, count, extra) = if paged {
-            // Every slot is virtual: the host heap as large as it takes.
+            // Every slot is virtual: the host heap as large as it takes,
+            // its pages for the title's slots but the few dynamic ones.
             match make(PORTABLE_VIEWS) {
-                Ok(heap) => (heap, count, DYNAMIC),
+                Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) => {
                     tracing::warn!(error = %e, count, "no host descriptor heap");
                     return None;
