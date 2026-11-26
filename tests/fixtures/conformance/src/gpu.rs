@@ -137,7 +137,11 @@ const COPY_SOURCE: u32 = 0x800;
 const GENERIC_READ: u32 = 0xAC3;
 
 /// Bytes the read-back buffer holds: four floats per pixel.
-const FRAME_BYTES: u64 = (WIDTH * HEIGHT * 16) as u64;
+/// The compute output's bytes for a `width` x `height` frame (four floats a
+/// pixel).
+fn frame_bytes(width: u32, height: u32) -> u64 {
+    u64::from(width) * u64::from(height) * 16
+}
 
 #[repr(C)]
 struct HeapProperties {
@@ -290,6 +294,9 @@ pub struct Run {
 
 /// Everything the frame uses.
 struct Gpu {
+    /// The frame's size in pixels.
+    width: u32,
+    height: u32,
     device: Obj,
     queue: Obj,
     allocators: [Obj; 2],
@@ -545,7 +552,7 @@ fn texture(width: u32, height: u32, format: u32, flags: u32) -> ResourceDesc {
     }
 }
 
-fn setup(t: &mut Tap) -> Option<Gpu> {
+fn setup(t: &mut Tap, width: u32, height: u32) -> Option<Gpu> {
     let mut parameters = [0u32; 32];
     parameters[0] = VERSION;
     let mut device = std::ptr::null_mut();
@@ -655,7 +662,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     let shaders = [
         crate::gfx10::vertex_container(),
         crate::gfx10::pixel_container(),
-        crate::gfx10::compute_container(),
+        crate::gfx10::compute_container(width),
     ];
     // The graphics pipeline, as a stream.
     let names = [c"POSITION", c"NORMAL", c"TEXCOORD"];
@@ -728,6 +735,8 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
 
     let null = std::ptr::null_mut();
     let mut g = Gpu {
+        width,
+        height,
         device,
         queue,
         allocators,
@@ -838,7 +847,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.target = g.resource(
         t,
         1,
-        texture(WIDTH, HEIGHT, RGBA8, 1),
+        texture(width, height, RGBA8, 1),
         RENDER_TARGET,
         Some(ClearValue {
             format: RGBA8,
@@ -849,7 +858,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.depth = g.resource(
         t,
         1,
-        texture(WIDTH, HEIGHT, D32, 2),
+        texture(width, height, D32, 2),
         DEPTH_WRITE,
         Some(ClearValue {
             format: D32,
@@ -860,7 +869,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.shown = g.resource(
         t,
         1,
-        texture(WIDTH, HEIGHT, RGBA8, 4),
+        texture(width, height, RGBA8, 4),
         UNORDERED,
         None,
         "texture shown",
@@ -868,7 +877,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.output = g.resource(
         t,
         1,
-        buffer(FRAME_BYTES, 4),
+        buffer(frame_bytes(width, height), 4),
         UNORDERED,
         None,
         "compute output buffer",
@@ -876,7 +885,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.readback = g.resource(
         t,
         3,
-        buffer(FRAME_BYTES, 0),
+        buffer(frame_bytes(width, height), 0),
         COPY_DEST,
         None,
         "read-back buffer",
@@ -971,7 +980,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
         1,
         0,
         0,
-        (FRAME_BYTES / 4) as u32,
+        (frame_bytes(width, height) / 4) as u32,
         0,
         0,
         0,
@@ -1108,9 +1117,9 @@ impl Gpu {
             0,
             &self.depth_cpu
         );
-        let viewport = [0.0, 0.0, WIDTH as f32, HEIGHT as f32, 0.0, 1.0f32];
+        let viewport = [0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0f32];
         call!(list, 0xa8, fn(u32, *const [f32; 6]), 1, &viewport);
-        let scissor = [0, 0, WIDTH as i32, HEIGHT as i32];
+        let scissor = [0, 0, self.width as i32, self.height as i32];
         call!(list, 0xb0, fn(u32, *const [i32; 4]), 1, &scissor);
         call!(list, 0xa0, fn(u32), 4); // triangle list
         call!(list, 0xc8, fn(Obj), self.graphics);
@@ -1161,8 +1170,8 @@ impl Gpu {
             list,
             0x70,
             fn(u32, u32, u32),
-            WIDTH / scene::GROUP,
-            HEIGHT / scene::GROUP,
+            self.width / scene::GROUP,
+            self.height / scene::GROUP,
             1
         );
         self.barrier(list, self.target, NON_PIXEL, RENDER_TARGET);
@@ -1189,7 +1198,7 @@ impl Gpu {
             0,
             self.output,
             0,
-            FRAME_BYTES
+            frame_bytes(self.width, self.height)
         );
         self.barrier(copy, self.output, COPY_SOURCE, UNORDERED);
         let (copied, copy_done) = self.submit(1);
@@ -1201,11 +1210,10 @@ impl Gpu {
         if at.is_null() {
             return Vec::new();
         }
-        let mut out = vec![0f32; (FRAME_BYTES / 4) as usize];
+        let bytes = frame_bytes(self.width, self.height);
+        let mut out = vec![0f32; (bytes / 4) as usize];
         // SAFETY: the mapping holds the buffer's bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(at, out.as_mut_ptr().cast::<u8>(), FRAME_BYTES as usize)
-        };
+        unsafe { std::ptr::copy_nonoverlapping(at, out.as_mut_ptr().cast::<u8>(), bytes as usize) };
         out
     }
 
@@ -1249,9 +1257,16 @@ fn pixel(image: &[f32], x: u32, y: u32) -> [u8; 4] {
 }
 
 /// Runs the frame; `reference` is the WARP image (RGBA floats per pixel),
-/// `window_seconds` how long to keep presenting it, animated, afterwards.
-pub fn run(t: &mut Tap, reference: Option<&[f32]>, window_seconds: u32) -> Run {
-    let Some(mut g) = setup(t) else {
+/// `window_seconds` how long to keep presenting it, animated, afterwards,
+/// and `window_size` the size it is drawn at there (each a multiple of
+/// [`scene::GROUP`]; the checks are of a [`WIDTH`] x [`HEIGHT`] frame).
+pub fn run(
+    t: &mut Tap,
+    reference: Option<&[f32]>,
+    window_seconds: u32,
+    window_size: (u32, u32),
+) -> Run {
+    let Some(mut g) = setup(t, WIDTH, HEIGHT) else {
         return Run { image: Vec::new() };
     };
     // Host pipelines are made on first use, by workers; a draw whose
@@ -1298,19 +1313,34 @@ pub fn run(t: &mut Tap, reference: Option<&[f32]>, window_seconds: u32) -> Run {
             String::new,
         );
     } else {
+        // The window's frames are drawn at its own size, by a second set of
+        // resources and pipelines (the compute pass knows its row width);
+        // their own calls were checked above, so they go unreported.
+        let (width, height) = window_size;
+        let mut quiet = Tap::default();
+        let mut sized = (window_size != (WIDTH, HEIGHT))
+            .then(|| setup(&mut quiet, width, height))
+            .flatten();
+        // New resources need the texture uploaded on their first frame.
+        let fresh = sized.is_some();
+        let g = sized.as_mut().unwrap_or(&mut g);
         let started = std::time::Instant::now();
         let mut shown = 0;
         let mut presented = S_OK;
         while started.elapsed().as_secs() < u64::from(window_seconds) {
             let token = g.begin();
-            g.frame(started.elapsed().as_secs_f32(), false, true);
+            g.frame(started.elapsed().as_secs_f32(), fresh && shown == 0, true);
             let hr = g.present(token);
             if hr != S_OK {
                 presented = hr;
             }
             shown += 1;
         }
-        t.eq(presented, S_OK, &format!("gpu: PresentX ({shown} frames)"));
+        t.eq(
+            presented,
+            S_OK,
+            &format!("gpu: PresentX ({shown} frames at {}x{})", g.width, g.height),
+        );
     }
     Run { image }
 }

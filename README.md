@@ -170,7 +170,7 @@ the public platform documentation says, citing the page per check. It links
 no SDK and holds no game data.
 
 ```powershell
-cargo test -p victory-hle --test conformance -- --nocapture
+cargo conformance          # or: cargo test -p victory-hle --test conformance -- --nocapture
 ```
 
 It reports one TAP line per check (189 of them):
@@ -212,6 +212,43 @@ cargo test -p victory-hle --test conformance the_gpu_frame_matches_warp -- --noc
 # Save VIctory's and WARP's frames as victory.ppm and warp.ppm.
 $env:VICTORY_CONFORMANCE_DUMP = "frames"
 ```
+
+### The demo
+
+`cargo demo` shows the GPU frame, animated, in a window until you close it,
+with VIctory's overlay (frame rate and frame times) in its top left corner:
+to leave running, or to show. The checks still run on a 512x288 frame; the
+window's frames are drawn at `--resolution`.
+
+```powershell
+cargo demo                          # 1440p until the window is closed
+cargo demo --resolution 4k          # 720p, 1080p, 1440p, 4k, or <width>x<height>
+cargo demo --seconds 30 --no-overlay
+cargo conformance --window 10 --resolution 1080p   # the whole suite, then 10 s of frames
+```
+
+Both build the test in release (`--debug` for the dev profile, whose
+frames are much slower).
+
+### On macOS
+
+`cargo conformance` and `cargo demo` also run on a Mac with Apple silicon,
+under [CrossOver](https://www.codeweavers.com/crossover) (Wine, with Apple's
+D3DMetal for Direct3D 12, and Rosetta 2 for the x86-64 code). The title and
+the test are cross-compiled for Windows with
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin), and run in a
+CrossOver bottle named `VIctory`, made on first use:
+
+```sh
+cargo install --locked cargo-xwin   # once; its first build downloads Microsoft's CRT and Windows SDK
+cargo demo
+```
+
+`VICTORY_CROSSOVER_BIN` names CrossOver's `bin` folder if the app is not in
+`/Applications`. There is no WARP under D3DMetal, so the comparison with
+it is skipped; every other check runs. The library crates' own tests run
+natively (`cargo test --workspace --exclude victory`); the `victory`
+executable, the game itself and GPU timings need Windows.
 
 ### Benchmarks
 

@@ -69,13 +69,16 @@ pub extern "system" fn conformance_bench(len: *mut usize) -> *const u8 {
 
 /// What the harness passes [`conformance_gpu`]: the WARP reference image
 /// (RGBA floats per pixel, null for none) and how long to keep presenting
-/// frames in a window afterwards (0: no window). The frame read back is
+/// frames in a window afterwards (0: no window), at
+/// `window_width` x `window_height`. The frame read back is
 /// handed out in `image` (valid until the next call).
 #[repr(C)]
 pub struct GpuRun {
     pub reference: *const f32,
     pub reference_len: usize,
     pub window_seconds: u32,
+    pub window_width: u32,
+    pub window_height: u32,
     pub image: *const f32,
     pub image_len: usize,
 }
@@ -91,7 +94,12 @@ pub extern "system" fn conformance_gpu(run: *mut GpuRun, len: *mut usize) -> *co
         // SAFETY: the harness passes `reference_len` floats.
         .then(|| unsafe { std::slice::from_raw_parts(run.reference, run.reference_len) });
     let mut t = tap::Tap::default();
-    let done = gpu::run(&mut t, reference, run.window_seconds);
+    let done = gpu::run(
+        &mut t,
+        reference,
+        run.window_seconds,
+        (run.window_width, run.window_height),
+    );
     let mut image = IMAGE.lock().unwrap_or_else(|e| e.into_inner());
     *image = done.image;
     run.image = image.as_ptr();
