@@ -296,6 +296,7 @@ fn root_uavs_stored_to_as_title_memory_are_written() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        native16: false,
         view_marks: false,
     })
     .expect("lower");
