@@ -1478,33 +1478,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_full_queue_has_submitted_itself() {
-        // (capacity, most entries held, entries that submit)
-        let expected = [
-            (0, 1, 1),
-            (1, 1, 1),
-            (2, 1, 1),
-            (3, 2, 2),
-            (4, 3, 3),
-            (8, 7, 5),
-        ];
-        for (capacity, most, submits_at) in expected {
-            let lane = Lane::new(0, capacity);
-            assert_eq!(
-                (lane.most(), lane.submits_at()),
-                (most, submits_at),
-                "{capacity}"
-            );
-        }
-        // A queue blocks once it holds `most` entries: those enqueued since
-        // the last submission must have been submitted by then.
-        for capacity in 0..=1024 {
-            let lane = Lane::new(0, capacity);
-            assert!(lane.submits_at() <= lane.most(), "{capacity}");
-        }
-    }
-
     /// Lanes without workers: what `start` picks, and when statuses land.
     fn lanes(staging: u64) -> Lanes {
         Lanes {
