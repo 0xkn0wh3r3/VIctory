@@ -915,13 +915,20 @@ impl HostHeap {
     /// Where slot `index` is written: in a paged heap its page is placed
     /// first (the scratch page where there is no room left).
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        match &self.pages {
-            None => self.host_cpu(index),
-            Some(p) => self.host_cpu(
-                p.slot(index, true)
-                    .unwrap_or(SCRATCH_PAGE * PAGE + index % PAGE),
-            ),
-        }
+        self.cpu_placed(index).0
+    }
+
+    /// [`HostHeap::cpu`], and whether it is the slot's own (not the
+    /// scratch page).
+    fn cpu_placed(&self, index: u32) -> (D3D12_CPU_DESCRIPTOR_HANDLE, bool) {
+        let slot = match &self.pages {
+            None => Some(index),
+            Some(p) => p.slot(index, true),
+        };
+        (
+            self.host_cpu(slot.unwrap_or(SCRATCH_PAGE * PAGE + index % PAGE)),
+            slot.is_some(),
+        )
     }
 
     /// Host heap slot `slot` (not a title slot in a paged heap).
@@ -946,8 +953,8 @@ impl HostHeap {
     /// none, and their host page is null before it is given out again.
     /// Their records stay noted, so heap syncs pass them by (one syncs
     /// every slot in 64 KiB of title memory with a write in it) and only a
-    /// record the title changes, a read mark or a draw making a texture's
-    /// view places the page again. The slot records are held throughout,
+    /// record the title changes, a read mark or a draw binding a slot of
+    /// the page places it again. The slot records are held throughout,
     /// so no title thread makes a slot of such a page meanwhile.
     // shortcut: a handle `gpu` gave out for a slot of a page placed on a
     // write, recorded into a list kept unsubmitted for longer than pages
@@ -957,13 +964,16 @@ impl HostHeap {
     // page; no list of ours bakes a title slot's handle today (the
     // unordered access clear takes a dynamic one).
     pub(crate) fn take_back_pages(&self, at: std::time::Instant) {
-        let Some(p) = &self.pages else { return };
+        // Without a page of null views to clear them with, pages are not
+        // taken back: one given out again would hold what it held before.
+        let (Some(p), Some(nulls), Some(host)) = (&self.pages, &self.page_nulls, host()) else {
+            return;
+        };
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let taken = p.take_back(at);
         if taken.is_empty() {
             return;
         }
-        let host = host();
         for &(page, host_page) in &taken {
             for index in page * PAGE..((page + 1) * PAGE).min(self.count) {
                 // Not readable as made any more: `mirror`'s lock-free check
@@ -972,17 +982,19 @@ impl HostHeap {
                 self.keep(index, None);
                 self.set_mark(index, None);
                 self.viewed.set(index, None, false);
-            }
-            if let (Some(host), Some(nulls)) = (host, &self.page_nulls) {
-                // SAFETY: a page of our heap; a page of null views.
-                unsafe {
-                    host.device.CopyDescriptorsSimple(
-                        PAGE,
-                        self.host_cpu(host_page * PAGE),
-                        nulls.GetCPUDescriptorHandleForHeapStart(),
-                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    );
+                // A shader's next read of it is taken (`make_read`).
+                if made[index as usize] != 0 {
+                    crate::shadow::forget_read(index);
                 }
+            }
+            // SAFETY: a page of our heap; a page of null views.
+            unsafe {
+                host.device.CopyDescriptorsSimple(
+                    PAGE,
+                    self.host_cpu(host_page * PAGE),
+                    nulls.GetCPUDescriptorHandleForHeapStart(),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
             }
         }
         drop(made);
@@ -997,12 +1009,13 @@ impl HostHeap {
         }
     }
 
-    /// The pages of a paged heap placed again since the last call (written
-    /// or read after they were taken back, or written with no room before),
-    /// their slots noted as made from no record ([`REMAKE`]): each is to
-    /// be made from the title's record, or made null where it holds none
-    /// now ([`HostHeap::sync_slots`]). Returns their first and last slots
-    /// (past them).
+    /// The pages of a paged heap placed again since the last call (written,
+    /// read or bound by a draw after they were taken back, or written with
+    /// no room before), their slots that hold no view noted as made from no
+    /// record ([`REMAKE`]): each is to be made from the title's record, or
+    /// made null where it holds none now ([`HostHeap::sync_slots`]). A slot
+    /// made since the page was placed holds its view there already. Returns
+    /// their first and last slots (past them).
     pub(crate) fn remakes(&self) -> Vec<(u32, u32)> {
         let Some(p) = &self.pages else { return Vec::new() };
         let pages = p.remakes();
@@ -1010,14 +1023,17 @@ impl HostHeap {
             return Vec::new();
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         pages
             .into_iter()
             .map(|page| (page * PAGE, ((page + 1) * PAGE).min(self.count)))
             .filter(|&(first, last)| first < last)
             .inspect(|&(first, last)| {
-                made[first as usize..last as usize].fill(REMAKE);
-                for ready in &self.ready[first as usize..last as usize] {
-                    ready.store(0, Ordering::Relaxed);
+                for i in (first..last).filter(|&i| kept[i as usize].is_none()) {
+                    made[i as usize] = REMAKE;
+                    // Not readable as made any more: `mirror`'s lock-free
+                    // check must not pass it by.
+                    self.ready[i as usize].store(0, Ordering::Relaxed);
                 }
             })
             .collect()
@@ -1070,9 +1086,11 @@ impl HostHeap {
             }
             return None;
         }
-        // A draw binds it: its page is in use.
+        // A draw binds it: its page is in use, and placed again if it was
+        // taken back (its slots made by the heap sync before the submission).
         if for_draw && let Some(p) = &self.pages {
             p.stamp(index);
+            p.place(index / PAGE);
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -1189,15 +1207,20 @@ impl HostHeap {
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
-            let (kept, mark) = if later {
-                (None, None)
+            let (kept, mark, placed) = if later {
+                (None, None, true)
             } else {
-                make_marked(&view, self.cpu(index))
+                let (at, placed) = self.cpu_placed(index);
+                let (kept, mark) = make_marked(&view, at);
+                (kept, mark, placed)
             };
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
+            // Made in the scratch page (no room for its page): the slot
+            // holds nothing, made again when its page is placed.
+            let kept = kept.filter(|_| placed);
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
@@ -1363,6 +1386,15 @@ impl HostHeap {
     pub(crate) fn set_page_water(&self, low: u32, high: u32) {
         if let Some(p) = &self.pages {
             p.set_water(low, high);
+        }
+    }
+
+    /// Leaves a paged heap no host page to give out (`none`), or gives
+    /// back those it held so (tests).
+    #[cfg(test)]
+    pub(crate) fn hold_page_room(&self, none: bool) {
+        if let Some(p) = &self.pages {
+            p.hold_room(none);
         }
     }
 }
