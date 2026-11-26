@@ -757,6 +757,7 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[cfg(windows)]
     #[test]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
@@ -862,6 +863,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[cfg(windows)]
     #[test]
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
