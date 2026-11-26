@@ -150,18 +150,50 @@ pub fn manifest_executables(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The predefined XML entities decoded (`&amp;` last, so that `&amp;lt;`
-/// stays `&lt;`).
+/// The XML references in `text` decoded, in one pass so that `&amp;lt;`
+/// stays `&lt;`: the predefined entities and character references
+/// (`&#32;`, `&#x20;`). One that is neither, or names no character, is
+/// kept as written.
 fn decode(text: &str) -> String {
-    [
-        ("&lt;", "<"),
-        ("&gt;", ">"),
-        ("&quot;", "\""),
-        ("&apos;", "'"),
-        ("&amp;", "&"),
-    ]
-    .iter()
-    .fold(text.to_owned(), |t, (entity, c)| t.replace(entity, c))
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let decoded = rest
+            .find(';')
+            .and_then(|semi| Some((reference(&rest[1..semi])?, semi)));
+        match decoded {
+            Some((c, semi)) => {
+                out.push(c);
+                rest = &rest[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The character the reference `&name;` stands for.
+fn reference(name: &str) -> Option<char> {
+    let (digits, radix) = match name {
+        "lt" => return Some('<'),
+        "gt" => return Some('>'),
+        "quot" => return Some('"'),
+        "apos" => return Some('\''),
+        "amp" => return Some('&'),
+        _ => match name.strip_prefix("#x") {
+            Some(hex) => (hex, 16),
+            None => (name.strip_prefix('#')?, 10),
+        },
+    };
+    let plain = !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix));
+    let code = u32::from_str_radix(digits, radix).ok().filter(|_| plain)?;
+    char::from_u32(code).filter(|c| *c != '\0')
 }
 
 /// The value of attribute `name` in an element's tag text (`Executable
@@ -324,6 +356,21 @@ mod tests {
         assert!(manifest_executables("<Game><ExecutableList/></Game>").is_empty());
         let unnamed = r#"<Game><ExecutableList><Executable Id="Game"/></ExecutableList></Game>"#;
         assert!(manifest_executables(unnamed).is_empty());
+    }
+
+    /// Character references decode as the named entities do, in one pass;
+    /// a malformed one, or one naming no character, stays as written.
+    #[test]
+    fn character_references_decode_in_one_pass() {
+        let manifest = r#"<Game><ExecutableList>
+            <Executable Name="Game&#x20;Title&#46;exe"/>
+            <Executable Name="&amp;lt;&amp;#65;&#X41;&#x;&#+65;&#0;&bogus;&#x1F600;&"/>
+            </ExecutableList></Game>"#;
+        let want = [
+            "Game Title.exe",
+            "&lt;&#65;&#X41;&#x;&#+65;&#0;&bogus;\u{1F600}&",
+        ];
+        assert_eq!(manifest_executables(manifest), want);
     }
 
     #[test]

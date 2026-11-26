@@ -86,13 +86,24 @@ pub(crate) fn title_files(game_dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// `name` (from the manifest) inside `dir`, if it is a relative path of a
-/// `.exe` that stays there: no root, drive, `..` or `.` parts.
+/// `.exe` there: no root, drive, empty, `..` or `.` parts (checked on the
+/// text, as [`Path::components`] drops an inner `.`), and the file it names
+/// is in `dir` once links and junctions on the way are followed.
 fn inside(dir: &Path, name: &str) -> Option<PathBuf> {
-    let name = Path::new(name);
-    let plain = name
-        .components()
-        .all(|c| matches!(c, std::path::Component::Normal(_)));
-    (plain && is(name, "exe")).then(|| dir.join(name))
+    let parts_plain = name
+        .split(['/', '\\'])
+        .all(|part| !matches!(part, "" | "." | ".."));
+    let path = Path::new(name);
+    let plain = parts_plain
+        && path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !plain || !is(path, "exe") {
+        return None;
+    }
+    let path = dir.join(path);
+    let real = path.canonicalize().ok()?;
+    real.starts_with(dir.canonicalize().ok()?).then_some(path)
 }
 
 /// Whether `path` has extension `ext` (any case).
@@ -217,7 +228,47 @@ mod tests {
         assert!(inside(&folder.0, &up).is_none() && inside(&folder.0, &absolute).is_none());
         assert!(inside(&folder.0, "notes.txt").is_none());
         assert!(inside(&folder.0, "./Title.exe").is_none());
+        assert!(inside(&folder.0, "Title.exe").is_some());
         // None of them: the folder's only `.exe`.
         assert_eq!(folder.picked().unwrap(), ["Title.exe", "x.dll"]);
+    }
+
+    /// An inner `.` part, which [`Path::components`] drops, is passed over
+    /// as the outer ones are, and so is an empty part.
+    #[test]
+    fn inner_dot_and_empty_parts_are_passed_over() {
+        let folder = Folder::new("dots", &["bin/Title.exe"]);
+        assert!(inside(&folder.0, "bin/Title.exe").is_some());
+        assert!(inside(&folder.0, r"bin\Title.exe").is_some());
+        for name in [
+            "bin/./Title.exe",
+            r"bin\.\Title.exe",
+            "bin//Title.exe",
+            "bin/Title.exe/",
+        ] {
+            assert!(inside(&folder.0, name).is_none(), "{name}");
+        }
+    }
+
+    /// A manifest entry reached through a junction out of the folder is
+    /// passed over, though the path has only plain parts.
+    #[cfg(windows)]
+    #[test]
+    fn an_executable_through_a_junction_out_of_the_folder_is_passed_over() {
+        let outside = Folder::new("beyond", &["Other.exe"]);
+        let folder = Folder::new("junction", &["Title.exe"]);
+        let link = folder.0.join("out");
+        // A junction needs no privilege, unlike a symbolic link.
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside.0)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        assert!(link.join("Other.exe").is_file());
+        folder.manifest(&["out/Other.exe"]);
+        assert!(inside(&folder.0, "out/Other.exe").is_none());
+        assert_eq!(folder.picked().unwrap(), ["Title.exe"]);
     }
 }
