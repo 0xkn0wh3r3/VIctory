@@ -1544,8 +1544,10 @@ fn make_texture(
     });
     // A committed texture takes its own priority. A placed one takes its
     // heap's (`keep_resident`): the normal one, as heaps of textures hold
-    // no render target, depth or unordered access (`crate::placement`).
-    if placement.is_none() {
+    // no render target, depth or unordered access (`crate::placement`), and
+    // a title heap's host heap's, high (`crate::alias`). Asked of a placed
+    // texture itself, the call removed the device at the next submission.
+    if placement.is_none() && aliased.is_none() {
         crate::host::keep_resident(&texture, crate::host::Residency::of_texture(d.flags));
     }
     let initial = crate::host::legal_state(&texture, initial);
