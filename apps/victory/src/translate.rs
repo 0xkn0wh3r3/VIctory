@@ -433,9 +433,9 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         started.elapsed().as_secs_f64()
     ));
     if translated + refused > 0 {
-        println!("time");
+        crate::progress::say("time".to_owned());
         for line in slow.lines("translations (containers by hash)") {
-            println!("{line}");
+            crate::progress::say(line);
         }
     }
     if pipelines {

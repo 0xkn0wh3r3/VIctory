@@ -277,19 +277,19 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     if !todo.is_empty() {
         let (saves, saved, locked) = pipeline::library_saves();
         let (saves, saved, locked) = (saves - saves0.0, saved - saves0.1, locked - saves0.2);
-        println!("time");
+        crate::progress::say("time".to_owned());
         for line in translating.lines("translating pipelines' shaders") {
-            println!("{line}");
+            crate::progress::say(line);
         }
         for line in creating.lines("making host pipelines (driver or library)") {
-            println!("{line}");
+            crate::progress::say(line);
         }
-        println!(
+        crate::progress::say(format!(
             "  library saves: {saves} in {:.1} s, {:.1} s of it serialising with the library \
              locked (pipelines being made wait to be stored)",
             saved.as_secs_f64(),
             locked.as_secs_f64()
-        );
+        ));
     }
     Ok(())
 }
