@@ -17,6 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -807,6 +808,18 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
         .as_ref()
 }
 
+/// The read marks of a bitmap, one bit per heap slot, as atomics: shaders
+/// of a submission still in flight may set more (atomic ORs) while the CPU
+/// takes them.
+fn read_marks(b: &'static Bitmap) -> &'static [AtomicU32] {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    // SAFETY: the bitmap's read marks, `words` dwords from `first`, mapped
+    // for good (the bitmap is never released); `AtomicU32` has `u32`'s
+    // layout, and every access to them is atomic.
+    unsafe { std::slice::from_raw_parts((b.data as *const AtomicU32).add(first), words) }
+}
+
 /// The host GPU address of the buffer views' written-pages bitmap, for the
 /// root UAV of shaders that mark their writes (`memory`: shaders that use
 /// title memory, see [`bitmap`]).
@@ -824,14 +837,11 @@ static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()))
 /// [`forget_read`]. Clears the slots forgotten since first.
 pub(crate) fn take_reads() -> Vec<u32> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
-    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     // Both bitmaps: shaders that use title memory mark their reads in theirs.
-    let mut maps: Vec<&mut [u32]> = [false, true]
+    let maps: Vec<&[AtomicU32]> = [false, true]
         .into_iter()
         .filter_map(bitmap)
-        // SAFETY: the mapped bitmap's read marks (a submission still in
-        // flight may set more: a later call takes them).
-        .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
+        .map(read_marks)
         .collect();
     if maps.is_empty() {
         return Vec::new();
@@ -842,13 +852,18 @@ pub(crate) fn take_reads() -> Vec<u32> {
     for slot in forgotten.drain(..) {
         let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
         if w < words {
-            maps.iter_mut().for_each(|bits| bits[w] &= !bit);
+            maps.iter().for_each(|bits| {
+                bits[w].fetch_and(!bit, AtomicOrdering::AcqRel);
+            });
             seen[w] &= !bit;
         }
     }
     let mut new = Vec::new();
     for (w, s) in seen.iter_mut().enumerate() {
-        let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
+        let mut fresh = maps
+            .iter()
+            .fold(0, |x, bits| x | bits[w].load(AtomicOrdering::Acquire))
+            & !*s;
         *s |= fresh;
         while fresh != 0 {
             new.push(w as u32 * 32 + fresh.trailing_zeros());
@@ -864,16 +879,15 @@ pub(crate) fn take_reads() -> Vec<u32> {
 /// has seen every mark: its own record of slots seen keeps a slot read
 /// again from being reported as new.
 pub(crate) fn reads_since() -> Vec<u32> {
-    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
-    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     let mut slots = Vec::new();
-    for b in [false, true].into_iter().filter_map(bitmap) {
-        // SAFETY: the mapped bitmap's read marks (one a submission in flight
-        // sets between the read and the clear is lost: a later read of the
-        // slot stamps it).
-        let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
-        for (w, word) in bits.iter_mut().enumerate() {
-            let mut x = std::mem::take(word);
+    for bits in [false, true].into_iter().filter_map(bitmap).map(read_marks) {
+        for (w, word) in bits.iter().enumerate() {
+            // Taken whole (a mark the GPU sets meanwhile is either in it or
+            // left for the next call); most words are clear.
+            if word.load(AtomicOrdering::Relaxed) == 0 {
+                continue;
+            }
+            let mut x = word.swap(0, AtomicOrdering::AcqRel);
             while x != 0 {
                 slots.push(w as u32 * 32 + x.trailing_zeros());
                 x &= x - 1;
@@ -1312,11 +1326,8 @@ pub(crate) mod tests {
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
     pub(crate) fn mark_read(memory: bool, slot: u32) {
-        let b = bitmap(memory).expect("a host GPU");
-        let bit = victory_shader::emit::VIEW_READS + slot;
-        // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
-        // holds the submission lock).
-        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+        let marks = read_marks(bitmap(memory).expect("a host GPU"));
+        marks[(slot / 32) as usize].fetch_or(1 << (slot % 32), AtomicOrdering::AcqRel);
     }
 
     /// The title writes a constant under a range an earlier list of the

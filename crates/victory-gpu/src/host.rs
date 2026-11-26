@@ -1152,6 +1152,21 @@ fn wait_unlocked(fence: &ID3D12Fence, value: u64) {
     }
 }
 
+/// A submission completed since held work was last pumped for it
+/// ([`pump_after_completions`]).
+static COMPLETED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// After submissions completed on a thread other than the completion
+/// thread (which pumps after its own), once the submission lock is let go:
+/// held work may wait for a value they wrote or a fence they signalled
+/// (`crate::queue`). Inside a pump the lock is taken and nothing runs here:
+/// that pump tests its queues again itself.
+fn pump_after_completions() {
+    if COMPLETED.swap(false, Ordering::Relaxed) {
+        crate::queue::pump_held_if_free(crate::queue::Why::Completed);
+    }
+}
+
 /// Sets a title fence a queue signalled behind its work, which kept it
 /// (`crate::fence::keep`), and lets it go.
 fn set_title_fence(fence: usize, value: u64) {
@@ -1294,11 +1309,12 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let (traced, sub) = (record.traced, record.value);
         self.finish(record, runs);
+        drop(submitted);
+        pump_after_completions();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
         if traced {
-            drop(submitted);
             let mut targets: Vec<(usize, String)> = Vec::new();
             for r in runs {
                 for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -1352,6 +1368,7 @@ impl Host {
         submitted.flight.push_back(record);
         drop(submitted);
         self.flown.notify_one();
+        pump_after_completions();
         static COMPLETER: std::sync::Once = std::sync::Once::new();
         COMPLETER.call_once(|| {
             let Some(host) = host() else { return };
@@ -1410,6 +1427,7 @@ impl Host {
     /// Completes every submission in flight ([`Host::finish`]).
     pub(crate) fn complete_all(&self) {
         drop(self.complete_while(self.lock_submitted(), |_| true));
+        pump_after_completions();
     }
 
     /// Completes the submissions in flight up to the last one that runs
@@ -1418,6 +1436,7 @@ impl Host {
         drop(self.complete_while(self.lock_submitted(), |r| {
             r.lists.iter().any(|l| std::sync::Arc::ptr_eq(l, list))
         }));
+        pump_after_completions();
     }
 
     /// Completes submissions in flight, oldest first, while one left
@@ -1736,6 +1755,7 @@ impl Host {
     /// then the title fences signalled behind it. `runs`: its lists, but
     /// our upload list.
     fn finish(&self, record: InFlight, runs: &[&HostList]) {
+        COMPLETED.store(true, Ordering::Relaxed);
         let waiting = std::time::Instant::now();
         self.wait_for(record.value);
         SUBMISSION_US[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -3977,6 +3997,12 @@ impl Host {
                 }
                 (capture, probe)
             };
+            // The frame's textures stay alive until the list has run: the
+            // title may release or give them up meanwhile.
+            for &(texture, _) in planes {
+                copy.keep(texture);
+            }
+            copy.keep(&back);
             copy.close();
             self.submit(0, vec![copy.clone()]);
             // What diagnostics read back is read once the frame has run.
