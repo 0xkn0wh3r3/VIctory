@@ -3,6 +3,9 @@
 //! the fence once they have.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(all(windows, test))]
+pub(crate) mod foreground_completion;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
@@ -238,6 +241,8 @@ fn pump(held: &mut Holding, why: Why) {
     TIMER.call_once(|| {
         let _ = std::thread::Builder::new().name("victory held work".into()).spawn(|| loop {
             std::thread::sleep(std::time::Duration::from_millis(2));
+            #[cfg(test)]
+            let _turn = foreground_completion::background_turn();
             pump_held_if_free(Why::Timer);
         });
     });

@@ -3209,6 +3209,19 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_list_waiting_for_another_queues_write_reads_what_it_wrote() {
+        check_two_queue_copy(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "run alone on a D3D12 device with overlapping submissions"]
+    fn foreground_completion_releases_the_waiting_compute_copy() {
+        assert!(crate::host::host().is_some() && crate::host::overlap());
+        check_two_queue_copy(true);
+    }
+
+    #[cfg(windows)]
+    fn check_two_queue_copy(check_foreground: bool) {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -3280,6 +3293,9 @@ mod tests {
         crate::list::write64(drawing, flag as u64, 1, 0, 0);
         slot::<Close>(drawing, 0x48)(drawing);
 
+        let probe = check_foreground.then(|| {
+            crate::queue::foreground_completion::Probe::attach(drawing, computing)
+        });
         slot::<Execute>(compute, 0x50)(compute, 1, &computing);
         // The part before the wait has run once its submission completes (a
         // fence the queue signalled would wait behind the held part).
@@ -3297,7 +3313,13 @@ mod tests {
         assert_eq!(slot::<Reset>(computing, 0x50)(computing, allocator, null), S_OK);
         slot::<Close>(computing, 0x48)(computing);
 
-        slot::<Execute>(graphics, 0x50)(graphics, 1, &drawing);
+        let submit_graphics = || slot::<Execute>(graphics, 0x50)(graphics, 1, &drawing);
+        let released = if let Some(probe) = probe {
+            Some(probe.complete(crate::host::host().unwrap(), submit_graphics))
+        } else {
+            submit_graphics();
+            None
+        };
         crate::queue::tests::finish(graphics);
         crate::queue::tests::finish(compute);
         // SAFETY: as above.
@@ -3306,6 +3328,10 @@ mod tests {
         for row in 0..4 {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}: the texture as the graphics list filled it");
+        }
+        if let Some(released) = released {
+            eprintln!("all four RGBA8 rows matched (64 bytes), graphics flag=1");
+            assert!(released, "foreground completion should release the compute copy");
         }
     }
 

@@ -1536,6 +1536,8 @@ impl Host {
                     WaitForSingleObject(event, INFINITE);
                 }
             }
+            #[cfg(test)]
+            let _turn = crate::queue::foreground_completion::background_turn();
             let mut submitted = self.lock_submitted();
             // SAFETY: a plain query.
             let reached = unsafe { self.fence.GetCompletedValue() };
