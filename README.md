@@ -154,6 +154,86 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+## Tests
+
+Everything below runs without game data. `cargo test --workspace` runs the
+unit tests of every crate and the acceptance suite; the shader tests run one
+at a time (`cargo test -p victory-shader -- --test-threads=1`, see
+[the validator](#windows-shader-test-validator)).
+
+### The conformance title (acceptance suite)
+
+`tests/fixtures/conformance` is a small title of our own, built from source
+by the test and loaded through VIctory like a real one. It calls the
+console runtime the way a title does and checks the answers against what
+the public platform documentation says, citing the page per check. It links
+no SDK and holds no game data.
+
+```powershell
+cargo test -p victory-hle --test conformance -- --nocapture
+```
+
+It reports one TAP line per check (189 of them):
+
+| Area | What it checks |
+|---|---|
+| Runtime | loading `xgameruntime.dll`, initialising, reaching each area's object |
+| Task queues and async calls | dispatch modes, cancellation, status, a provider's call order |
+| System information | console id, analytics info |
+| Memory | physical pages mapped at two addresses reading back the same bytes (invariants: XMem's pages are not public) |
+| DirectStorage | completion order, automatic submission, capacity and size limits, cancel by tag |
+| Game saves | update and quota limits, atomic updates, container names |
+| User | default user, gamertags, ids, handles |
+| Networking, package, display | connectivity hint, package, HDR mode |
+| Files | the package drive (read-only) and temporary storage, with Win32 and C runtime semantics |
+| Persistent local storage | path size and path |
+| GPU frame | see below |
+
+Checks VIctory is known to answer differently are listed with the reason in
+`KNOWN` (`crates/victory-hle/tests/conformance.rs`): reported, not failed. A
+listed check that starts passing fails the test, so the list stays true.
+
+### The GPU frame (a drawing test title)
+
+The same title draws a frame through VIctory's console D3D12, as a game
+would: device, queue, command lists, descriptor heaps, root signatures, a
+graphics and a compute pipeline whose shaders are hand-assembled console
+(GFX10) programs, vertex, index and constant buffers in title memory, a
+texture uploaded by a copy, and a depth buffer. The scene is a ground plane,
+two cubes and a glowing pyramid, lit by a directional light, textured from a
+checkerboard, then blurred by a compute pass (512x288). The test draws the
+same scene natively on WARP from equivalent HLSL and compares the two
+images (`the_gpu_frame_matches_warp`).
+
+```powershell
+# Watch it: present the frame, animated, in a window for 10 seconds.
+$env:VICTORY_CONFORMANCE_WINDOW = 10
+cargo test -p victory-hle --test conformance the_gpu_frame_matches_warp -- --nocapture
+# Save VIctory's and WARP's frames as victory.ppm and warp.ppm.
+$env:VICTORY_CONFORMANCE_DUMP = "frames"
+```
+
+### Benchmarks
+
+Ignored tests that measure rather than check (synthetic workloads, no game
+data). Run them in release, one at a time:
+`cargo test --release -p <crate> --lib <name> -- --ignored --nocapture --test-threads=1`.
+
+| Crate | Name | Measures |
+|---|---|---|
+| victory-gpu | `benchmark_blank_frame` | a heavy frame with nothing on screen: copies of title memory, shader writes found by marks or by snapshots, clears |
+| victory-gpu | `compute_heavy_submissions_by_copy_placement` | 200 dispatches over 320 MiB of title buffers, copies in system memory against video memory |
+| victory-gpu | `reading_copies_in_video_and_system_memory`, `written_copies_in_video_and_system_memory` | shaders reading and writing one 256 MiB copy in each kind of memory |
+| victory-gpu | `world_frame_refreshes` | a world frame's refreshes of a 174 MB heap, on one thread and on the workers |
+| victory-gpu | `transient_targets_video_memory` | video memory for render targets sharing a title heap, against one allocation each |
+| victory-gpu | `marks_bench`, `bitmap_copy_out_bench` | what marking the title pages shaders write costs, per way of marking |
+| victory-gpu | `f16_bench` | translated 16-bit float math in f32 against native `half` |
+| victory-gpu | `list_calls` | the cost of the title's command list calls |
+| victory-gpu | `dispatch_binding_cost` | binding a dispatch's resources |
+| victory-gpu | `library_file_memory` | memory the pipeline library file takes |
+| victory-shader | `wave64_split_cost` | console wave64 programs split for 32-lane GPUs, against wave32 and native wave64 |
+| victory-hle | `workloads` (conformance test) | DirectStorage streaming throughput |
+
 ## Commands
 
 ```
