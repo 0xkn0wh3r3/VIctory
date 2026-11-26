@@ -992,6 +992,7 @@ impl<'a> Lower<'a> {
             };
             match self.root_address(&src) {
                 Some((lo, hi)) => {
+                    self.root_written(&src);
                     // As `raw_view`, looked up inside the guard below.
                     let (lo, hi) = self.add64(lo, hi, off, false);
                     let mask = self.s.m.i32(0xFFFF);
@@ -1805,11 +1806,29 @@ impl<'a> Lower<'a> {
             };
             return Ok((h, off));
         };
+        if write {
+            self.root_written(src);
+        }
         // The hardware adds the 32-bit offset to the 48-bit base.
         let (lo, hi) = self.add64(lo, hi, off, false);
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
         Ok(self.memory(lo, hi, bytes, write, active))
+    }
+
+    /// Records that the root UAV `src` is built around is written, in a
+    /// program that reaches it as title memory ([`Self::root_address`]):
+    /// no operation on a root UAV handle tells [`Shader::op`] so.
+    fn root_written(&mut self, src: &Source) {
+        let Source::Built { address, .. } = src else {
+            return;
+        };
+        let Some(rp) = self.x.native.layout.get(address.param) else {
+            return;
+        };
+        if !self.s.written_root_uavs.contains(&rp.slot) {
+            self.s.written_root_uavs.push(rp.slot);
+        }
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
