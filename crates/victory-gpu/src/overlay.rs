@@ -338,6 +338,8 @@ pub(crate) struct Overlay {
     /// a lock other threads take), its size, and when it was last drawn.
     upload: Option<(ID3D12Resource, usize, u64)>,
     drawn: Option<(Instant, Image, i32)>,
+    /// Whether `drawn` is the status banner (else the panel).
+    banner: bool,
 }
 
 impl Default for Overlay {
@@ -359,6 +361,7 @@ impl Default for Overlay {
             adapter: None,
             upload: None,
             drawn: None,
+            banner: false,
         }
     }
 }
@@ -501,17 +504,22 @@ impl Overlay {
         if CHANGED.swap(false, Relaxed) {
             self.drawn = None;
         }
-        if !shown() {
+        // Work going on behind the title (shaders and pipelines made ahead,
+        // `crate::set_caption_status`) shows as a banner while the panel
+        // does not, so players see it without the overlay or a console.
+        let status = crate::host::caption_status();
+        if !shown() && status.is_none() {
             self.drawn = None;
             return state;
         }
         let Some(pixel) = Pixel::of(format) else {
             return state;
         };
-        if self
-            .sampled
-            .as_ref()
-            .is_none_or(|(at, _)| now - *at >= SAMPLE)
+        if shown()
+            && self
+                .sampled
+                .as_ref()
+                .is_none_or(|(at, _)| now - *at >= SAMPLE)
         {
             let system = self.sample(host);
             if self.history.len() == SECONDS {
@@ -528,10 +536,16 @@ impl Overlay {
         let scale = scale_for(height);
         let fresh = self.drawn.as_ref().is_some_and(|(at, image, f)| {
             now - *at < REDRAW && (image.scale - scale).abs() < 1e-3 && *f == format.0
-        });
+        }) && self.banner == !shown();
         if !fresh {
-            let system = self.sampled.map(|(_, s)| s).unwrap_or_default();
-            let image = self.panel(scale, &system);
+            let image = match &status {
+                Some(status) if !shown() => draw_banner(&Fonts::new(), scale, status),
+                _ => {
+                    let system = self.sampled.map(|(_, s)| s).unwrap_or_default();
+                    self.panel(scale, &system)
+                }
+            };
+            self.banner = !shown();
             self.drawn = Some((now, image, -1));
         }
         let Some((_, image, written)) = self.drawn.as_mut() else {
@@ -857,6 +871,30 @@ fn half(x: f32) -> u16 {
         return 0;
     }
     ((exp as u32) << 10 | (bits >> 13 & 0x3FF)) as u16
+}
+
+/// The banner of work going on behind the title (`status`, from
+/// `crate::set_caption_status`): it, and that draws may be missing until it
+/// is done, framed like the panel.
+fn draw_banner(fonts: &Fonts, scale: f32, status: &str) -> Image {
+    const NOTE: &str = "Some draws may be missing until it is done (Alt+Z for details)";
+    let (big, small) = ((15.0 * scale).round() as u32, (13.0 * scale).round() as u32);
+    let lines = [
+        (fonts.mask(status, big.max(6), true), colour::VALUE),
+        (fonts.mask(NOTE, small.max(6), false), colour::LABEL),
+    ];
+    let pad = (10.0 * scale).round() as u32;
+    let gap = (4.0 * scale).round() as u32;
+    let width = lines.iter().map(|(m, _)| m.width).max().unwrap_or(0) + 2 * pad;
+    let height = lines.iter().map(|(m, _)| m.height).sum::<u32>() + gap + 2 * pad;
+    let mut image = Image::new(width, height, scale);
+    let mut y = pad as i32;
+    for (mask, c) in &lines {
+        image.stamp(mask, pad as i32, y, *c);
+        y += (mask.height + gap) as i32;
+    }
+    image.outline(0, 0, width as i32, height as i32, colour::BORDER);
+    image
 }
 
 /// The panel in sRGB.
@@ -1916,11 +1954,94 @@ mod tests {
         assert_eq!((fallback.width, fallback.height), (24, 18));
     }
 
+    /// The banner fits its status, is framed, and draws its text.
+    #[test]
+    fn the_banner_frames_its_status_and_note() {
+        let fonts = Fonts::new();
+        let short = draw_banner(&fonts, 1.0, "Building pipelines");
+        let long = draw_banner(&fonts, 1.0, &"Building pipelines: 3200 of 27000 ".repeat(3));
+        assert!(long.width > short.width, "it fits its status");
+        let border = colour::BORDER;
+        assert_eq!(short.pixels[0], border, "framed");
+        let bright = |p: &&Rgb| p.iter().map(|&c| u32::from(c)).sum::<u32>() > 600;
+        assert!(short.pixels.iter().filter(bright).count() > 20, "its text is drawn");
+    }
+
+    /// The tests that show or hide the panel (a switch of the process's):
+    /// one at a time.
+    static SHOWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// With the panel hidden, a status (work going on behind the title) is
+    /// copied into the frame as a banner; without one, nothing is.
+    #[test]
+    fn a_status_shows_as_a_banner_while_the_panel_is_hidden() {
+        let _one = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1280,
+            Height: 720,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut back: Option<ID3D12Resource> = None;
+        // SAFETY: plain resource creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut back,
+                )
+                .unwrap();
+        }
+        let back = back.unwrap();
+        let list = host.new_list().unwrap();
+        let mut overlay = Overlay {
+            enabled: true,
+            ..Overlay::default()
+        };
+        VISIBLE.store(false, Relaxed);
+        let record = |overlay: &mut Overlay| {
+            overlay.record(
+                host,
+                &list.list,
+                &back,
+                (1280, 720, DXGI_FORMAT_R8G8B8A8_UNORM),
+                HWND::default(),
+                D3D12_RESOURCE_STATE_COMMON,
+            )
+        };
+        crate::host::set_caption_status(None);
+        assert_eq!(record(&mut overlay), D3D12_RESOURCE_STATE_COMMON, "no banner, no copy");
+        crate::host::set_caption_status(Some("Building pipelines: 12 of 34 (35%)".into()));
+        let state = record(&mut overlay);
+        crate::host::set_caption_status(None);
+        assert_eq!(state, D3D12_RESOURCE_STATE_COPY_DEST, "the banner is copied in");
+        assert!(overlay.banner);
+        list.close();
+    }
+
     /// The panel, shown, lands in the back buffer's top left corner on the
     /// host GPU: its background at the margin, its text in the text colour,
     /// the frame around it untouched.
     #[test]
     fn a_shown_panel_is_copied_into_the_back_buffer() {
+        let _one = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };

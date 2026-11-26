@@ -532,6 +532,11 @@ pub fn set_caption_status(text: Option<String>) {
     *CAPTION_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = text;
 }
 
+/// The caption's status text, if any (the overlay shows it as a banner).
+pub(crate) fn caption_status() -> Option<String> {
+    CAPTION_STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     thread_local! {
