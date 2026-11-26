@@ -875,10 +875,11 @@ impl HostHeap {
     /// so no title thread makes a slot of such a page meanwhile.
     // shortcut: a handle `gpu` gave out for a slot of a page placed on a
     // write, recorded into a list kept unsubmitted for longer than pages
-    // are kept unused (10 s and 300 submissions), reads what the page's
-    // host page holds by then. Lists bind title slots through the page
-    // table, and `gpu` stamps the page; no list of ours bakes a title
-    // slot's handle today (the unordered access clear takes a dynamic one).
+    // are kept unused (10 s and 300 submissions; 32 submissions once a
+    // write found no room), reads what the page's host page holds by then.
+    // Lists bind title slots through the page table, and `gpu` stamps the
+    // page; no list of ours bakes a title slot's handle today (the
+    // unordered access clear takes a dynamic one).
     pub(crate) fn take_back_pages(&self, at: std::time::Instant) {
         let Some(p) = &self.pages else { return };
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
