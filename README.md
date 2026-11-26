@@ -217,21 +217,28 @@ $env:VICTORY_CONFORMANCE_DUMP = "frames"
 
 `cargo demo` shows the GPU frame, animated, in a window until you close it,
 with VIctory's overlay (frame rate and frame times) in its top left corner:
-to leave running, or to show. The window's frames add hills of Perlin
-noise around the ground; the checks still run on the 512x288 frame,
-without them.
+to leave running, or to show. The window's frames are a synthwave drive:
+a neon car going down a highway into a striped sunset, the camera
+following it, past spinning shapes on both sides, between wireframe ridges
+of Perlin noise. Everything moves every frame (the camera, the car, the
+world going past), as in a game. The checks still run on the 512x288
+frame, as it was.
 
 `--scale <n>` is a stress test of VIctory itself, not of the GPU: each
-step past 1 adds 64 small objects to a frame, each a draw with its
+step past 1 adds 64 spinning shapes beside the highway (`cargo demo` runs
+at 4 unless given; `cargo conformance --window` at 1), each a draw with its
 constants written into title memory and its view made in the descriptor
 heap that frame, and one more submission, as a title's frame grows. Every
-5 seconds it prints the frame rate and the work per frame, so runs at
-different scales compare.
+5 seconds it prints the frame rate and where the frame's time in VIctory
+went (submissions, split into Close, ExecuteCommandLists and the fence
+wait; views made; constants written; recording; PresentX; waiting for the
+frame tick), so runs at different scales, and before and after a change,
+compare.
 
 ```powershell
 cargo demo                          # 1440p until the window is closed
 cargo demo --resolution 4k          # 720p, 1080p, 1440p, 4k, or <width>x<height>
-cargo demo --scale 64               # 4,037 draws and 64 submissions a frame
+cargo demo --scale 64               # 4,047 draws and 64 submissions a frame
 cargo demo --seconds 30 --dump frames   # then save the last frame as frames/window.ppm
 cargo conformance --window 10 --resolution 1080p   # the whole suite, then 10 s of frames
 ```

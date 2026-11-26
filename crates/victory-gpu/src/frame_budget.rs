@@ -173,6 +173,13 @@ pub(crate) struct Phases {
     pub(crate) copy_back: Duration,
 }
 
+impl Phases {
+    /// In order: sync, uploads, refresh, GPU, copy-back.
+    fn parts(&self) -> [Duration; 5] {
+        [self.sync, self.uploads, self.refresh, self.gpu, self.copy_back]
+    }
+}
+
 /// What a frame's timed commands took on the GPU: per [`Kind`] (ms and
 /// count), per [`Traits`] bit (ms), and the slowest commands.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -540,6 +547,22 @@ fn keep_slowest<T: Clone>(slowest: &mut Vec<(f64, T)>, ms: f64, command: &T) {
 /// A submission and where its time went.
 pub(crate) fn submitted(phases: Phases) {
     FRAME.submitted(phases);
+    let mut total = TOTAL.lock().unwrap_or_else(|e| e.into_inner());
+    total.0 += 1;
+    for (sum, part) in total.1.iter_mut().zip(phases.parts()) {
+        *sum += part;
+    }
+}
+
+/// Every submission since the start: how many, and their phases summed.
+static TOTAL: std::sync::Mutex<(u64, [Duration; 5])> =
+    std::sync::Mutex::new((0, [Duration::ZERO; 5]));
+
+/// How many submissions ran since the start, and their time summed by
+/// phase, in [`Phases`]' order: sync, uploads, refresh, GPU, copy-back. For
+/// tools that compare runs, such as the conformance demo's report.
+pub fn submission_totals() -> (u64, [Duration; 5]) {
+    *TOTAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A wait for a pipeline being made.
