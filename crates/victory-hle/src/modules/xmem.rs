@@ -359,7 +359,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            // The GPU side lets go of what it holds in place there first.
+            super::memoryapi::change(address, 0, || VirtualFree(address, 0, MEM_RELEASE));
             return;
         }
         let user = address.cast::<u8>();
@@ -1075,8 +1076,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
+        // What the GPU side holds in place in the view would make the unmap
+        // fail: it lets go first.
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        let gone = unsafe {
+        let gone = victory_gpu::title_memory_change(at, size, || unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1084,7 +1087,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 },
                 MEM_PRESERVE_PLACEHOLDER,
             )
-        };
+        });
         // Unmapped whole, its placeholder is its own until mapped over.
         if gone != 0 && at >= base && at + size <= end {
             physical.holes.insert(at, size);

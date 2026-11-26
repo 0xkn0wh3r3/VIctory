@@ -61,6 +61,8 @@ pub mod object;
 pub mod overlay;
 pub mod pipeline;
 #[cfg(windows)]
+mod pinned;
+#[cfg(windows)]
 mod placement;
 #[cfg(windows)]
 mod primitive;
@@ -95,6 +97,7 @@ pub use copystat::CountingAlloc;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use host::{adapter_identity, set_caption_status};
+pub use pinned::{title_memory_change, title_memory_held};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
