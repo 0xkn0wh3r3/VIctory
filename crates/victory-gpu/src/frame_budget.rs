@@ -1,108 +1,34 @@
-//! The frame budget: at 30 frames a second, a frame has 33.3 ms for the
-//! title's work, ours and the GPU's. Two things here:
+//! The frame budget (33.3 ms a frame at 30 a second).
 //!
-//! - A report of each frame past [`REPORT`] (at most one line a second,
-//!   counting the others), in terms of any title: what bound it and why
-//!   ([`cause`]), and where its time went: the GPU, our work around
-//!   submissions ([`Phases`]: descriptor heap sync, texture uploads, title
-//!   memory refresh, copy-back), pipeline waits, and the rest (the title's
-//!   own work, and the translation of its command-list calls). With the
-//!   guard on, the GPU time per kind of command, per way programs reach
-//!   memory ([`Traits`]), and the slowest commands with their sizes.
-//!   It needs no GPU timing and takes no lock: a few relaxed atomic adds a
-//!   submission, and swaps at a present.
-//! - The slow-pipeline guard: compute dispatches and mesh draws are timed
-//!   on the GPU (two timestamps each, `HostList::time_start`). A frame
-//!   (present to present) in which one of a pipeline's commands took
-//!   longer than the limit (`VICTORY_SLOW_PIPELINE_MS`, 100 ms) is one
-//!   strike for it, however many of its commands did; a frame in which
-//!   all of its timed commands kept to the limit clears its strikes. The
-//!   first [`WARMUP`] frames after a pipeline is first timed are no
-//!   strikes (first-use hitches). After [`STRIKES`] over-limit frames in a
-//!   row the pipeline is banned, said once: draws and dispatches of it
-//!   recorded from then on are dropped (`State::bind`). Lists recorded
-//!   before still hold its commands and run them each time they are
-//!   submitted again; submission does not bind again. After [`COOLDOWN`]
-//!   it is tried again (said once); still over the limit [`STRIKES`]
-//!   frames in a row, it is banned again for twice as long (up to
-//!   [`COOLDOWN_MAX`]); a frame within the limit keeps it. A submission
-//!   cannot be stopped once it runs, and one the host takes 2 s for resets
-//!   the device; a frame of a second stalls the title's world. The work
-//!   the guard drops is the title's, so what it computes is missing (a
-//!   pass's effect, or what later passes read from it): visible, logged,
-//!   and better than a world stopped or lost. `VICTORY_SLOW_PIPELINES=0`
-//!   turns it off: nothing is timed (no query heaps, no read-backs) and
-//!   its lock is never taken.
+//! A report of each frame past [`REPORT`], at most one line a second: what
+//! bound it and why ([`cause`]), and where its time went (the GPU, our work
+//! around submissions ([`Phases`]), pipeline waits, and the rest). With
+//! commands timed (`VICTORY_FRAME_TIMING=1`), also the GPU time per kind of
+//! command and per way programs reach memory ([`Traits`]), and the slowest
+//! commands.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Frames longer than this are reported (a frame at 30 a second is
-/// 33.3 ms; past this one has slipped).
+/// Frames longer than this are reported.
 pub(crate) const REPORT: Duration = Duration::from_millis(50);
-/// Over-limit frames in a row before a pipeline is banned.
-pub(crate) const STRIKES: u32 = 3;
-/// Frames after a pipeline is first timed that are no strikes for it. Its
-/// first runs may pay for work the driver defers to first use (shader
-/// compilation and caches) and for memory first made resident; that is
-/// over within a few frames, while a pipeline slow for its own work stays
-/// slow after. Ten frames are a third of a second at 30 a second, ten
-/// seconds at the one a second a world takes today.
-pub(crate) const WARMUP: u64 = 10;
-/// How long a first ban lasts before the pipeline is tried again: long
-/// enough that a pipeline slow for good costs [`STRIKES`] slow frames a
-/// minute at most, short enough that one slow for a while (a heavy scene,
-/// a busy host) comes back within the minute.
-pub(crate) const COOLDOWN: Duration = Duration::from_secs(60);
-/// The longest ban: each ban after a retry doubles the last, up to this
-/// (60 s, 2, 4, 8, then 16 min): a pipeline slow for good then costs
-/// [`STRIKES`] slow frames each 16 minutes, and one that becomes quick
-/// (another scene) runs again within them.
-pub(crate) const COOLDOWN_MAX: Duration = Duration::from_secs(16 * 60);
-/// The limit for one command without `VICTORY_SLOW_PIPELINE_MS`.
-const LIMIT_MS: f64 = 100.0;
 /// Slowest commands kept per frame for its report.
 const SLOWEST: usize = 3;
 
-/// The guard's settings, read once: on, and its limit for one command in
-/// ms.
-fn settings() -> (bool, f64) {
-    static SETTINGS: OnceLock<(bool, f64)> = OnceLock::new();
-    *SETTINGS.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_SLOW_PIPELINES").is_none_or(|v| v != "0");
-        let limit = std::env::var("VICTORY_SLOW_PIPELINE_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<f64>().ok())
-            .filter(|&ms| ms > 0.0)
-            .unwrap_or(LIMIT_MS);
-        if on {
-            tracing::info!(limit_ms = limit, strikes = STRIKES, "slow-pipeline guard");
-        }
-        (on, limit)
-    })
-}
-
-/// Whether the guard is on: 0 not read yet, 1 off, 2 on.
+/// Whether commands are timed: 0 not read yet, 1 off, 2 on.
 static ON: AtomicU8 = AtomicU8::new(0);
 
-/// Whether commands are timed (the guard is on): one relaxed load once
-/// the setting was read.
+/// Whether commands are timed (`VICTORY_FRAME_TIMING=1`).
 pub(crate) fn timing() -> bool {
     match ON.load(Ordering::Relaxed) {
         0 => {
-            let on = settings().0;
+            let on = std::env::var_os("VICTORY_FRAME_TIMING").is_some_and(|v| v == "1");
             let _ = ON.compare_exchange(0, 1 + u8::from(on), Ordering::Relaxed, Ordering::Relaxed);
             ON.load(Ordering::Relaxed) == 2
         }
         v => v == 2,
     }
-}
-
-/// The guard's limit for one command, in ms.
-pub(crate) fn limit() -> f64 {
-    settings().1
 }
 
 /// What a timed command was, in terms of any title: what kind of command,
@@ -241,8 +167,6 @@ struct Report {
     submissions: AtomicU32,
     /// Waits for pipelines being made, in µs.
     waited_us: AtomicU64,
-    /// Draws and dispatches the guard dropped.
-    skipped: AtomicU32,
     /// The end of the last frame, and of the last report: µs from
     /// [`epoch`], plus one (0: none yet).
     last: AtomicU64,
@@ -258,7 +182,6 @@ struct Slow {
     phases: Phases,
     submissions: u32,
     waited: Duration,
-    skipped: u32,
     /// Slow frames not reported since the last report.
     others: u32,
 }
@@ -283,7 +206,6 @@ impl Report {
             copy_back_us: AtomicU64::new(0),
             submissions: AtomicU32::new(0),
             waited_us: AtomicU64::new(0),
-            skipped: AtomicU32::new(0),
             last: AtomicU64::new(0),
             reported: AtomicU64::new(0),
             unreported: AtomicU32::new(0),
@@ -319,7 +241,6 @@ impl Report {
         };
         let waited = micros(&self.waited_us);
         let submissions = self.submissions.swap(0, Ordering::Relaxed);
-        let skipped = self.skipped.swap(0, Ordering::Relaxed);
         if last == 0 {
             return None;
         }
@@ -339,7 +260,6 @@ impl Report {
             phases,
             submissions,
             waited,
-            skipped,
             others,
         })
     }
@@ -358,7 +278,7 @@ impl Report {
         ] {
             a.store(0, Ordering::Relaxed);
         }
-        for a in [&self.submissions, &self.skipped, &self.unreported] {
+        for a in [&self.submissions, &self.unreported] {
             a.store(0, Ordering::Relaxed);
         }
     }
@@ -366,177 +286,19 @@ impl Report {
 
 static FRAME: Report = Report::new();
 
-/// The slow-pipeline guard's state; only used while it is on.
-#[derive(Default)]
-struct Guard {
-    /// Frames presented while the guard is on: the warm-up's clock.
-    frames: u64,
-    /// The frame each pipeline was first timed in.
-    seen: HashMap<String, u64>,
-    /// Over-limit frames in a row per pipeline (none: no strikes).
-    strikes: HashMap<String, u32>,
-    /// Pipelines whose draws and dispatches are dropped when recorded.
-    banned: HashMap<String, Ban>,
-    /// Pipelines tried again after a ban, with that ban's length: banned
-    /// again for twice as long if still slow, kept (and forgotten) after a
-    /// frame within the limit.
-    retried: HashMap<String, Duration>,
-    /// The pipelines timed this frame (not banned ones), each with its
-    /// slowest command's ms.
-    timed: HashMap<String, f64>,
-    /// The frame's timed commands, for its report.
-    gpu: Breakdown,
-}
+/// The frame's timed commands, while commands are timed.
+static GPU: Mutex<Option<Breakdown>> = Mutex::new(None);
 
-/// A ban: until when, and how long it is.
-#[derive(Debug, PartialEq)]
-struct Ban {
-    until: Instant,
-    cooldown: Duration,
-}
-
-impl Guard {
-    /// A timed command of `pipeline` took `ms` on the GPU. Strikes are
-    /// counted when the frame ends.
-    fn ran(&mut self, pipeline: &str, ms: f64) {
-        if self.banned.contains_key(pipeline) {
-            return;
-        }
-        match self.timed.get_mut(pipeline) {
-            Some(slowest) => *slowest = slowest.max(ms),
-            None => {
-                self.timed.insert(pipeline.to_owned(), ms);
-            }
-        }
-    }
-
-    /// A frame ended at `now`, with commands over `limit` ms or not: one
-    /// strike for each pipeline with a command over it (not in its
-    /// warm-up), none left for those whose timed commands all kept to it.
-    /// A pipeline at [`STRIKES`] is banned; bans that ended are retried.
-    /// What the frame's timed commands took.
-    fn presented(&mut self, now: Instant, limit: f64) -> Breakdown {
-        let frame = self.frames;
-        self.frames += 1;
-        let mut timed = std::mem::take(&mut self.timed);
-        for (pipeline, ms) in timed.drain() {
-            let first = match self.seen.get(&pipeline) {
-                Some(&first) => first,
-                None => {
-                    self.seen.insert(pipeline.clone(), frame);
-                    frame
-                }
-            };
-            if frame - first < WARMUP {
-                continue;
-            }
-            if ms <= limit {
-                self.strikes.remove(&pipeline);
-                self.retried.remove(&pipeline);
-                continue;
-            }
-            let strikes = self.strikes.entry(pipeline.clone()).or_default();
-            *strikes += 1;
-            if *strikes < STRIKES {
-                continue;
-            }
-            self.strikes.remove(&pipeline);
-            let cooldown = match self.retried.remove(&pipeline) {
-                Some(last) => {
-                    let cooldown = (2 * last).min(COOLDOWN_MAX);
-                    tracing::warn!(
-                        pipeline,
-                        ms = format_args!("{ms:.0}"),
-                        limit_ms = limit,
-                        retry_s = cooldown.as_secs(),
-                        "a pipeline tried again is still too slow on this host: dropped again, \
-                         for longer"
-                    );
-                    cooldown
-                }
-                None => {
-                    tracing::warn!(
-                        pipeline,
-                        ms = format_args!("{ms:.0}"),
-                        limit_ms = limit,
-                        frames = STRIKES,
-                        retry_s = COOLDOWN.as_secs(),
-                        "a pipeline too slow on this host is dropped from draws and dispatches \
-                         recorded from now on, until it is tried again; lists recorded before \
-                         still run it (VICTORY_SLOW_PIPELINES=0 keeps it): what it computes is \
-                         missing"
-                    );
-                    COOLDOWN
-                }
-            };
-            let until = now + cooldown;
-            self.banned.insert(pipeline, Ban { until, cooldown });
-        }
-        // The next frame keeps the map's room.
-        self.timed = timed;
-        let retried = &mut self.retried;
-        self.banned.retain(|pipeline, ban| {
-            if ban.until > now {
-                return true;
-            }
-            tracing::info!(
-                pipeline,
-                banned_s = ban.cooldown.as_secs(),
-                "a pipeline dropped as too slow is tried again"
-            );
-            retried.insert(pipeline.clone(), ban.cooldown);
-            false
-        });
-        std::mem::take(&mut self.gpu)
-    }
-}
-
-static GUARD: Mutex<Option<Guard>> = Mutex::new(None);
-/// Whether any pipeline is banned (the check on every bind is then free).
-static ANY_BANNED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(test)]
-thread_local! {
-    /// Times this thread took the guard's lock.
-    static LOCKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-fn guard<R>(f: impl FnOnce(&mut Guard) -> R) -> R {
-    #[cfg(test)]
-    LOCKED.with(|n| n.set(n.get() + 1));
-    let mut held = GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    let g = held.get_or_insert_with(Guard::default);
-    let r = f(g);
-    ANY_BANNED.store(!g.banned.is_empty(), Ordering::Relaxed);
-    r
-}
-
-/// Whether the guard dropped `pipeline` (and counts the draw or dispatch
-/// not run). Asked while recording: commands already in a closed list
-/// run whenever it is submitted.
-pub(crate) fn skips(pipeline: &str) -> bool {
-    if !ANY_BANNED.load(Ordering::Relaxed) {
-        return false;
-    }
-    let banned = guard(|g| g.banned.contains_key(pipeline));
-    if banned {
-        FRAME.skipped.fetch_add(1, Ordering::Relaxed);
-    }
-    banned
-}
-
-/// A list's timed commands ran: each one and its GPU time in ms. Strikes
-/// are counted when the frame ends ([`presented`]).
+/// A list's timed commands ran: each one and its GPU time in ms.
 pub(crate) fn ran(timed: Vec<(Command, f64)>) {
     if timed.is_empty() || !timing() {
         return;
     }
-    guard(|g| {
-        for (command, ms) in timed {
-            g.gpu.add(&command, ms);
-            g.ran(&command.pipeline, ms);
-        }
-    });
+    let mut gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let gpu = gpu.get_or_insert_with(Breakdown::default);
+    for (command, ms) in timed {
+        gpu.add(&command, ms);
+    }
 }
 
 /// Keeps the [`SLOWEST`] slowest commands of a frame, slowest first.
@@ -642,7 +404,7 @@ pub(crate) fn presented() {
     let now = Instant::now();
     let timed = timing();
     let gpu = if timed {
-        guard(|g| g.presented(now, limit()))
+        GPU.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default()
     } else {
         Breakdown::default()
     };
@@ -682,7 +444,6 @@ pub(crate) fn presented() {
         ?gpu_by_kind,
         ?gpu_by_trait,
         ?slowest,
-        skipped = slow.skipped,
         other_slow_frames = slow.others,
         "slow frame"
     );
@@ -694,17 +455,16 @@ pub(crate) mod tests {
     use windows::Win32::Graphics::Direct3D12::{ID3D12PipelineState, ID3D12RootSignature};
     use windows::core::Interface;
 
-    /// The tests share the guard: one at a time (`crate::draw`'s too).
+    /// The tests share the timing switch: one at a time.
     pub(crate) static ONE: Mutex<()> = Mutex::new(());
 
-    /// Clears the guard and the frame (tests share the process).
+    /// Clears the breakdown and the frame (tests share the process).
     pub(crate) fn reset() {
-        *GUARD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        ANY_BANNED.store(false, Ordering::Relaxed);
+        *GPU.lock().unwrap_or_else(|e| e.into_inner()) = None;
         FRAME.clear();
     }
 
-    /// The guard on or off until dropped (then as before); hold [`ONE`].
+    /// Timing on or off until dropped (then as before); hold [`ONE`].
     pub(crate) struct Switched(u8);
 
     pub(crate) fn switch(on: bool) -> Switched {
@@ -718,194 +478,23 @@ pub(crate) mod tests {
         }
     }
 
-    /// Bans `pipeline` through the guard's calls: its warm-up, then
-    /// [`STRIKES`] frames over the limit.
-    pub(crate) fn ban(pipeline: &str) {
-        for _ in 0..WARMUP + u64::from(STRIKES) {
-            ran(vec![(Command::compute(pipeline), limit() + 1.0)]);
-            presented();
-        }
-    }
-
-    const LIMIT: f64 = 100.0;
-    const SLOW: f64 = LIMIT + 1.0;
-    const QUICK: f64 = LIMIT / 2.0;
-
-    /// A frame of `g` ending at `now` in which `pipeline` ran commands of
-    /// `ms` each.
-    fn frame_at(g: &mut Guard, now: Instant, pipeline: &str, ms: &[f64]) {
-        for &ms in ms {
-            g.ran(pipeline, ms);
-        }
-        g.presented(now, LIMIT);
-    }
-
-    /// A guard past `pipeline`'s warm-up, its frames quick.
-    fn warm(pipeline: &str, now: Instant) -> Guard {
-        let mut g = Guard::default();
-        for _ in 0..WARMUP {
-            frame_at(&mut g, now, pipeline, &[QUICK]);
-        }
-        g
-    }
-
-    /// The first [`WARMUP`] frames after a pipeline is first timed are no
-    /// strikes, however slow; the frames after are.
+    /// With timing off nothing is timed: no breakdown is kept, and a list
+    /// asked to time a command makes no query heap.
     #[test]
-    fn no_strikes_during_the_warm_up() {
-        let now = Instant::now();
-        let mut g = Guard::default();
-        frame_at(&mut g, now, "[compute other]", &[QUICK]);
-        for _ in 0..WARMUP {
-            frame_at(&mut g, now, "[compute first]", &[SLOW, SLOW]);
-        }
-        assert!(g.strikes.is_empty() && g.banned.is_empty(), "warming up");
-        for _ in 0..STRIKES - 1 {
-            frame_at(&mut g, now, "[compute first]", &[SLOW]);
-        }
-        assert!(!g.banned.contains_key("[compute first]"));
-        frame_at(&mut g, now, "[compute first]", &[SLOW]);
-        assert!(g.banned.contains_key("[compute first]"), "after the warm-up");
-    }
-
-    /// Commands over the limit in one frame are one strike, however many:
-    /// a pipeline is not banned in the frame its commands first ran slow.
-    #[test]
-    fn slow_commands_in_one_frame_are_one_strike() {
-        let now = Instant::now();
-        let mut g = warm("[compute slow]", now);
-        frame_at(&mut g, now, "[compute slow]", &[SLOW; STRIKES as usize]);
-        assert!(!g.banned.contains_key("[compute slow]"), "one frame, one strike");
-        assert_eq!(g.strikes["[compute slow]"], 1);
-    }
-
-    /// A frame in which all of a pipeline's commands kept to the limit
-    /// clears its strikes (a one-off hitch does not add up), and frames in
-    /// which it did not run leave them.
-    #[test]
-    fn a_frame_within_the_limit_clears_the_strikes() {
-        let now = Instant::now();
-        let mut g = warm("[compute hitch]", now);
-        frame_at(&mut g, now, "[compute hitch]", &[SLOW]);
-        frame_at(&mut g, now, "[compute hitch]", &[QUICK, QUICK]);
-        for _ in 0..STRIKES - 1 {
-            frame_at(&mut g, now, "[compute hitch]", &[SLOW]);
-            frame_at(&mut g, now, "[compute other]", &[QUICK]);
-        }
-        assert!(!g.banned.contains_key("[compute hitch]"), "slow, quick, slow, slow");
-    }
-
-    /// [`STRIKES`] over-limit frames in a row ban a pipeline at the end of
-    /// the last, not before, and only it, for [`COOLDOWN`]; a frame counts
-    /// as over the limit if any of its commands was.
-    #[test]
-    fn slow_frames_in_a_row_ban_a_pipeline() {
-        let now = Instant::now();
-        let mut g = warm("[compute slow]", now);
-        for _ in 0..STRIKES - 1 {
-            frame_at(&mut g, now, "[compute slow]", &[QUICK, SLOW, QUICK]);
-            frame_at(&mut g, now, "[compute quick]", &[QUICK]);
-        }
-        g.ran("[compute slow]", SLOW);
-        assert!(!g.banned.contains_key("[compute slow]"), "not before the frame ends");
-        g.presented(now, LIMIT);
-        let until = now + COOLDOWN;
-        let ban = Ban {
-            until,
-            cooldown: COOLDOWN,
-        };
-        assert_eq!(g.banned.get("[compute slow]"), Some(&ban));
-        assert!(!g.banned.contains_key("[compute quick]"));
-    }
-
-    /// A banned pipeline is tried again after its cooldown; still slow
-    /// [`STRIKES`] frames in a row, it is banned again for twice as long,
-    /// up to [`COOLDOWN_MAX`].
-    #[test]
-    fn a_ban_ends_and_a_pipeline_still_slow_is_banned_longer() {
-        let p = "[compute slow]";
-        let mut now = Instant::now();
-        let mut g = warm(p, now);
-        let mut cooldown = COOLDOWN;
-        for _ in 0..8 {
-            for _ in 0..STRIKES {
-                frame_at(&mut g, now, p, &[SLOW]);
-            }
-            assert_eq!(g.banned[p].cooldown, cooldown);
-            // Lists recorded before the ban still run it: no strikes.
-            frame_at(&mut g, now + cooldown / 2, p, &[SLOW]);
-            frame_at(&mut g, now + cooldown - Duration::from_millis(1), p, &[SLOW]);
-            assert!(g.banned.contains_key(p), "within the cooldown");
-            assert!(g.strikes.is_empty());
-            now += cooldown;
-            g.presented(now, LIMIT);
-            assert!(!g.banned.contains_key(p), "tried again after {cooldown:?}");
-            assert_eq!(g.retried[p], cooldown);
-            cooldown = (2 * cooldown).min(COOLDOWN_MAX);
-        }
-        assert_eq!(cooldown, COOLDOWN_MAX);
-    }
-
-    /// A pipeline tried again that keeps to the limit stays allowed, and a
-    /// later ban of it starts again at [`COOLDOWN`].
-    #[test]
-    fn a_pipeline_quick_when_tried_again_stays_allowed() {
-        let p = "[compute better]";
-        let mut now = Instant::now();
-        let mut g = warm(p, now);
-        for _ in 0..STRIKES {
-            frame_at(&mut g, now, p, &[SLOW]);
-        }
-        now += COOLDOWN;
-        g.presented(now, LIMIT);
-        assert!(!g.banned.contains_key(p));
-        frame_at(&mut g, now, p, &[SLOW]);
-        frame_at(&mut g, now, p, &[QUICK]);
-        assert!(g.retried.is_empty() && g.strikes.is_empty(), "kept");
-        for _ in 0..100 {
-            now += Duration::from_secs(1);
-            frame_at(&mut g, now, p, &[QUICK]);
-        }
-        assert!(!g.banned.contains_key(p));
-        for _ in 0..STRIKES {
-            frame_at(&mut g, now, p, &[SLOW]);
-        }
-        assert_eq!(g.banned[p].cooldown, COOLDOWN, "a new ban");
-    }
-
-    /// The guard through its calls: a ban is seen by `skips`.
-    #[test]
-    fn a_banned_pipeline_is_skipped() {
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
-        let _on = switch(true);
-        reset();
-        ban("[compute global]");
-        assert!(skips("[compute global]"));
-        assert!(!skips("[compute other]"));
-        reset();
-    }
-
-    /// With the guard off nothing is timed and its lock is never taken:
-    /// not on submissions, waits, presents or binds, and a list asked to
-    /// time a command makes no query heap.
-    #[test]
-    fn the_guard_off_times_nothing_and_takes_no_lock() {
+    fn timing_off_times_nothing() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let _off = switch(false);
         reset();
-        let locked = LOCKED.with(|n| n.get());
-        for _ in 0..WARMUP + u64::from(STRIKES) {
+        for _ in 0..3 {
             submitted(Phases {
                 gpu: Duration::from_millis(1),
                 ..Phases::default()
             });
             waited(Duration::from_millis(1));
             ran(vec![(Command::compute("[compute off]"), 1e6)]);
-            assert!(!skips("[compute off]"));
             presented();
         }
-        assert_eq!(LOCKED.with(|n| n.get()), locked, "the guard's lock taken");
-        assert!(GUARD.lock().unwrap().is_none(), "the guard's state made");
+        assert!(GPU.lock().unwrap().is_none(), "a breakdown kept");
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -914,10 +503,9 @@ pub(crate) mod tests {
         list.close();
         host.execute(&[&list]);
         assert!(list.timestamp_heap().is_none(), "a query heap made");
-        assert_eq!(LOCKED.with(|n| n.get()), locked, "the guard's lock taken");
     }
 
-    /// With the guard on, a list makes its query heap at its first timed
+    /// With timing on, a list makes its query heap at its first timed
     /// command, not before (a list with none never does), and keeps it
     /// across resets.
     #[test]
@@ -1044,7 +632,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         list.close();
         host.execute(&[&list]);
-        let times: HashMap<String, f64> = list
+        let times: std::collections::HashMap<String, f64> = list
             .timed_ms(host.timestamp_frequency())
             .into_iter()
             .map(|(c, ms)| (c.pipeline, ms))
@@ -1080,7 +668,6 @@ void main(uint3 id : SV_DispatchThreadID) {
             phases,
             submissions: 1,
             waited: ms(3),
-            skipped: 0,
             others: 0,
         };
         assert_eq!(r.presented(t + ms(60)), Some(slow));
@@ -1097,7 +684,6 @@ void main(uint3 id : SV_DispatchThreadID) {
             phases,
             submissions: 1,
             waited: Duration::from_millis(waited),
-            skipped: 0,
             others: 0,
         }
     }
