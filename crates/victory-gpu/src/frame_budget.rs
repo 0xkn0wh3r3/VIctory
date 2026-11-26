@@ -469,6 +469,9 @@ impl Guard {
 static GUARD: Mutex<Option<Guard>> = Mutex::new(None);
 /// Whether any pipeline is banned (the check on every bind is then free).
 static ANY_BANNED: AtomicBool = AtomicBool::new(false);
+/// The banned pipelines, for [`skips`]: recording threads read them under
+/// a shared lock, never the guard's.
+static BANNED: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 #[cfg(test)]
 thread_local! {
@@ -482,6 +485,13 @@ fn guard<R>(f: impl FnOnce(&mut Guard) -> R) -> R {
     let mut held = GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let g = held.get_or_insert_with(Guard::default);
     let r = f(g);
+    let changed = {
+        let banned = BANNED.read().unwrap_or_else(|e| e.into_inner());
+        banned.len() != g.banned.len() || banned.iter().any(|p| !g.banned.contains_key(p))
+    };
+    if changed {
+        *BANNED.write().unwrap_or_else(|e| e.into_inner()) = g.banned.keys().cloned().collect();
+    }
     ANY_BANNED.store(!g.banned.is_empty(), Ordering::Relaxed);
     r
 }
@@ -493,7 +503,11 @@ pub(crate) fn skips(pipeline: &str) -> bool {
     if !ANY_BANNED.load(Ordering::Relaxed) {
         return false;
     }
-    let banned = guard(|g| g.banned.contains_key(pipeline));
+    let banned = BANNED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| p == pipeline);
     if banned {
         FRAME.skipped.fetch_add(1, Ordering::Relaxed);
     }
@@ -675,6 +689,7 @@ pub(crate) mod tests {
     /// Clears the guard and the frame (tests share the process).
     pub(crate) fn reset() {
         *GUARD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        BANNED.write().unwrap_or_else(|e| e.into_inner()).clear();
         ANY_BANNED.store(false, Ordering::Relaxed);
         FRAME.clear();
     }
@@ -860,15 +875,18 @@ pub(crate) mod tests {
         assert_eq!(g.banned[p].cooldown, COOLDOWN, "a new ban");
     }
 
-    /// The guard through its calls: a ban is seen by `skips`.
+    /// The guard through its calls: a ban is seen by `skips`, which takes
+    /// no lock of the guard's (recording threads ask it at every bind).
     #[test]
     fn a_banned_pipeline_is_skipped() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let _on = switch(true);
         reset();
         ban("[compute global]");
+        let locked = LOCKED.with(|n| n.get());
         assert!(skips("[compute global]"));
         assert!(!skips("[compute other]"));
+        assert_eq!(LOCKED.with(|n| n.get()), locked, "binds took the guard's lock");
         reset();
     }
 
