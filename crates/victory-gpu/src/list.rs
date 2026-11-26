@@ -655,16 +655,18 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
-            crate::texture::host_writes(list, dst);
             // Two title textures over one memory share one host texture: the
             // copy would be of that texture onto itself, which the host does
             // not allow (the debug layer: CopyResource with its destination
             // in the COPY_SOURCE state, as the two transitions left it), and
-            // it changes nothing. The transitions and the copy are left out.
+            // it changes nothing. The transitions and the copy are left out,
+            // and the texture is not noted as written by the host: it still
+            // shows title memory, whose later CPU writes are uploaded.
             if same_texture(&to, &from) {
                 self_copy(dst, src);
                 return;
             }
+            crate::texture::host_writes(list, dst);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             #[cfg(feature = "diagnostics")]
@@ -809,11 +811,10 @@ extern "system" fn copy_texture_region(
                 Some(b) => [b[0], b[1], b[2]] == [x, y, z],
                 None => [x, y, z] == [0; 3],
             };
-            if in_place {
-                // As a copy would have: what is noted stays as it was.
-                crate::texture::host_writes(list, dst.resource);
-            } else {
-                // Not done, so the destination is not the host's either.
+            // Nothing is written, so the texture is not noted as written by
+            // the host either: it still shows title memory, whose later CPU
+            // writes are uploaded.
+            if !in_place {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     tracing::warn!("a copy to another place in its own subresource is not done");
@@ -2118,8 +2119,10 @@ mod tests {
 
     /// Two title textures over one memory share one host texture. A copy
     /// between them, whole or of one subresource in place, is left out (the
-    /// host refuses a copy of a texture onto itself); one between textures
-    /// over two memories is recorded.
+    /// host refuses a copy of a texture onto itself) and leaves the texture
+    /// showing title memory, not noted as written by the host (which would
+    /// stop the CPU's later writes from being uploaded); one between
+    /// textures over two memories is recorded and noted.
     #[test]
     fn a_copy_between_textures_over_one_memory_is_left_out() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2170,11 +2173,21 @@ mod tests {
             create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
             S_OK
         );
-        let mut list = null;
-        assert_eq!(
-            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
-            S_OK
-        );
+        let new_list = || {
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            list
+        };
+        // Closed and submitted: the notes a list makes land then.
+        let submit = |list: This| {
+            assert_eq!(close(list), S_OK);
+            host.execute(&[host_list(list).expect("a host list")]);
+        };
+        let host_written = |t: This| copy(t).host_written.load(Relaxed);
+        let list = new_list();
         let before = SELF_COPIES.load(Relaxed);
         copy_resource(list, a, b);
         assert_eq!(SELF_COPIES.load(Relaxed), before + 1, "whole");
@@ -2190,17 +2203,22 @@ mod tests {
             before + 2,
             "a subresource in place"
         );
-        copy_resource(list, a, c);
-        copy_texture_region(list, &at(c), 0, 0, 0, &at(a), std::ptr::null());
+        submit(list);
+        assert!(!host_written(a), "left out: still title memory's");
+
+        let other = new_list();
+        copy_resource(other, a, c);
+        copy_texture_region(other, &at(c), 0, 0, 0, &at(a), std::ptr::null());
         assert_eq!(SELF_COPIES.load(Relaxed), before + 2, "two memories");
-        assert_eq!(close(list), S_OK);
+        submit(other);
+        assert!(host_written(a) && host_written(c), "copied: the host's");
         assert_eq!(
             host.log_messages(),
             None,
             "the debug layer saw nothing wrong"
         );
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-        for object in [list, allocator, a, b, c] {
+        for object in [list, other, allocator, a, b, c] {
             release(object);
         }
     }
