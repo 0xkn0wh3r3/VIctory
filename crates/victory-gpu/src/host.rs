@@ -2438,7 +2438,10 @@ impl Batch {
 
     /// Does the refreshes; returns the bytes copied. Their copies of pages
     /// no shader writes are made together at the end, on several threads
-    /// ([`crate::copy_pool`]); the time per range counts only finding them.
+    /// ([`crate::copy_pool`]). With `diagnostics`, the time per range and
+    /// the copied-whole time (`WholeUs`) count only finding and queueing
+    /// them; the copies count in the flush time (`FlushUs`) and, summed
+    /// over the threads, in the move time (`MoveUs`).
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
@@ -2446,18 +2449,17 @@ impl Batch {
         let started = std::time::Instant::now();
         let (total, pieces) = crate::copy_pool::queued(|| self.update_all());
         crate::copy_pool::run(pieces);
-        // Every copy updated is current, so kept alive until here.
-        for (shadow, _, _) in self.current.values() {
+        for (shadow, _, _) in self.refreshes.drain(..) {
             shadow.queued_made();
         }
         PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         total
     }
 
-    /// [`Batch::flush`]'s updates, one per copy.
+    /// [`Batch::flush`]'s updates, one per copy (left in `refreshes`).
     fn update_all(&mut self) -> usize {
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        for &(ref shadow, from, to) in &self.refreshes {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             #[cfg(feature = "diagnostics")]
@@ -2468,8 +2470,8 @@ impl Batch {
             total += copied;
             // Kept: the union with what was current if they touch, else
             // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            let (_, a, b) = self.current.entry(key).or_insert_with(|| (shadow.clone(), from, to));
             if from <= *b && *a <= to {
                 (*a, *b) = ((*a).min(from), (*b).max(to));
             } else if to - from > *b - *a {

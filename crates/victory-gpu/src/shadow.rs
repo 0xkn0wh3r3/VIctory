@@ -136,7 +136,8 @@ fn give_back(v: Vec<u8>) {
 const POOL_BYTES: usize = 512 << 20;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// written on the submitting thread, and by the refresh workers only inside
+// `crate::copy_pool::run`, which the flush waits for before going on.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
