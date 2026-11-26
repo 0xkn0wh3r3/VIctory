@@ -1044,6 +1044,8 @@ fn into_destination(
     // its own, so a read can start first. Read the list again for a few
     // milliseconds before failing: the title never looks at a request's
     // result, so a failed one is a model or texture left unwritten.
+    // The list as last read: one filled late replaces the first reading.
+    let mut list = pages;
     if pages.contains(&0) {
         for _ in 0..LATE_LIST_TRIES {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1051,6 +1053,7 @@ fn into_destination(
             let again = unsafe {
                 std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
             };
+            list = again;
             if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
                 let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
                 if late.is_power_of_two() {
@@ -1066,10 +1069,11 @@ fn into_destination(
     // Every page known and still not written: the host refused a view of
     // them (address space or commit short for a moment while a load maps
     // many at once). Tried again a few times, waiting longer each time,
-    // before the request fails; unknown pages fail at once.
-    if super::xmem::unknown_pages(pages) == 0
+    // before the request fails; unknown pages fail at once. The list as
+    // last read: a late one that filled in but met a refusal is retried.
+    if super::xmem::unknown_pages(list) == 0
         && let Some(tries) = with_retries(HOST_RETRIES, std::thread::sleep, || {
-            super::xmem::write_physical(pages, offset, &data[..n])
+            super::xmem::write_physical(list, offset, &data[..n])
         })
     {
         let retried = HOST_RETRIED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1086,8 +1090,8 @@ fn into_destination(
         offset,
         len,
         pages = pages.len(),
-        unknown = super::xmem::unknown_pages(pages),
-        list = format_args!("{:x?}", &pages[..pages.len().min(8)]),
+        unknown = super::xmem::unknown_pages(list),
+        list = format_args!("{:x?}", &list[..list.len().min(8)]),
         options = format_args!("{:#x}", request.options),
         file = source_name(request),
         file_offset = request.offset,
