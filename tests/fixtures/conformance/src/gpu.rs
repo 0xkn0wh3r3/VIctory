@@ -334,10 +334,14 @@ struct Costs {
     /// lists closed, run and waited for; the rest of `frame` is recording.
     submit: Duration,
     /// Of `submit`: Close, ExecuteCommandLists, and Signal with the wait
-    /// for the fence (SetEventOnCompletion with no event).
+    /// for the fence (SetEventOnCompletion with no event; the checked
+    /// frames only, read back right after).
     close: Duration,
     execute: Duration,
     signal_wait: Duration,
+    /// Waiting for the GPU to finish the frame that last used this frame's
+    /// allocator, constants and views ([`FRAMES`] in flight).
+    in_flight: Duration,
     /// PresentX.
     present: Duration,
     /// Waiting for the next frame tick (WaitFrameEventX).
@@ -354,6 +358,7 @@ impl Costs {
             close: self.close - earlier.close,
             execute: self.execute - earlier.execute,
             signal_wait: self.signal_wait - earlier.signal_wait,
+            in_flight: self.in_flight - earlier.in_flight,
             present: self.present - earlier.present,
             wait: self.wait - earlier.wait,
         }
@@ -364,16 +369,17 @@ impl Costs {
         let ms = |d: Duration| d.as_secs_f64() * 1000.0 / frames.max(1) as f64;
         let record = self
             .frame
-            .saturating_sub(self.constants + self.views + self.submit);
+            .saturating_sub(self.constants + self.views + self.submit + self.in_flight);
         format!(
             "VIctory {:.2} ms a frame: submissions {:.2} (Close {:.2}, ExecuteCommandLists {:.2}, \
-             Signal and fence wait {:.2}), views {:.2}, constants {:.2}, recording {:.2}, \
-             present {:.2}; waiting for the frame tick {:.2}",
+             Signal and fence wait {:.2}), waiting for a frame in flight {:.2}, views {:.2}, \
+             constants {:.2}, recording {:.2}, present {:.2}; waiting for the frame tick {:.2}",
             ms(self.frame + self.present),
             ms(self.submit),
             ms(self.close),
             ms(self.execute),
             ms(self.signal_wait),
+            ms(self.in_flight),
             ms(self.views),
             ms(self.constants),
             ms(record),
@@ -393,16 +399,23 @@ struct Gpu {
     /// Whether the terrain is drawn (the demo's window; never the checked
     /// frame, which the reference draws without it).
     scenery: bool,
-    /// Whether the texture shown was last left in the state for presenting.
-    shown_common: bool,
     /// Whether the copy list has been closed once (it starts open).
     copy_closed: bool,
     /// Where the window's frames spend their time.
     costs: Costs,
     device: Obj,
     queue: Obj,
-    allocators: [Obj; 2],
-    lists: [Obj; 2],
+    /// The frames in flight ([`FRAMES`] in the window, one for the checked
+    /// frames), and the one being drawn.
+    contexts: Vec<Context>,
+    at: usize,
+    /// Per frame context: constant bytes and views (each context has its
+    /// own, from `at` times these).
+    region: u64,
+    block: u64,
+    /// The list that copies the compute output to the read-back buffer.
+    copy_allocator: Obj,
+    copy_list: Obj,
     fence: Obj,
     fence_value: u64,
     views: Obj,
@@ -418,6 +431,9 @@ struct Gpu {
     compute_root: Obj,
     graphics: Obj,
     compute: Obj,
+    /// The compute pass of frames only shown: the texture shown, not the
+    /// buffer (null for the checked frames).
+    compute_shown: Obj,
     vertices: Obj,
     indices: Obj,
     constants: Obj,
@@ -429,13 +445,32 @@ struct Gpu {
     sky_upload: Obj,
     target: Obj,
     depth: Obj,
-    shown: Obj,
     output: Obj,
     readback: Obj,
     geometry: scene::Geometry,
     /// The shader containers (pipelines point at them while created).
-    _shaders: [Vec<u8>; 3],
+    _shaders: [Vec<u8>; 4],
 }
+
+/// One frame in flight: what the CPU writes and records for a frame while
+/// the GPU may still run the one before.
+struct Context {
+    allocator: Obj,
+    list: Obj,
+    /// Whether the list is open (it starts open).
+    open: bool,
+    /// The fence value its last frame signalled (0: none yet).
+    pending: u64,
+    /// The texture its frames are presented from, and whether it was left
+    /// in the state for presenting.
+    shown: Obj,
+    shown_common: bool,
+}
+
+/// Frames the window keeps in flight, as a title does with its swap
+/// chain: the CPU records a frame while the GPU runs the one before, each
+/// with its own allocator, list, constants, views and texture shown.
+const FRAMES: usize = 2;
 
 const VIEW_SIZE: u64 = 32;
 
@@ -529,17 +564,10 @@ impl Gpu {
         call!(list, 0xd0, fn(u32, *const Barrier) -> u32, 1, &b);
     }
 
-    /// Closes list `n`, runs it and waits for it with the fence; whether the
-    /// fence reached the value signalled.
-    fn submit(&mut self, n: usize) -> (Hresult, bool) {
-        let started = Instant::now();
-        let run = self.submit_untimed(n);
-        self.costs.submit += started.elapsed();
-        run
-    }
-
-    fn submit_untimed(&mut self, n: usize) -> (Hresult, bool) {
-        let list = self.lists[n];
+    /// Closes `list` and runs it. `wait` (the checked frames, read back
+    /// right after): signals the fence and waits for it; whether it reached
+    /// the value signalled. Else the list runs on while the CPU goes on.
+    fn submit(&mut self, list: Obj, wait: bool) -> (Hresult, bool) {
         let started = Instant::now();
         let hr = call!(list, 0x48, fn() -> Hresult,);
         let closed = Instant::now();
@@ -547,6 +575,19 @@ impl Gpu {
         let executed = Instant::now();
         self.costs.close += closed - started;
         self.costs.execute += executed - closed;
+        let mut done = true;
+        if wait {
+            let value = self.signal();
+            self.wait_for(value);
+            done = call!(self.fence, 0x40, fn() -> u64,) >= value;
+            self.costs.signal_wait += executed.elapsed();
+        }
+        self.costs.submit += started.elapsed();
+        (hr, done)
+    }
+
+    /// Signals the next fence value on the queue: the value.
+    fn signal(&mut self) -> u64 {
         self.fence_value += 1;
         call!(
             self.queue,
@@ -555,28 +596,62 @@ impl Gpu {
             self.fence,
             self.fence_value
         );
+        self.fence_value
+    }
+
+    /// Waits until the fence reaches `value` (at once if it has).
+    fn wait_for(&self, value: u64) {
+        if call!(self.fence, 0x40, fn() -> u64,) >= value {
+            return;
+        }
         // A null event: wait here until the fence reaches the value.
         call!(
             self.fence,
             0x48,
             fn(u64, *mut c_void) -> Hresult,
-            self.fence_value,
+            value,
             std::ptr::null_mut()
         );
-        let done = call!(self.fence, 0x40, fn() -> u64,);
-        self.costs.signal_wait += executed.elapsed();
-        (hr, done >= self.fence_value)
     }
 
-    fn reset(&self, n: usize, pipeline: Obj) -> Hresult {
-        call!(self.allocators[n], 0x40, fn() -> Hresult,);
+    /// The list of the frame being drawn, reset with its allocator once the
+    /// GPU is done with the frame that used them last.
+    fn begin_context(&mut self) -> Obj {
+        let started = Instant::now();
+        let pending = self.contexts[self.at].pending;
+        self.wait_for(pending);
+        self.costs.in_flight += started.elapsed();
+        let c = &mut self.contexts[self.at];
+        if !c.open {
+            call!(c.allocator, 0x40, fn() -> Hresult,);
+            call!(
+                c.list,
+                0x50,
+                fn(Obj, Obj) -> Hresult,
+                c.allocator,
+                std::ptr::null_mut::<c_void>()
+            );
+            c.open = true;
+        }
+        c.list
+    }
+
+    /// Records on: `list` again after its submission, with the same
+    /// allocator (reset only once its frame is done).
+    fn reopen(&self, list: Obj) {
+        let allocator = self.contexts[self.at].allocator;
         call!(
-            self.lists[n],
+            list,
             0x50,
             fn(Obj, Obj) -> Hresult,
-            self.allocators[n],
-            pipeline
-        )
+            allocator,
+            std::ptr::null_mut::<c_void>()
+        );
+    }
+
+    /// The table of views from view `n` of the frame being drawn.
+    fn table(&self, n: u64) -> u64 {
+        self.view_gpu + (self.at as u64 * self.block + n) * VIEW_SIZE
     }
 }
 
@@ -693,10 +768,13 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         &mut queue
     );
     t.eq(hr, S_OK, "gpu: CreateCommandQueue");
-    let mut allocators = [std::ptr::null_mut(); 2];
-    let mut lists = [std::ptr::null_mut(); 2];
+    // A draw list per frame in flight (one for the checked frames), and the
+    // copy list.
+    let frames = if scenery { FRAMES } else { 1 };
+    let mut allocators = vec![std::ptr::null_mut(); frames + 1];
+    let mut lists = vec![std::ptr::null_mut(); frames + 1];
     let mut made = 0;
-    for n in 0..2 {
+    for n in 0..=frames {
         made += i32::from(
             call!(
                 device,
@@ -721,9 +799,10 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
             ) == S_OK,
         );
     }
+    let lists_made = 2 * (frames + 1) as i32;
     t.eq(
         made,
-        4,
+        lists_made,
         "gpu: CreateCommandAllocator and CreateCommandList, twice",
     );
     let mut fence = std::ptr::null_mut();
@@ -737,7 +816,7 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         &mut fence
     );
     t.eq(hr, S_OK, "gpu: CreateFence");
-    if queue.is_null() || fence.is_null() || made != 4 {
+    if queue.is_null() || fence.is_null() || made != lists_made {
         return None;
     }
 
@@ -780,7 +859,13 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
     let shaders = [
         crate::gfx10::vertex_container(),
         crate::gfx10::pixel_container(),
-        crate::gfx10::compute_container(width),
+        crate::gfx10::compute_container(width, true),
+        // The window's frames are only shown: no buffer written.
+        if scenery {
+            crate::gfx10::compute_container(width, false)
+        } else {
+            Vec::new()
+        },
     ];
     // The graphics pipeline, as a stream.
     let names = [c"POSITION", c"NORMAL", c"TEXCOORD"];
@@ -850,20 +935,52 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         &mut compute
     );
     t.eq(hr, S_OK, "gpu: CreateComputePipelineState");
+    let mut compute_shown = std::ptr::null_mut();
+    if scenery {
+        let desc = ComputeDesc {
+            code: shaders[3].as_ptr(),
+            size: shaders[3].len(),
+            ..desc
+        };
+        let hr = call!(
+            device,
+            0x58,
+            fn(*const ComputeDesc, *const Guid, *mut Obj) -> Hresult,
+            &desc,
+            &PIPELINE,
+            &mut compute_shown
+        );
+        if hr != S_OK || compute_shown.is_null() {
+            return None;
+        }
+    }
 
     let null = std::ptr::null_mut();
+    let contexts = (0..frames)
+        .map(|n| Context {
+            allocator: allocators[n],
+            list: lists[n],
+            open: true,
+            pending: 0,
+            shown: null,
+            shown_common: false,
+        })
+        .collect();
     let mut g = Gpu {
         width,
         height,
         scale,
         scenery,
-        shown_common: false,
         copy_closed: false,
         costs: Costs::default(),
         device,
         queue,
-        allocators,
-        lists,
+        contexts,
+        at: 0,
+        region: 256 * (SLOTS + extra_draws(scale)) as u64,
+        block: VIEWS + extra_draws(scale) as u64,
+        copy_allocator: allocators[frames],
+        copy_list: lists[frames],
         fence,
         fence_value: 0,
         views: null,
@@ -879,6 +996,7 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         compute_root,
         graphics,
         compute,
+        compute_shown,
         vertices: null,
         indices: null,
         constants: null,
@@ -889,23 +1007,17 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         sky_upload: null,
         target: null,
         depth: null,
-        shown: null,
         output: null,
         readback: null,
         geometry: scene::Geometry::new(),
         _shaders: shaders,
     };
 
-    // Descriptor heaps: views (0 scene constants, 1-4 the draws', 5 the
-    // texture, 6 the frame, 7 the texture shown, 8 the read-back buffer),
-    // one sampler, one render target, one depth buffer.
-    g.views = g.heap(
-        t,
-        0,
-        VIEWS as u32 + extra_draws(scale) as u32,
-        true,
-        "views",
-    );
+    // Descriptor heaps: views, a block for each frame in flight (0 scene
+    // constants, 1-4 the draws', 5 the texture, 6 the frame, 7 the texture
+    // shown, 8 the read-back buffer, the window's from 9, the stress
+    // scale's from VIEWS), one sampler, one render target, one depth buffer.
+    g.views = g.heap(t, 0, (g.block * frames as u64) as u32, true, "views");
     g.samplers = g.heap(t, 1, 1, true, "samplers");
     g.targets = g.heap(t, 2, 1, false, "render targets");
     g.depths = g.heap(t, 3, 1, false, "depth");
@@ -952,7 +1064,7 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
     g.constants = g.resource(
         t,
         2,
-        buffer(256 * (SLOTS + extra_draws(scale)) as u64, 0),
+        buffer(g.region * frames as u64, 0),
         GENERIC_READ,
         None,
         "constant buffer",
@@ -1019,14 +1131,16 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         }),
         "depth buffer",
     );
-    g.shown = g.resource(
-        t,
-        1,
-        texture(width, height, RGBA8, 4),
-        UNORDERED,
-        None,
-        "texture shown",
-    );
+    for n in 0..frames {
+        g.contexts[n].shown = g.resource(
+            t,
+            1,
+            texture(width, height, RGBA8, 4),
+            UNORDERED,
+            None,
+            "texture shown",
+        );
+    }
     g.output = g.resource(
         t,
         1,
@@ -1051,11 +1165,10 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         g.texture,
         g.target,
         g.depth,
-        g.shown,
         g.output,
         g.readback,
     ];
-    if all.iter().any(|r| r.is_null()) {
+    if all.iter().any(|r| r.is_null()) || g.contexts.iter().any(|c| c.shown.is_null()) {
         return None;
     }
     let write = |r: Obj, bytes: &[u8]| {
@@ -1100,90 +1213,93 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
         return None;
     }
 
-    // Views.
-    let view = |n: u64| g.view_cpu + n * VIEW_SIZE;
-    let constants = Gpu::address(g.constants);
-    for n in 0..5 {
-        let desc = [constants + 256 * n, 256];
-        call!(device, 0x88, fn(*const [u64; 2], u64), &desc, view(n));
-    }
-    // The window's terrain (slot 5) and backdrop (slot 6), and its sky.
-    if scenery {
-        for (slot, at) in [(5, TERRAIN_VIEW), (6, BACKDROP_VIEW)] {
-            let desc = [constants + 256 * slot, 256];
-            call!(device, 0x88, fn(*const [u64; 2], u64), &desc, view(at));
+    // Views: each frame in flight's own block, of its own constants and
+    // its texture shown.
+    for k in 0..frames as u64 {
+        let view = |n: u64| g.view_cpu + (k * g.block + n) * VIEW_SIZE;
+        let constants = Gpu::address(g.constants) + k * g.region;
+        for n in 0..5 {
+            let desc = [constants + 256 * n, 256];
+            call!(device, 0x88, fn(*const [u64; 2], u64), &desc, view(n));
         }
-        for n in 0..MAIN_MAX as u64 {
-            let desc = [constants + 256 * (MAIN_SLOT as u64 + n), 256];
+        // The window's terrain (slot 5) and backdrop (slot 6), and its sky.
+        if scenery {
+            for (slot, at) in [(5, TERRAIN_VIEW), (6, BACKDROP_VIEW)] {
+                let desc = [constants + 256 * slot, 256];
+                call!(device, 0x88, fn(*const [u64; 2], u64), &desc, view(at));
+            }
+            for n in 0..MAIN_MAX as u64 {
+                let desc = [constants + 256 * (MAIN_SLOT as u64 + n), 256];
+                call!(
+                    device,
+                    0x88,
+                    fn(*const [u64; 2], u64),
+                    &desc,
+                    view(MAIN_VIEW + n)
+                );
+            }
+            let srv = [RGBA8, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
             call!(
                 device,
-                0x88,
-                fn(*const [u64; 2], u64),
-                &desc,
-                view(MAIN_VIEW + n)
+                0x90,
+                fn(Obj, *const [u32; 10], u64),
+                g.sky,
+                &srv,
+                view(SKY_VIEW)
             );
         }
+        // Format, 2D, the default component mapping, then (from 16 bytes)
+        // the most detailed level 0 and one level.
         let srv = [RGBA8, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
         call!(
             device,
             0x90,
             fn(Obj, *const [u32; 10], u64),
-            g.sky,
+            g.texture,
             &srv,
-            view(SKY_VIEW)
+            view(5)
+        );
+        call!(
+            device,
+            0x90,
+            fn(Obj, *const [u32; 10], u64),
+            g.target,
+            &srv,
+            view(6)
+        );
+        let uav = [RGBA8, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        call!(
+            device,
+            0x98,
+            fn(Obj, Obj, *const [u32; 10], u64),
+            g.contexts[k as usize].shown,
+            std::ptr::null_mut(),
+            &uav,
+            view(7)
+        );
+        // Raw: R32 elements, the raw flag.
+        let raw = [
+            R32_TYPELESS,
+            1,
+            0,
+            0,
+            (frame_bytes(width, height) / 4) as u32,
+            0,
+            0,
+            0,
+            1,
+            0,
+        ];
+        call!(
+            device,
+            0x98,
+            fn(Obj, Obj, *const [u32; 10], u64),
+            g.output,
+            std::ptr::null_mut(),
+            &raw,
+            view(8)
         );
     }
-    // Format, 2D, the default component mapping, then (from 16 bytes) the
-    // most detailed level 0 and one level.
-    let srv = [RGBA8, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
-    call!(
-        device,
-        0x90,
-        fn(Obj, *const [u32; 10], u64),
-        g.texture,
-        &srv,
-        view(5)
-    );
-    call!(
-        device,
-        0x90,
-        fn(Obj, *const [u32; 10], u64),
-        g.target,
-        &srv,
-        view(6)
-    );
-    let uav = [RGBA8, 4, 0, 0, 0, 0, 0, 0, 0, 0];
-    call!(
-        device,
-        0x98,
-        fn(Obj, Obj, *const [u32; 10], u64),
-        g.shown,
-        std::ptr::null_mut(),
-        &uav,
-        view(7)
-    );
-    // Raw: R32 elements, the raw flag.
-    let raw = [
-        R32_TYPELESS,
-        1,
-        0,
-        0,
-        (frame_bytes(width, height) / 4) as u32,
-        0,
-        0,
-        0,
-        1,
-        0,
-    ];
-    call!(
-        device,
-        0x98,
-        fn(Obj, Obj, *const [u32; 10], u64),
-        g.output,
-        std::ptr::null_mut(),
-        &raw,
-        view(8)
-    );
     // Linear filtering, wrapping.
     let mut sampler = [0x15u32, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, f32::MAX.to_bits()];
     sampler[4] = 0f32.to_bits();
@@ -1256,17 +1372,23 @@ impl Gpu {
             stride_or_format: R16U,
         };
         call!(list, 0x178, fn(*const BufferView), &indices);
-        let table = |n: u64| self.view_gpu + n * VIEW_SIZE;
-        call!(list, 0x120, fn(u32, u64), 0, table(0));
-        call!(list, 0x120, fn(u32, u64), 2, table(5));
+        call!(list, 0x120, fn(u32, u64), 0, self.table(0));
+        call!(list, 0x120, fn(u32, u64), 2, self.table(5));
         call!(list, 0x120, fn(u32, u64), 3, self.sampler_gpu);
     }
 
     /// Records and runs one frame at time `at`: the draws, the compute pass
     /// (and the texture's upload if `first`); then copies the compute
-    /// output to the read-back buffer, unless `present`, which leaves the
-    /// texture shown in the state for presenting instead.
+    /// output to the read-back buffer and waits for it, unless `present`,
+    /// which leaves the texture shown in the state for presenting instead
+    /// and runs on while the CPU goes on to the next frame (in the next
+    /// frame context: [`FRAMES`] in flight).
     fn frame(&mut self, at: f32, first: bool, present: bool) -> (Hresult, Hresult, bool) {
+        self.at = (self.at + 1) % self.contexts.len();
+        // Its allocator, constants and views are free once the GPU is done
+        // with the frame that used them last.
+        let list = self.begin_context();
+        let region = self.at * self.region as usize;
         let (scene, draws) = if self.scenery {
             scene::window_frame(at)
         } else {
@@ -1275,7 +1397,7 @@ impl Gpu {
         // SAFETY: the constant buffer is mapped, [`SLOTS`] slots of 256 bytes
         // at least.
         unsafe {
-            let base = self.constants_cpu;
+            let base = self.constants_cpu.add(region);
             std::ptr::copy_nonoverlapping((&raw const scene).cast::<u8>(), base, 256);
             // The window's main draws from MAIN_SLOT, the checked frame's from 1.
             let first = if self.scenery { MAIN_SLOT } else { 1 };
@@ -1299,10 +1421,6 @@ impl Gpu {
                 base.add(256 * 6),
                 256,
             );
-        }
-        let list = self.lists[0];
-        if !first {
-            self.reset(0, std::ptr::null_mut());
         }
         if first {
             let dst = CopyLocation {
@@ -1363,9 +1481,10 @@ impl Gpu {
                 self.barrier(list, self.sky, COPY_DEST, PIXEL);
             }
         }
-        if self.shown_common {
-            self.barrier(list, self.shown, COMMON, UNORDERED);
-            self.shown_common = false;
+        let shown = self.contexts[self.at].shown;
+        if self.contexts[self.at].shown_common {
+            self.barrier(list, shown, COMMON, UNORDERED);
+            self.contexts[self.at].shown_common = false;
         }
         let clear = scene::CLEAR.map(|c| f32::from(c) / 255.0);
         call!(
@@ -1389,8 +1508,8 @@ impl Gpu {
             std::ptr::null()
         );
         self.bind_pass(list);
-        let view_gpu = self.view_gpu;
-        let table = move |n: u64| view_gpu + n * VIEW_SIZE;
+        let block = self.view_gpu + self.at as u64 * self.block * VIEW_SIZE;
+        let table = move |n: u64| block + n * VIEW_SIZE;
         if self.scenery {
             // The sky first, behind everything, with its own texture.
             let m = self.geometry.meshes[4];
@@ -1444,14 +1563,17 @@ impl Gpu {
         let crowd = scene::crowd(at, extra_draws(self.scale));
         let mut closed = S_OK;
         let mut done = true;
-        let constants = Gpu::address(self.constants);
+        let constants = Gpu::address(self.constants) + region as u64;
+        let views = self.view_cpu + self.at as u64 * self.block * VIEW_SIZE;
         for (k, chunk) in crowd.chunks(DRAWS_A_STEP).enumerate() {
-            let (hr, reached) = self.submit(0);
+            // The checked frames wait for each submission; the window's run
+            // on, the list recording the next with the same allocator.
+            let (hr, reached) = self.submit(list, !present);
             if hr != S_OK {
                 closed = hr;
             }
             done &= reached;
-            self.reset(0, std::ptr::null_mut());
+            self.reopen(list);
             self.bind_pass(list);
             // In three passes, each timed: the constants, the views, the
             // draws (the same calls as one pass, in another order).
@@ -1463,7 +1585,7 @@ impl Gpu {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         (&raw const *mesh_constants).cast::<u8>(),
-                        self.constants_cpu.add(256 * (SLOTS + first + j)),
+                        self.constants_cpu.add(region + 256 * (SLOTS + first + j)),
                         256,
                     );
                 }
@@ -1476,7 +1598,7 @@ impl Gpu {
                     0x88,
                     fn(*const [u64; 2], u64),
                     &desc,
-                    self.view_cpu + (VIEWS + (first + j) as u64) * VIEW_SIZE
+                    views + (VIEWS + (first + j) as u64) * VIEW_SIZE
                 );
             }
             self.costs.constants += written - started;
@@ -1498,10 +1620,15 @@ impl Gpu {
             }
         }
         // The compute pass reads the frame and writes the texture shown and
-        // the buffer.
+        // (unless the frame is only shown) the buffer.
         self.barrier(list, self.target, RENDER_TARGET, NON_PIXEL);
         call!(list, 0x108, fn(Obj), self.compute_root);
-        call!(list, 0xc8, fn(Obj), self.compute);
+        let compute = if present && !self.compute_shown.is_null() {
+            self.compute_shown
+        } else {
+            self.compute
+        };
+        call!(list, 0xc8, fn(Obj), compute);
         call!(list, 0x118, fn(u32, u64), 0, table(6));
         call!(
             list,
@@ -1513,21 +1640,31 @@ impl Gpu {
         );
         self.barrier(list, self.target, NON_PIXEL, RENDER_TARGET);
         if present {
-            self.barrier(list, self.shown, UNORDERED, COMMON);
-            self.shown_common = true;
+            self.barrier(list, shown, UNORDERED, COMMON);
+            self.contexts[self.at].shown_common = true;
         }
-        let (last, reached) = self.submit(0);
+        let (last, reached) = self.submit(list, !present);
+        self.contexts[self.at].open = false;
         let closed = if last == S_OK { closed } else { last };
         let done = done && reached;
         if present {
+            // The frame's end: its context is free again once the GPU passes it.
+            self.contexts[self.at].pending = self.signal();
             return (closed, S_OK, done);
         }
 
         // The compute output to the read-back buffer (not while only
         // showing frames).
-        let copy = self.lists[1];
+        let copy = self.copy_list;
         if self.copy_closed {
-            self.reset(1, std::ptr::null_mut());
+            call!(self.copy_allocator, 0x40, fn() -> Hresult,);
+            call!(
+                copy,
+                0x50,
+                fn(Obj, Obj) -> Hresult,
+                self.copy_allocator,
+                std::ptr::null_mut::<c_void>()
+            );
         }
         self.barrier(copy, self.output, UNORDERED, COPY_SOURCE);
         call!(
@@ -1541,7 +1678,7 @@ impl Gpu {
             frame_bytes(self.width, self.height)
         );
         self.barrier(copy, self.output, COPY_SOURCE, UNORDERED);
-        let (copied, copy_done) = self.submit(1);
+        let (copied, copy_done) = self.submit(copy, true);
         self.copy_closed = true;
         (closed, copied, done && copy_done)
     }
@@ -1578,7 +1715,7 @@ impl Gpu {
         let plane = Plane {
             token,
             count: 1,
-            resources: &self.shown,
+            resources: &self.contexts[self.at].shown,
         };
         call!(
             self.queue,

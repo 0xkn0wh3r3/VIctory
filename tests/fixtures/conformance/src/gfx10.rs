@@ -278,12 +278,16 @@ pub fn pixel() -> Vec<u32> {
 /// texture shown (UAV, at 32 bytes) and the read-back buffer (raw UAV, at
 /// 64 bytes; four floats per pixel, row after row). The group id arrives
 /// in s1-s2, the thread id in v0-v1. A neighbour past the edge reads 0.
-pub fn compute(width: u32) -> Vec<u32> {
+/// Without `buffer` (frames only shown), the buffer is neither read from
+/// the table nor written.
+pub fn compute(width: u32, buffer: bool) -> Vec<u32> {
     let mut a = Asm::default();
     a.table(4, 0);
     a.smem(3, 8, 4, 0); // s_load_dwordx8 s[8:15]: the frame
     a.smem(3, 16, 4, 0x20); // s_load_dwordx8 s[16:23]: the texture shown
-    a.smem(2, 24, 4, 0x40); // s_load_dwordx4 s[24:27]: the buffer
+    if buffer {
+        a.smem(2, 24, 4, 0x40); // s_load_dwordx4 s[24:27]: the buffer
+    }
     a.sop2(0x1e, 28, 1, 3 + 128); // s_lshl_b32 s28, s1, 3
     a.sop2(0x1e, 29, 2, 3 + 128); // s_lshl_b32 s29, s2, 3
     a.vop2(0x25, v(2), 28, 0); // x = group x * 8 + thread x
@@ -305,13 +309,15 @@ pub fn compute(width: u32) -> Vec<u32> {
         a.fmac(v(d), HALF, 8 + c);
     }
     a.image(8, 20, 2, 16, 0); // image_store v[20:23], v[2:3]
-    a.s_movk(
-        30,
-        u16::try_from(width).expect("a frame at most 65,535 pixels wide"),
-    );
-    a.vop3(0x143, 24, v(3), 30, v(2)); // v_mad_u32_u24 v24, y, width, x
-    a.vop2(0x1a, v(24), 4 + 128, 24); // v_lshlrev_b32 v24, 4, v24
-    a.store4(20, 24, 24);
+    if buffer {
+        a.s_movk(
+            30,
+            u16::try_from(width).expect("a frame at most 65,535 pixels wide"),
+        );
+        a.vop3(0x143, 24, v(3), 30, v(2)); // v_mad_u32_u24 v24, y, width, x
+        a.vop2(0x1a, v(24), 4 + 128, 24); // v_lshlrev_b32 v24, 4, v24
+        a.store4(20, 24, 24);
+    }
     a.end();
     a.0
 }
@@ -556,7 +562,8 @@ pub fn pixel_container() -> Vec<u8> {
     container(0, &p, &[(b"ISG1", isg), (b"OSG1", osg)])
 }
 
-pub fn compute_container(width: u32) -> Vec<u8> {
+/// The compute shader's container; `buffer` as [`compute`].
+pub fn compute_container(width: u32, buffer: bool) -> Vec<u8> {
     let mut data = vec![0u8; 0x40];
     // COMPUTE_PGM_RSRC2: one user SGPR, group ids x and y, thread ids x
     // and y.
@@ -570,11 +577,15 @@ pub fn compute_container(width: u32) -> Vec<u8> {
     }
     let p = Program {
         stage: CS,
-        code: compute(width),
+        code: compute(width, buffer),
         vgprs: 32,
         sgprs: 32,
         layout: vec![(0, 0)],
-        used: vec![(0, 0, 0, 0, 0, 8), (3, 0, 0, 8, 0, 8), (3, 0, 0, 16, 1, 4)],
+        used: if buffer {
+            vec![(0, 0, 0, 0, 0, 8), (3, 0, 0, 8, 0, 8), (3, 0, 0, 16, 1, 4)]
+        } else {
+            vec![(0, 0, 0, 0, 0, 8), (3, 0, 0, 8, 0, 8)]
+        },
         stage_data: data,
     };
     container(5, &p, &[])
