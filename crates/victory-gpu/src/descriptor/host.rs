@@ -475,12 +475,18 @@ impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
+        if self.sampler || n == 0 {
             return None;
         }
         let mut guard = self.taken.lock().unwrap_or_else(|e| e.into_inner());
         let old = (guard.peak, guard.run);
         guard.run = guard.run.max(n);
+        if n > self.dynamic {
+            let new = (guard.peak, guard.run);
+            drop(guard);
+            self.log_dynamic(old, new);
+            return None;
+        }
         let t = &mut *guard;
         let (next, taken) = (&mut t.next, &mut t.slots);
         let n = n as usize;
@@ -2674,6 +2680,9 @@ mod tests {
         // A run that does not fit still counts as asked for.
         assert_eq!(heap.dynamic(heap.dynamic), None);
         assert_eq!(counts(&heap), (70, 70, heap.dynamic));
+        let over_capacity = heap.dynamic + 1;
+        assert_eq!(heap.dynamic(over_capacity), None);
+        assert_eq!(counts(&heap), (70, 70, over_capacity));
     }
 
     #[test]
