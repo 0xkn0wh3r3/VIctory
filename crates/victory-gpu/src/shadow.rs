@@ -1000,7 +1000,6 @@ pub(crate) fn owners() -> u64 {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
     buffers().insert(
         (start, resource),
         Entry {
@@ -1008,12 +1007,15 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    // After the buffers changed: a count read before is looked at again.
+    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
+    let removed = buffers().remove(&(start, resource));
     OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    if removed.is_some_and(|e| e.shadow.is_some()) {
         changed();
     }
 }
