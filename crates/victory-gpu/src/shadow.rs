@@ -1533,6 +1533,7 @@ pub(crate) fn copy_back_marks(
         let written = copy.copy_back_marked(page, only.as_deref());
         #[cfg(feature = "diagnostics")]
         {
+            crate::heat::copied_back(copy.range(), written);
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
             crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
         }

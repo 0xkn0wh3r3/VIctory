@@ -756,6 +756,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
             let n = copies[k].copy_back_page(at as usize);
+            #[cfg(feature = "diagnostics")]
+            crate::heat::copied_back(copies[k].range(), n);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
                 copy = format_args!("{:#x?}", copies[k].range()),
