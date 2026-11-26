@@ -574,6 +574,12 @@ impl HostHeap {
         self.count
     }
 
+    /// Where the dynamic slots end: view pairs lie past here.
+    #[cfg(test)]
+    pub(crate) fn dynamic_end(&self) -> u32 {
+        self.count + self.dynamic
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
