@@ -170,6 +170,12 @@ memory, `VICTORY_GPU_UPLOAD_WRITES=0` those of buffers shaders write, and
 `VICTORY_GPU_UPLOAD_WRITES=1` puts those in video memory on any GPU
 ([GPU memory](docs/gpu-memory.md)).
 
+Where the GPU shares memory with the CPU (an APU or integrated GPU) and
+title memory passes a self-test at startup, title buffers have no host
+copies at all: the GPU uses title memory in place. `VICTORY_IN_PLACE=0`
+keeps the copies, and `VICTORY_IN_PLACE=1` puts buffers in place on any
+GPU that can open title memory as a heap.
+
 ### Windows shader-test validator
 
 The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.

@@ -321,6 +321,123 @@ mark their writes through views, so such ranges are rare; where a title
 still has them, `VICTORY_GPU_UPLOAD_WRITES=0` keeps written copies in
 system memory.
 
+## Unified hosts: title memory in place
+
+On a host whose GPU shares memory with the CPU (an AMD or Intel APU, an
+integrated GPU, Apple silicon under a translation layer), there is one
+pool, as on the console. Every placement reads at the same speed there,
+so a host copy buys no GPU time and only costs its refreshes, snapshots
+and copy-backs. `crate::unified::detect` asks the device at host creation
+(`D3D12_FEATURE_DATA_ARCHITECTURE1.UMA`, `GPUUploadHeapSupported`, the
+memory budgets; about 0.3 ms) and logs the answer (`host GPU memory: ...`).
+
+Where the host reports unified memory, `crate::in_place` gives each title
+buffer of 64 KiB or more no copy at all: its host buffer is title memory
+itself, a heap opened over the buffer's own pages
+(`ID3D12Device13::OpenExistingHeapFromAddress1`) with one buffer placed at
+its start. The GPU reads what the title wrote, and the title reads what
+the GPU wrote, in the same pages: no refresh, no snapshot, no copy-back,
+and no second copy of the memory.
+
+Before turning that on, the host checks once that title memory really is
+shared (`crate::unified::self_test`): it opens a block of memory
+allocated as the title's pools are, has the GPU copy bytes out of it and
+into it, and checks that each processor saw the other's writes. A
+translation layer can have the method and still give the GPU new memory
+(vkd3d-proton without `VK_EXT_external_memory_host`). If the test fails,
+the copies stay and the log says why.
+
+| `VICTORY_IN_PLACE` | title buffers |
+|---|---|
+| unset | in place where the host reports unified memory and the self-test passes |
+| `1` | in place wherever the host can open title memory as a heap |
+| `0` | copied |
+
+What holding title memory as a heap implies, and how it is handled:
+
+- **The title cannot free, protect or remap memory a heap holds**
+  (Windows refuses with error 87). Every heap is registered with
+  `crate::pinned`, and the title's `VirtualFree`, `VirtualProtect` and
+  `UnmapViewOfFile*` (`victory-hle`'s `memoryapi`, and the runtime's own
+  unmapping in `xmem`) go through `title_memory_change`: buffers in place
+  over the range are dropped first, and the change is retried for up to
+  100 ms while the lists still holding them are reset.
+- **The heap lives as long as anything placed in it.** Each buffer holds
+  its heap through private data, and the heap's registration goes when the
+  heap is destroyed (`ID3DDestructionNotifier`). vkd3d-proton destroyed a
+  heap once its own references went, though its buffer still lived.
+- **Write watching does not see the GPU's writes.** Other copies of the
+  same pages (a view's own copy, textures' uploads) cannot guard pages a
+  heap holds either, so their pages stay changed and are copied at each
+  use: they see what the GPU wrote.
+- **Withholding** (`crate::memory::withholding`): what a program using
+  title memory at computed addresses writes stays out of title memory
+  when such a program missed memory. A buffer in place cannot hold
+  anything back, so a buffer such a program writes gets a copy from its
+  next use on. The submission that wrote it in place keeps the declared
+  range's bytes beforehand and puts them back if its writes are withheld.
+  Such programs also reach title memory through a page table naming every
+  host buffer (`crate::memory`): once one is made, buffers shaders may
+  write are copied instead, and only buffers made without unordered access
+  stay in place.
+
+### What it saves
+
+The compute-heavy submission above, on the Ryzen 9 7900X's integrated
+Radeon (`VICTORY_TEST_ADAPTER=radeon`), with each placement in its own
+process and title memory checked to end up the same in all of them.
+Median of three runs of the median of 5 submissions, ms. `making buffers`
+is the one-time cost of the first use of the six buffers (allocating the
+copies, or opening the heaps), and `first submission` the submission after
+it (copying everything in):
+
+| copies | writes found by | title writes | total | prepare | GPU | copy-back | making buffers | first submission |
+|---|---|---|---|---|---|---|---|---|
+| system memory | write marks | none | 58.9 | 0.0 | 44.0 | 14.9 | 30.0 | 111.4 |
+| system memory | write marks | 16 MiB per submission | 59.8 | 2.3 | 42.5 | 14.9 | 25.7 | 111.2 |
+| system memory | snapshots | none | 70.1 | 11.7 | 40.3 | 17.5 | 28.1 | 134.4 |
+| system memory | snapshots | 16 MiB per submission | 71.1 | 14.3 | 39.7 | 17.1 | 26.4 | 122.1 |
+| read-only copies in video memory | write marks | none | 58.7 | 0.0 | 43.9 | 14.8 | 31.3 | 104.1 |
+| read-only copies in video memory | write marks | 16 MiB per submission | 60.2 | 2.1 | 42.5 | 15.2 | 25.7 | 102.4 |
+| read-only copies in video memory | snapshots | none | 68.6 | 11.7 | 39.6 | 17.2 | 25.9 | 127.6 |
+| read-only copies in video memory | snapshots | 16 MiB per submission | 70.8 | 13.7 | 39.5 | 17.0 | 25.1 | 113.7 |
+| all copies in video memory | write marks | none | 65.5 | 0.0 | 44.4 | 20.7 | 41.0 | 108.0 |
+| all copies in video memory | write marks | 16 MiB per submission | 65.6 | 2.1 | 42.7 | 20.7 | 31.8 | 109.6 |
+| all copies in video memory | snapshots | none | 75.3 | 12.0 | 40.1 | 23.4 | 30.6 | 137.4 |
+| all copies in video memory | snapshots | 16 MiB per submission | 76.9 | 13.9 | 39.8 | 23.2 | 30.2 | 124.9 |
+| no copies: title memory in place | write marks | none | 40.6 | 0.0 | 40.3 | 0.1 | 127.6 | 40.4 |
+| no copies: title memory in place | write marks | 16 MiB per submission | 41.1 | 0.0 | 40.9 | 0.2 | 126.3 | 40.1 |
+| no copies: title memory in place | snapshots | none | 40.5 | 0.0 | 40.1 | 0.2 | 127.7 | 39.9 |
+| no copies: title memory in place | snapshots | 16 MiB per submission | 40.9 | 0.0 | 40.6 | 0.2 | 127.1 | 40.2 |
+
+- **In place**, a submission takes 40.5-41.1 ms in every mode, against
+  58.9-71.1 ms with copies in system memory (the default before): 31%
+  less with write marks, 42% less with snapshots. The refreshes (up to
+  14 ms), snapshots and copy-backs (15-17 ms) are gone; the GPU's own time
+  stays the same (40-41 ms against 40-44).
+- The one-time cost moves: opening heaps over 320 MiB of title memory
+  takes about 127 ms, against 25-30 ms for allocating copies, and
+  the first submission no longer copies everything in (40 ms against
+  111-134): the first use costs about the same either way (167 ms against
+  137-162), and every submission after it is 18-30 ms shorter.
+- **Memory:** the 320 MiB of copies are not made.
+- **Video memory placements** buy nothing here: the "video memory" is the
+  same memory.
+
+On a discrete GPU, in place reads title memory across the bus, as copies
+in system memory do: on the RTX 5070 Ti it is faster than copies in
+system memory (no refreshes or copy-backs) but slower than copies in
+video memory, so it stays off there unless `VICTORY_IN_PLACE=1`
+(RTX 5070 Ti, the same runs; system memory and video memory rows in the
+table above):
+
+| copies | writes found by | title writes | total | prepare | GPU | copy-back | making buffers | first submission |
+|---|---|---|---|---|---|---|---|---|
+| no copies: title memory in place | write marks | none | 43.6 | 0.0 | 43.4 | 0.1 | 55.2 | 45.2 |
+| no copies: title memory in place | write marks | 16 MiB per submission | 43.7 | 0.0 | 43.6 | 0.1 | 57.9 | 45.4 |
+| no copies: title memory in place | snapshots | none | 43.8 | 0.0 | 43.6 | 0.1 | 56.9 | 43.9 |
+| no copies: title memory in place | snapshots | 16 MiB per submission | 43.8 | 0.0 | 43.6 | 0.2 | 57.5 | 43.9 |
+
 ## Video memory budget and residency
 
 Windows gives each process a **video memory budget**
