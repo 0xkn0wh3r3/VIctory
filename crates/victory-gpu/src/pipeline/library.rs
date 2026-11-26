@@ -50,6 +50,9 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
+/// Library saves, their time in µs, and of that the time serialising it
+/// with its lock held (pipelines wait to be stored meanwhile).
+pub(crate) static SAVES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 
@@ -314,11 +317,13 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let started = std::time::Instant::now();
     let (blob, prebuilt) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
+        let _locked = Timed(std::time::Instant::now(), &SAVES[2]);
         // SAFETY: a plain size query on a live library.
         let size = unsafe { l.library.GetSerializedSize() };
         let Some(mut bytes) = zeroed(size) else {
@@ -351,6 +356,8 @@ pub(crate) fn save(now: bool) {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
             None => Ok(()),
         });
+    SAVES[0].fetch_add(1, Ordering::Relaxed);
+    SAVES[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
@@ -367,6 +374,15 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    }
+}
+
+/// Adds the time since `.0` to `.1`, in µs, when dropped.
+struct Timed<'a>(std::time::Instant, &'a AtomicU64);
+
+impl Drop for Timed<'_> {
+    fn drop(&mut self) {
+        self.1.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 }
 
