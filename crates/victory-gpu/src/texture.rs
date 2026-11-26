@@ -49,7 +49,7 @@ pub(crate) struct Staging {
     mips: u32,
     /// The first level uploaded: the levels before it are never read
     /// ([`note_reads`]), and `prefix` bytes of the memory hold the rest.
-    first: u32,
+    pub(crate) first: u32,
     prefix: usize,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
@@ -373,7 +373,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource, 
         }
         return;
     }
-    if !list.first_use(texture.as_raw() as usize) {
+    // Again when the list reads from an earlier level than it did: the
+    // staging it holds may lack that level.
+    if !list.first_use_from(texture.as_raw() as usize, first) {
         return;
     }
     let (Some(staging), Some(copy)) = (staging(resource, texture), crate::resource::host_copy(resource)) else {
@@ -677,7 +679,7 @@ impl Staging {
             let zeros = vec![0u8; size];
             let every = all();
             let buffer = self.detile(&zeros, &every);
-            last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
+            last.hash = buffer.is_some().then(|| blake3::hash(&zeros[..prefix]));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
         // SAFETY: committed memory of the levels' bytes.
