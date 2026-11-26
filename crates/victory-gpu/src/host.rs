@@ -115,9 +115,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
         }
-        // Whether the GPU shares memory with the CPU, and title memory
-        // opens in place there: what a report from an APU or a translation
-        // layer needs first.
+        // Whether the GPU shares memory with the CPU: what a report from an
+        // APU or a translation layer needs first.
         text.push_str(&format!("; host GPU memory: {}", host.memory));
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
