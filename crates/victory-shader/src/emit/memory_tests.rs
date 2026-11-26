@@ -194,6 +194,8 @@ fn program() -> HostShader {
     .expect("lower");
     assert!(l.memory && l.memory_writes && l.view_addresses);
     assert!(l.root_uavs.is_empty(), "the root UAV is read as title memory");
+    // Its global store reaches it at its address: the host writes it back.
+    assert_eq!(l.written_root_uavs, [2]);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -215,6 +217,94 @@ fn program() -> HostShader {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
     }
     shader
+}
+
+/// In a program that reaches its root UAVs as title memory, a buffer
+/// store through a descriptor built around one marks it written (the host
+/// writes it back); one only loaded from is not.
+#[test]
+fn root_uavs_stored_to_as_title_memory_are_written() {
+    let root_uav = |slot, user_data| RootParam {
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        sgprs: 2,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let used_uav = |slot, user_data| UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 2,
+        user_data,
+        slot,
+    };
+    // s14 = the dword root constants s[0:1] point at: title memory, so
+    // root UAVs are read as title memory.
+    let mut w = s_load(0, 14, 0, 0).to_vec();
+    w.push(S_WAITCNT_ALL);
+    w.push(v_mov_b32(1, ZERO));
+    w.push(v_mov_b32(4, 14));
+    // v9 = the dword at root UAV 3 (s[4:5]): loaded, never stored to.
+    w.extend(global(12, 9, 1, 0, 4, 0));
+    w.push(S_WAITCNT_ALL);
+    // s[8:11]: a raw buffer descriptor around root UAV 2 (s[2:3]).
+    w.push(s_mov_b32(8, 2));
+    w.push(s_mov_b32(9, 3));
+    w.push(s_mov_b32(10, 0xC1)); // -1: every byte
+    w.extend([s_mov_b32(11, 0xFF), 0x3100_7FAC]); // dword 3, a literal
+    w.extend(buffer_store_dword(4, 8, 0));
+    w.extend(buffer_store_dword(9, 8, 4));
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 10,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            root_uav(2, 2),
+            root_uav(3, 4),
+        ],
+        used: vec![used_uav(2, 2), used_uav(3, 4)],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 6 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+    assert!(
+        l.memory && l.memory_writes,
+        "root UAVs are title memory here"
+    );
+    assert!(l.root_uavs.is_empty(), "no root UAV handle is made");
+    assert_eq!(l.written_root_uavs, [2]);
 }
 
 /// The page table for one copy of title memory at [`TITLE`] whose views
