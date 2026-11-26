@@ -104,6 +104,12 @@ pub(crate) fn shader_files(title_dir: &Path, exe: &Path, dlls: &[PathBuf]) -> Ve
         .collect()
 }
 
+/// Whether the title can start: the work is over (done, failed or
+/// panicked), or with [`Mode::Shaders`] the shaders are done.
+pub(crate) fn ready(mode: Mode, finished: bool, shaders_done: bool) -> bool {
+    finished || mode != Mode::All && shaders_done
+}
+
 /// Makes what is not made yet of the title's shaders and pipelines, waiting
 /// as [`Mode`] says (with a progress window), and goes on with the rest
 /// behind the title.
@@ -175,9 +181,12 @@ pub(crate) fn prepare(title_dir: &Path, files: Vec<PathBuf>) -> Result<()> {
                 }
             })?
     };
-    let waited = |work: &std::thread::JoinHandle<()>| match mode {
-        Mode::All => work.is_finished(),
-        _ => shaders_done.load(Ordering::Acquire),
+    let waited = |work: &std::thread::JoinHandle<()>| {
+        ready(
+            mode,
+            work.is_finished(),
+            shaders_done.load(Ordering::Acquire),
+        )
     };
     if !waited(&work) {
         #[cfg(windows)]
@@ -227,6 +236,19 @@ mod tests {
         assert_eq!(Mode::from_env(Some("all")), Mode::All);
         assert_eq!(Mode::from_env(Some(" wait ")), Mode::All);
         assert_eq!(Mode::from_env(Some("anything")), Mode::Shaders);
+    }
+
+    /// The title starts when the work is over however it ended (a worker
+    /// that panicked before the shaders were done does not hold it
+    /// forever), or once the shaders are done unless all is waited for.
+    #[test]
+    fn the_title_starts_when_the_work_is_over_or_its_shaders_are_done() {
+        for mode in [Mode::Shaders, Mode::All] {
+            assert!(ready(mode, true, false), "{mode:?}: the worker ended early");
+            assert!(!ready(mode, false, false), "{mode:?}");
+        }
+        assert!(ready(Mode::Shaders, false, true));
+        assert!(!ready(Mode::All, false, true));
     }
 
     #[test]
