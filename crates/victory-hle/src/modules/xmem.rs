@@ -1363,7 +1363,7 @@ mod tests {
     }
 
     /// Graphics blocks of a page or more get a write-watched reservation of
-    /// their own (the GPU side copies only the pages written since its last
+    /// their own (the GPU side copies only the pages written into their host
     /// copy) and go back to the system when freed; smaller ones, and other
     /// allocators' blocks, come from the host heap as before.
     #[test]
