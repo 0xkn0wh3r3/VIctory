@@ -40,6 +40,8 @@ pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 mod frame_budget;
+#[cfg(windows)]
+pub use frame_budget::submission_totals;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod heat;
 mod hold;

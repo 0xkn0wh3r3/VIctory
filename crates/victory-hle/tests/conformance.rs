@@ -237,6 +237,7 @@ fn the_gpu_frame_matches_warp() {
     };
     if window > 0 {
         end_when_the_window_closes();
+        report_submissions();
     }
     let size = window_size();
     let scale = window_scale();
@@ -486,4 +487,30 @@ fn window_scale() -> u32 {
         Ok(scale @ 1..=1024) => scale,
         _ => panic!("VICTORY_CONFORMANCE_SCALE={asked}: 1 to 1024"),
     }
+}
+
+/// Every 5 seconds while the window shows: VIctory's time per submission by
+/// phase (`victory_gpu::submission_totals`), beside the title's own report
+/// of its calls.
+fn report_submissions() {
+    std::thread::spawn(|| {
+        let mut last = victory_gpu::submission_totals();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let now = victory_gpu::submission_totals();
+            let count = now.0 - last.0;
+            let ms = |i: usize| (now.1[i] - last.1[i]).as_secs_f64() * 1000.0 / count.max(1) as f64;
+            println!(
+                "victory: {count} submissions in 5 s; per submission {:.3} ms: sync {:.3}, \
+                 uploads {:.3}, refresh {:.3}, GPU {:.3}, copy-back {:.3}",
+                (0..5).map(ms).sum::<f64>(),
+                ms(0),
+                ms(1),
+                ms(2),
+                ms(3),
+                ms(4)
+            );
+            last = now;
+        }
+    });
 }
