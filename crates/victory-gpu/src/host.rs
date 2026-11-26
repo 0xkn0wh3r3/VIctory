@@ -3963,15 +3963,22 @@ fn upload_placement(
 /// memory from the first one on ([`Host::gpu_upload_buffer`]).
 static NO_UPLOAD_CALLBACKS: AtomicBool = AtomicBool::new(false);
 
+/// Tests: [`Host::copy_now`] fails, as when the device is removed.
+#[cfg(test)]
+pub(crate) static COPIES_FAIL: AtomicBool = AtomicBool::new(false);
+
 /// The PCI vendor ID of NVIDIA's GPUs (`DXGI_ADAPTER_DESC1::VendorId`).
 const NVIDIA: u32 = 0x10DE;
 
 impl Host {
-    /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: [`Host::shared_buffer`]s
-    /// (host copies of title memory among them) in video memory the CPU maps
-    /// (a GPU upload heap, where the host has one), to measure how much of
-    /// the GPU's time is shaders reading the copies over the bus. CPU reads
-    /// of them (snapshots, copy-backs) become slow: for that measurement only.
+    /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: every host copy of
+    /// title memory in video memory the CPU maps (a GPU upload heap, where
+    /// the host has one), read-only and written copies alike, whatever
+    /// [`upload_placement`] would choose: to measure how much of the GPU's
+    /// time is shaders reading the copies over the bus. Written copies keep
+    /// their mirrors, the marks bitmap and other [`Host::shared_buffer`]s
+    /// stay in system memory (the CPU reads them), and the copies count
+    /// against [`UPLOAD_POOL`] as ever.
     #[cfg(feature = "diagnostics")]
     fn copies_in_video_memory(&self) -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -4113,6 +4120,10 @@ impl Host {
                 written,
                 "host copies of title buffers in GPU upload heaps (VICTORY_GPU_UPLOAD, _WRITES)"
             );
+            #[cfg(feature = "diagnostics")]
+            if self.copies_in_video_memory() {
+                return (true, true);
+            }
             (read_only, written)
         })
     }
@@ -4123,10 +4134,20 @@ impl Host {
     /// mirrors before the CPU reads them (`crate::shadow::pull`). Runs in a
     /// list of its own after whatever the queue holds; callable from inside
     /// a submission's copy-back. Buffers start and end in the common state
-    /// (buffers enter and leave the copy states implicitly).
-    pub(crate) fn copy_now(&self, regions: &[(&ID3D12Resource, u64, &ID3D12Resource, u64, u64)]) {
+    /// (buffers enter and leave the copy states implicitly). Returns whether
+    /// the copy was seen to finish: false when there is no copier, a call
+    /// failed, or the wait did not end with the fence (then the copier is not
+    /// used again until the GPU reaches it).
+    pub(crate) fn copy_now(
+        &self,
+        regions: &[(&ID3D12Resource, u64, &ID3D12Resource, u64, u64)],
+    ) -> bool {
         if regions.is_empty() {
-            return;
+            return true;
+        }
+        #[cfg(test)]
+        if COPIES_FAIL.load(Ordering::Relaxed) {
+            return false;
         }
         struct Copier {
             allocator: ID3D12CommandAllocator,
@@ -4162,12 +4183,17 @@ impl Host {
             }
         });
         let Some(copier) = copier else {
-            return;
+            return false;
         };
         let mut c = copier.lock().unwrap_or_else(|e| e.into_inner());
-        c.value += 1;
-        let value = c.value;
-        // SAFETY: the allocator's last list finished (each call waits); the
+        // SAFETY: a plain query on our fence.
+        if unsafe { c.fence.GetCompletedValue() } < c.value {
+            // An earlier copy was not seen to finish: its list may still
+            // hold the allocator.
+            return false;
+        }
+        let value = c.value + 1;
+        // SAFETY: the allocator's last list finished (checked above); the
         // buffers are live and their ranges inside them (the caller's).
         let ran = unsafe {
             c.allocator.Reset().and_then(|()| {
@@ -4176,15 +4202,26 @@ impl Host {
                     c.list.CopyBufferRegion(dst, dst_at, src, src_at, bytes);
                 }
                 c.list.Close()?;
-                self.queue.ExecuteCommandLists(&[Some(c.list.cast()?)]);
+                let list: ID3D12CommandList = c.list.cast()?;
+                self.queue.ExecuteCommandLists(&[Some(list)]);
+                // From here the list may run: the fence value is its own.
+                c.value = value;
                 self.queue.Signal(&c.fence, value)?;
-                c.fence.SetEventOnCompletion(value, c.event)?;
-                WaitForSingleObject(c.event, INFINITE);
-                Ok(())
+                if c.fence.GetCompletedValue() < value {
+                    c.fence.SetEventOnCompletion(value, c.event)?;
+                    WaitForSingleObject(c.event, INFINITE);
+                }
+                // A removed device reports every fence value reached.
+                Ok(c.fence.GetCompletedValue() >= value
+                    && self.device.GetDeviceRemovedReason().is_ok())
             })
         };
-        if let Err(e) = ran {
-            tracing::warn!(error = %e, "a host copy did not run");
+        match ran {
+            Ok(done) => done,
+            Err(e) => {
+                tracing::warn!(error = %e, "a host copy did not run");
+                false
+            }
         }
     }
 
@@ -4203,12 +4240,6 @@ impl Host {
                 MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
                 ..Default::default()
             }
-        };
-        #[cfg(feature = "diagnostics")]
-        let heap = if self.copies_in_video_memory() {
-            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() }
-        } else {
-            heap
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,

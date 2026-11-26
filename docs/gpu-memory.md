@@ -170,13 +170,24 @@ The rules that keep them consistent:
   snapshots.
 - **A submission's snapshots are prepared up front.** Before a
   submission, `Host::execute` collects the ranges its lists declare as
-  written without marks (`shadow::snapshots_ahead`). Their stale pages
-  come back in one GPU copy, and until the copy-backs, refreshes in those
+  written without marks (`shadow::snapshots_ahead`). Their pages come
+  back whole in one GPU copy, and until the copy-backs, refreshes in those
   pages write the mirror as well. A snapshot then never waits for the
-  GPU.
+  GPU. Whole pages, not only stale ones: an earlier shader may have
+  written there through a view no list declared, which leaves video
+  memory ahead with no stale bit. A snapshot without that byte would take
+  it for this submission's write and put it over the title's.
 - **Page bits are cleared under the page lock, around the GPU copy.** A
   refresh that races the copy sets its bit again once the lock is
   released, so its bytes are not lost.
+- **If the GPU copy fails, the CPU reads video memory instead.**
+  `Host::copy_now` reports whether it saw its fence reached on a live
+  device. When it did not (no copier, a failed call, a removed device),
+  `bring_back` reads the pages through the CPU's mapping of video memory.
+  That is slow (~50 MB/s), but the mirror still gets what shaders wrote,
+  and the copy-back neither loses it nor writes the mirror's old bytes
+  into title memory. Written copies made after that stay in system
+  memory.
 
 ```mermaid
 stateDiagram-v2
@@ -198,7 +209,7 @@ sequenceDiagram
   T->>V: changed pages (CPU writes through the BAR)
   Note over Mi: pages marked stale
   Note over Mi,V: snapshot ranges (unmarked lists only)
-  V->>Mi: stale pages in the ranges (one GPU copy)
+  V->>Mi: the ranges' pages (one GPU copy)
   G->>V: shaders run at video memory speed
   Note over Mi,V: before copy-back
   V->>Mi: marked pages / declared ranges (one GPU copy)
