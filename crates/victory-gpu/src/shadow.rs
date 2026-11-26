@@ -775,8 +775,9 @@ struct Bitmap {
     gpu: u64,
 }
 
-// SAFETY: D3D12 resources are free-threaded; the mapping is read and cleared
-// only between submissions, which run one at a time.
+// SAFETY: D3D12 resources are free-threaded; write marks are read and
+// cleared only with no other submission in flight (`crate::host`), read
+// marks also while one may still set more (taken by a later call).
 unsafe impl Send for Bitmap {}
 // SAFETY: as above.
 unsafe impl Sync for Bitmap {}
@@ -828,8 +829,8 @@ pub(crate) fn take_reads() -> Vec<u32> {
     let mut maps: Vec<&mut [u32]> = [false, true]
         .into_iter()
         .filter_map(bitmap)
-        // SAFETY: the mapped bitmap's read marks; the GPU is done with them
-        // (one submission runs at a time).
+        // SAFETY: the mapped bitmap's read marks (a submission still in
+        // flight may set more: a later call takes them).
         .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
         .collect();
     if maps.is_empty() {
@@ -867,7 +868,9 @@ pub(crate) fn reads_since() -> Vec<u32> {
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     let mut slots = Vec::new();
     for b in [false, true].into_iter().filter_map(bitmap) {
-        // SAFETY: the mapped bitmap's read marks; no submission runs.
+        // SAFETY: the mapped bitmap's read marks (one a submission in flight
+        // sets between the read and the clear is lost: a later read of the
+        // slot stamps it).
         let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
         for (w, word) in bits.iter_mut().enumerate() {
             let mut x = std::mem::take(word);
@@ -904,8 +907,8 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             continue;
         };
         let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
-        // SAFETY: the mapped bitmap; the GPU is done with it (one submission
-        // runs at a time).
+        // SAFETY: the mapped bitmap; the GPU is done with it (write marks are
+        // taken with no other submission in flight, `crate::host`).
         let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
         // Marks of offsets past the bitmap land in its last bit, no copy's.
         bits[words - 1] = 0;

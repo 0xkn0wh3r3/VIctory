@@ -1613,6 +1613,13 @@ pub(crate) type Owned = (std::sync::Arc<HostTexture>, Vec<usize>);
 /// ([`give_up`]). Returns how many and their bytes.
 #[cfg(windows)]
 fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
+    // Submissions in flight may have marked reads their completion has not
+    // taken yet: their null views are made now, as it would (the pass below
+    // clears every mark).
+    let first = crate::shadow::take_reads();
+    if !first.is_empty() {
+        crate::descriptor::make_read(&first);
+    }
     // Read through the heap since the last pass: used (a slot's read mark is
     // reported as new only once, so its first read alone stamped it; run
     // evict1 gave up and made again hundreds of textures a frame).
