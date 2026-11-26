@@ -3571,80 +3571,43 @@ mod tests {
         assert!(weak.upgrade().is_none(), "released with its last texture");
     }
 
-    /// Two render targets of other shapes at one offset of a title heap
-    /// (aliases on the host), cleared through the title's lists one after
-    /// the other and read back after each clear: each reads its own clear,
-    /// as on the console. The second takes the memory within a list
-    /// (barrier and discard recorded there), then in the next list (in its
-    /// prelude).
+    /// A title queue and command allocator to record title lists with, and
+    /// a host readback buffer of four rows, 512 bytes apart, that title
+    /// textures' first rows are copied into.
     #[cfg(windows)]
-    #[test]
-    fn aliased_targets_cleared_in_turn_read_their_own_clears() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
-        let null = std::ptr::null();
-        let heap = heap(1 << 20);
-        let a = place_in(heap, 0, &target(64, 64, 28, 1, 0, 0));
-        let b = place_in(heap, 0, &target(64, 64, 10, 1, 0, 0));
-        let (ha, hb) = (
-            host_heap(a).expect("a placed"),
-            host_heap(b).expect("b placed"),
-        );
-        assert!(std::sync::Arc::ptr_eq(&ha, &hb), "one host heap");
-        assert!(
-            !std::sync::Arc::ptr_eq(&host_copy(a).unwrap(), &host_copy(b).unwrap()),
-            "two host textures"
-        );
-        // Render target views in descriptor memory of ours.
-        let views = vec![0u64; 64];
-        let (va, vb) = (views.as_ptr() as u64, views.as_ptr() as u64 + 256);
-        crate::descriptor::create_rtv(null, a, std::ptr::null(), va);
-        crate::descriptor::create_rtv(null, b, std::ptr::null(), vb);
+    struct Bench {
+        queue: This,
+        allocator: This,
+        out: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    }
 
-        let queue_iid = guid(
-            0x0ec870a6,
-            0x5d7e,
-            0x4c22,
-            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
-        );
-        let allocator_iid = guid(
-            0x6102dee4,
-            0xaf59,
-            0x4b09,
-            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
-        );
-        let list_iid = guid(
-            0x5b160d0f,
-            0xac1b,
-            0x4185,
-            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
-        );
-        let (mut queue, mut allocator) = (null, null);
-        let queue_desc = [0u32; 4];
-        assert_eq!(
-            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
-            S_OK
-        );
-        assert_eq!(
-            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
-            S_OK
-        );
-        let new_list = || {
-            let mut list = null;
+    #[cfg(windows)]
+    impl Bench {
+        fn new(host: &crate::host::Host) -> Self {
+            use windows::Win32::Graphics::Direct3D12::*;
+            let null = std::ptr::null();
+            let queue_iid = guid(
+                0x0ec870a6,
+                0x5d7e,
+                0x4c22,
+                [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+            );
+            let allocator_iid = guid(
+                0x6102dee4,
+                0xaf59,
+                0x4b09,
+                [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+            );
+            let (mut queue, mut allocator) = (null, null);
+            let queue_desc = [0u32; 4];
             assert_eq!(
-                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+                crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
                 S_OK
             );
-            list
-        };
-        type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const c_void);
-        type Close = extern "system" fn(This) -> HRESULT;
-        type Execute = extern "system" fn(This, u32, *const This);
-
-        // A readback buffer: four rows, 512 bytes apart.
-        let out = {
+            assert_eq!(
+                crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+                S_OK
+            );
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_READBACK,
                 ..Default::default()
@@ -3662,7 +3625,7 @@ mod tests {
                 Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                 ..Default::default()
             };
-            let mut buffer: Option<ID3D12Resource> = None;
+            let mut out: Option<ID3D12Resource> = None;
             // SAFETY: plain creation of a readback buffer.
             unsafe {
                 host.device
@@ -3672,14 +3635,38 @@ mod tests {
                         &desc,
                         D3D12_RESOURCE_STATE_COPY_DEST,
                         None,
-                        &mut buffer,
+                        &mut out,
                     )
                     .unwrap();
             }
-            buffer.unwrap()
-        };
-        // Records a copy of `r`'s first row into the readback buffer at `at`.
-        let read = |list: This, r: This, at: u64| {
+            Bench {
+                queue,
+                allocator,
+                out: out.unwrap(),
+            }
+        }
+
+        /// A new title list, open.
+        fn list(&self) -> This {
+            let list_iid = guid(
+                0x5b160d0f,
+                0xac1b,
+                0x4185,
+                [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+            );
+            let null = std::ptr::null();
+            let mut list = null;
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, self.allocator, null, &list_iid, &mut list),
+                S_OK
+            );
+            list
+        }
+
+        /// Records a copy of the first 64 texels of `r`'s first row into the
+        /// readback buffer at `at`.
+        fn read(&self, list: This, r: This, at: u64) {
+            use windows::Win32::Graphics::Direct3D12::*;
             let hl = crate::list::host_list(list).unwrap();
             crate::list::ensure_state(hl, r, 0x800);
             let texture = host_resource(r).unwrap();
@@ -3687,7 +3674,7 @@ mod tests {
             let format = unsafe { texture.GetDesc() }.Format;
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: borrowed pointers, never released through these.
-                pResource: unsafe { std::mem::transmute_copy(&out) },
+                pResource: unsafe { std::mem::transmute_copy(&self.out) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
@@ -3720,28 +3707,110 @@ mod tests {
             };
             // SAFETY: an open list, live resources.
             unsafe { hl.list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&row)) };
+        }
+
+        /// Closes `lists` and submits them in that order (submissions are
+        /// waited for).
+        fn execute(&self, lists: &[This]) {
+            type Close = extern "system" fn(This) -> HRESULT;
+            type Execute = extern "system" fn(This, u32, *const This);
+            for &l in lists {
+                assert_eq!(slot::<Close>(l, 0x48)(l), S_OK);
+            }
+            slot::<Execute>(self.queue, 0x50)(self.queue, lists.len() as u32, lists.as_ptr());
+        }
+
+        /// The readback buffer's bytes.
+        fn bytes(&self) -> Vec<u8> {
+            let mut mapped = std::ptr::null_mut();
+            let range = windows::Win32::Graphics::Direct3D12::D3D12_RANGE {
+                Begin: 0,
+                End: 2048,
+            };
+            // SAFETY: the copies finished (submissions are waited for); 2048
+            // bytes, copied out before the buffer is unmapped.
+            unsafe {
+                self.out.Map(0, Some(&range), Some(&mut mapped)).unwrap();
+                let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), 2048).to_vec();
+                self.out.Unmap(0, None);
+                bytes
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Bench {
+        fn drop(&mut self) {
+            for r in [self.allocator, self.queue] {
+                slot::<Release>(r, 0x10)(r);
+            }
+        }
+    }
+
+    /// The RGBA8 texel at `at` of read-back bytes.
+    #[cfg(windows)]
+    fn rgba8(bytes: &[u8], at: usize) -> [u8; 4] {
+        bytes[at..at + 4].try_into().unwrap()
+    }
+
+    /// The RGBA16F texel at `at` of read-back bytes.
+    #[cfg(windows)]
+    fn half(bytes: &[u8], at: usize) -> [u16; 4] {
+        std::array::from_fn(|i| u16::from_le_bytes([bytes[at + 2 * i], bytes[at + 2 * i + 1]]))
+    }
+
+    /// Two render targets of other shapes at one offset of a title heap
+    /// (aliases on the host), cleared through the title's lists one after
+    /// the other and read back after each clear: each reads its own clear,
+    /// as on the console. The second takes the memory within a list
+    /// (barrier and discard recorded there), then in the next list (in its
+    /// prelude).
+    #[cfg(windows)]
+    #[test]
+    fn aliased_targets_cleared_in_turn_read_their_own_clears() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
         };
+        let null = std::ptr::null();
+        let heap = heap(1 << 20);
+        let a = place_in(heap, 0, &target(64, 64, 28, 1, 0, 0));
+        let b = place_in(heap, 0, &target(64, 64, 10, 1, 0, 0));
+        let (ha, hb) = (
+            host_heap(a).expect("a placed"),
+            host_heap(b).expect("b placed"),
+        );
+        assert!(std::sync::Arc::ptr_eq(&ha, &hb), "one host heap");
+        assert!(
+            !std::sync::Arc::ptr_eq(&host_copy(a).unwrap(), &host_copy(b).unwrap()),
+            "two host textures"
+        );
+        // Render target views in descriptor memory of ours.
+        let views = vec![0u64; 64];
+        let (va, vb) = (views.as_ptr() as u64, views.as_ptr() as u64 + 256);
+        crate::descriptor::create_rtv(null, a, std::ptr::null(), va);
+        crate::descriptor::create_rtv(null, b, std::ptr::null(), vb);
+        type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const c_void);
+        let bench = Bench::new(host);
+
         let discards = || crate::alias::DISCARDS.load(std::sync::atomic::Ordering::Relaxed);
         let before = discards();
         // One list: a red, b green, a blue; the next: b white.
-        let first = new_list();
+        let first = bench.list();
         let clear = slot::<Clear>(first, 0x1a0);
         clear(first, va, &[1.0, 0.0, 0.0, 1.0], 0, std::ptr::null());
-        read(first, a, 0);
+        bench.read(first, a, 0);
         clear(first, vb, &[0.0, 1.0, 0.0, 1.0], 0, std::ptr::null());
-        read(first, b, 512);
+        bench.read(first, b, 512);
         clear(first, va, &[0.0, 0.0, 1.0, 1.0], 0, std::ptr::null());
-        read(first, a, 1024);
+        bench.read(first, a, 1024);
         assert!(
             discards() >= before + 2,
             "b, then a again, discarded where they take the memory"
         );
-        assert_eq!(slot::<Close>(first, 0x48)(first), S_OK);
-        let second = new_list();
+        let second = bench.list();
         clear(second, vb, &[1.0, 1.0, 1.0, 1.0], 0, std::ptr::null());
-        read(second, b, 1536);
-        assert_eq!(slot::<Close>(second, 0x48)(second), S_OK);
-        slot::<Execute>(queue, 0x50)(queue, 2, [first, second].as_ptr());
+        bench.read(second, b, 1536);
+        bench.execute(&[first, second]);
         assert!(
             discards() >= before + 3,
             "b discarded again before the second list"
@@ -3752,33 +3821,203 @@ mod tests {
             panic!("debug layer: {error}");
         }
 
-        let mut mapped = std::ptr::null_mut();
-        // SAFETY: the copies finished (submissions are waited for); 2048 bytes.
-        let bytes = unsafe {
-            out.Map(
-                0,
-                Some(&D3D12_RANGE {
-                    Begin: 0,
-                    End: 2048,
-                }),
-                Some(&mut mapped),
-            )
-            .unwrap();
-            std::slice::from_raw_parts(mapped.cast::<u8>(), 2048)
-        };
-        let rgba8 = |at: usize| -> [u8; 4] { bytes[at..at + 4].try_into().unwrap() };
-        let half = |at: usize| -> [u16; 4] {
-            std::array::from_fn(|i| u16::from_le_bytes([bytes[at + 2 * i], bytes[at + 2 * i + 1]]))
-        };
+        let bytes = bench.bytes();
         for x in [0usize, 63] {
-            assert_eq!(rgba8(x * 4), [255, 0, 0, 255], "a red at {x}");
-            assert_eq!(half(512 + x * 8), [0, 0x3c00, 0, 0x3c00], "b green at {x}");
-            assert_eq!(rgba8(1024 + x * 4), [0, 0, 255, 255], "a blue at {x}");
-            assert_eq!(half(1536 + x * 8), [0x3c00; 4], "b white at {x}");
+            assert_eq!(rgba8(&bytes, x * 4), [255, 0, 0, 255], "a red at {x}");
+            assert_eq!(half(&bytes, 512 + x * 8), [0, 0x3c00, 0, 0x3c00], "b green at {x}");
+            assert_eq!(rgba8(&bytes, 1024 + x * 4), [0, 0, 255, 255], "a blue at {x}");
+            assert_eq!(half(&bytes, 1536 + x * 8), [0x3c00; 4], "b white at {x}");
         }
-        for r in [first, second, allocator, queue, a, b] {
+        for r in [first, second, a, b] {
             slot::<Release>(r, 0x10)(r);
         }
+        drop(bench);
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
+    }
+
+    /// Lists recorded together are judged in the order they are submitted,
+    /// not recorded: two aliased render targets, each cleared in a list of
+    /// its own, the lists recorded a then b and submitted b then a; then
+    /// recorded b then a and submitted a then b. Each list's first use of
+    /// the memory is judged against the list submitted before it.
+    #[cfg(windows)]
+    #[test]
+    fn lists_recorded_together_are_judged_in_the_order_they_are_submitted() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let heap = heap(1 << 20);
+        let a = place_in(heap, 0, &target(64, 64, 28, 1, 0, 0));
+        let b = place_in(heap, 0, &target(64, 64, 10, 1, 0, 0));
+        let (ca, cb) = (host_copy(a).unwrap(), host_copy(b).unwrap());
+        let (pa, pb) = (ca.aliased.as_ref().unwrap(), cb.aliased.as_ref().unwrap());
+        let shared = pa.at().0;
+        assert!(std::sync::Arc::ptr_eq(shared, pb.at().0), "one host heap");
+        let (ia, ib) = (pa.id(), pb.id());
+        let views = vec![0u64; 64];
+        let (va, vb) = (views.as_ptr() as u64, views.as_ptr() as u64 + 256);
+        crate::descriptor::create_rtv(null, a, std::ptr::null(), va);
+        crate::descriptor::create_rtv(null, b, std::ptr::null(), vb);
+        type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const c_void);
+        let bench = Bench::new(host);
+        let clear = |list: This, view: u64, color: [f32; 4]| {
+            slot::<Clear>(list, 0x1a0)(list, view, &color, 0, std::ptr::null());
+        };
+
+        // Recorded a, b; submitted b, a: b's first use finds memory no
+        // texture held (b is new), a discard and no barrier; a's finds b's.
+        let first_a = bench.list();
+        clear(first_a, va, [1.0, 0.0, 0.0, 1.0]);
+        bench.read(first_a, a, 0);
+        let first_b = bench.list();
+        clear(first_b, vb, [0.0, 1.0, 0.0, 1.0]);
+        bench.read(first_b, b, 512);
+        bench.execute(&[first_b, first_a]);
+        assert_eq!(
+            shared.take_judged(),
+            [(ib, false, true), (ia, true, true)],
+            "b judged first, then a after b"
+        );
+        // Recorded b, a; submitted a, b: a still holds the memory (it ran
+        // last), so its list needs nothing; b's takes it from a.
+        let second_b = bench.list();
+        clear(second_b, vb, [1.0, 1.0, 1.0, 1.0]);
+        bench.read(second_b, b, 1536);
+        let second_a = bench.list();
+        clear(second_a, va, [0.0, 0.0, 1.0, 1.0]);
+        bench.read(second_a, a, 1024);
+        bench.execute(&[second_a, second_b]);
+        assert_eq!(
+            shared.take_judged(),
+            [(ia, false, false), (ib, true, true)],
+            "a judged first and finds its own memory, then b after a"
+        );
+        if let Some(error) = host.log_messages() {
+            panic!("debug layer: {error}");
+        }
+
+        let bytes = bench.bytes();
+        for x in [0usize, 63] {
+            assert_eq!(rgba8(&bytes, x * 4), [255, 0, 0, 255], "a red at {x}");
+            assert_eq!(half(&bytes, 512 + x * 8), [0, 0x3c00, 0, 0x3c00], "b green at {x}");
+            assert_eq!(rgba8(&bytes, 1024 + x * 4), [0, 0, 255, 255], "a blue at {x}");
+            assert_eq!(half(&bytes, 1536 + x * 8), [0x3c00; 4], "b white at {x}");
+        }
+        drop((ca, cb));
+        for r in [first_a, first_b, second_a, second_b, a, b] {
+            slot::<Release>(r, 0x10)(r);
+        }
+        drop(bench);
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
+    }
+
+    /// A title discard region reaches the host as it is: its subresources
+    /// (mips fastest, then array slices, then planes) are the host
+    /// texture's. Depth formats with stencil (the console's 16-bit depth
+    /// with stencil among them, float depth on the host) have two planes on
+    /// both, depth-only and colour formats one; mip and array counts are the
+    /// title's. Placed depth and render target arrays with every mip are
+    /// discarded in their last subresource and in their second plane (or
+    /// two slices) through the title's list; a region past the last
+    /// subresource is not passed on.
+    #[cfg(windows)]
+    #[test]
+    fn title_discard_regions_number_subresources_as_the_host_texture() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const MIB_4: u64 = 4 << 20;
+        // D32S8, D24S8, D32, D16 and the console's D16S8 depth textures with
+        // their planes; RGBA8 and RGBA16F render targets.
+        let formats = [
+            (20, 2, 2),
+            (45, 2, 2),
+            (40, 2, 1),
+            (55, 2, 1),
+            (118, 2, 2),
+            (28, 1, 1),
+            (10, 1 | 4, 1),
+        ];
+        let heap = heap(MIB_4 * formats.len() as u64);
+        let bench = Bench::new(host);
+        let list = bench.list();
+        type Discard = extern "system" fn(This, This, *const c_void);
+        let discard = slot::<Discard>(list, 0x1b8);
+        let mut textures = Vec::new();
+        for (i, &(format, flags, planes)) in formats.iter().enumerate() {
+            let desc = ResourceDesc {
+                depth_or_array_size: 3,
+                mip_levels: 0,
+                ..target(64, 32, format, flags, 0, MIB_4)
+            };
+            let r = place_in(heap, i as u64 * MIB_4, &desc);
+            let copy = host_copy(r).unwrap();
+            assert!(copy.aliased.is_some(), "format {format}: placed");
+            // SAFETY: a live texture.
+            let host_desc = unsafe { copy.texture.GetDesc() };
+            let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+                Format: host_desc.Format,
+                PlaneCount: 0,
+            };
+            // SAFETY: the query writes its own structure of the given size.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_INFO,
+                    (&raw mut info).cast(),
+                    size_of_val(&info) as u32,
+                )
+            }
+            .unwrap();
+            let console = (
+                texture_layout(&desc).unwrap().planes.len() as u32,
+                mip_count(&desc),
+                u32::from(desc.depth_or_array_size),
+            );
+            assert_eq!(console, (planes, 7, 3), "format {format} on the console");
+            let on_host = (
+                u32::from(info.PlaneCount),
+                u32::from(host_desc.MipLevels),
+                u32::from(host_desc.DepthOrArraySize),
+            );
+            assert_eq!(on_host, console, "format {format}: planes, mips, slices");
+            let (mips, slices) = (console.1, console.2);
+            let per_plane = mips * slices;
+            // The last subresource, the second plane (or two slices), and
+            // one past the last, which is not passed on.
+            let regions = [
+                (planes * per_plane - 1, 1),
+                if planes == 2 {
+                    (per_plane, per_plane)
+                } else {
+                    (mips, 2 * mips)
+                },
+                (planes * per_plane, 1),
+            ];
+            for (first, count) in regions {
+                let region = D3D12_DISCARD_REGION {
+                    NumRects: 0,
+                    pRects: std::ptr::null(),
+                    FirstSubresource: first,
+                    NumSubresources: count,
+                };
+                discard(list, r, (&raw const region).cast());
+            }
+            textures.push((r, copy));
+        }
+        bench.execute(&[list]);
+        // With the debug layer on (diagnostics, `VICTORY_D3D12_DEBUG=1`): no
+        // error about subresources outside a texture.
+        if let Some(error) = host.log_messages() {
+            panic!("debug layer: {error}");
+        }
+        slot::<Release>(list, 0x10)(list);
+        for (r, copy) in textures {
+            drop(copy);
+            slot::<Release>(r, 0x10)(r);
+        }
+        drop(bench);
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
     }
 
