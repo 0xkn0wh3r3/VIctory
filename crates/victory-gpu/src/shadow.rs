@@ -2124,6 +2124,42 @@ pub(crate) mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D12::*;
 
+    /// The copy holding a view's first byte holds it to that copy's end:
+    /// a lookup of that whole range finds the same copy, in an inner buffer
+    /// inside an outer one, in the outer one, and in loose memory in no
+    /// buffer. Constant views are looked up once so (`draw`'s `readable`).
+    #[test]
+    fn the_copy_holding_a_views_first_byte_holds_it_to_its_end() {
+        if host().is_none() {
+            return;
+        }
+        let same = |address: u64, size: u64| {
+            let first = find(address, 1).expect("a copy");
+            let len = size.min(first.left(address));
+            let whole = find(address, len).expect("a copy");
+            assert!(Arc::ptr_eq(&first, &whole), "{address:#x}+{size}");
+        };
+        let memory = vec![0u8; 4 * PAGE];
+        let base = memory.as_ptr() as u64;
+        let page = PAGE as u64;
+        // Resource ids of their own (the addresses are the memory's).
+        let (outer, inner) = (base as usize | 1, base as usize | 2);
+        register(outer, base, 4 * page);
+        register(inner, base + page, page);
+        // In the outer buffer; in the inner one; past the inner one's end.
+        for (address, size) in [(base + 16, 10_000), (base + page + 256, 10_000), (base + 2 * page - 100, 10_000)] {
+            same(address, size);
+        }
+        unregister(inner, base + page);
+        unregister(outer, base);
+        drop(memory);
+        // Loose memory: copies of the windows it touches.
+        let loose = vec![0u8; 2 * PAGE];
+        let address = loose.as_ptr() as u64 + 64;
+        same(address, 1 << 20);
+        same(address, 64);
+    }
+
     /// The views' written-pages bitmaps, which shaders that mark their
     /// writes set every frame, are kept resident.
     #[test]
