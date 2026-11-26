@@ -70,7 +70,7 @@ pub extern "system" fn conformance_bench(len: *mut usize) -> *const u8 {
 /// What the harness passes [`conformance_gpu`]: the WARP reference image
 /// (RGBA floats per pixel, null for none) and how long to keep presenting
 /// frames in a window afterwards (0: no window), at
-/// `window_width` x `window_height`. The frame read back is
+/// `window_width` x `window_height`, with `window_scale` times the work. The frame read back is
 /// handed out in `image` (valid until the next call).
 #[repr(C)]
 pub struct GpuRun {
@@ -79,8 +79,11 @@ pub struct GpuRun {
     pub window_seconds: u32,
     pub window_width: u32,
     pub window_height: u32,
+    pub window_scale: u32,
     pub image: *const f32,
     pub image_len: usize,
+    pub window_image: *const f32,
+    pub window_image_len: usize,
 }
 
 /// Runs the GPU frame (`gpu`); returns its TAP report (valid until the
@@ -88,6 +91,7 @@ pub struct GpuRun {
 #[unsafe(no_mangle)]
 pub extern "system" fn conformance_gpu(run: *mut GpuRun, len: *mut usize) -> *const u8 {
     static IMAGE: std::sync::Mutex<Vec<f32>> = std::sync::Mutex::new(Vec::new());
+    static WINDOW_IMAGE: std::sync::Mutex<Vec<f32>> = std::sync::Mutex::new(Vec::new());
     // SAFETY: the harness passes its parameters.
     let run = unsafe { &mut *run };
     let reference = (!run.reference.is_null())
@@ -99,11 +103,16 @@ pub extern "system" fn conformance_gpu(run: *mut GpuRun, len: *mut usize) -> *co
         reference,
         run.window_seconds,
         (run.window_width, run.window_height),
+        run.window_scale,
     );
     let mut image = IMAGE.lock().unwrap_or_else(|e| e.into_inner());
     *image = done.image;
     run.image = image.as_ptr();
     run.image_len = image.len();
+    let mut window_image = WINDOW_IMAGE.lock().unwrap_or_else(|e| e.into_inner());
+    *window_image = done.window_image;
+    run.window_image = window_image.as_ptr();
+    run.window_image_len = window_image.len();
     let report = t.finish();
     // SAFETY: the harness passes room for the length.
     unsafe { len.write(report.len()) };

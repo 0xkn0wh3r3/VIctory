@@ -217,13 +217,22 @@ $env:VICTORY_CONFORMANCE_DUMP = "frames"
 
 `cargo demo` shows the GPU frame, animated, in a window until you close it,
 with VIctory's overlay (frame rate and frame times) in its top left corner:
-to leave running, or to show. The checks still run on a 512x288 frame; the
-window's frames are drawn at `--resolution`.
+to leave running, or to show. The window's frames add hills of Perlin
+noise around the ground; the checks still run on the 512x288 frame,
+without them.
+
+`--scale <n>` is a stress test of VIctory itself, not of the GPU: each
+step past 1 adds 64 small objects to a frame, each a draw with its
+constants written into title memory and its view made in the descriptor
+heap that frame, and one more submission, as a title's frame grows. Every
+5 seconds it prints the frame rate and the work per frame, so runs at
+different scales compare.
 
 ```powershell
 cargo demo                          # 1440p until the window is closed
 cargo demo --resolution 4k          # 720p, 1080p, 1440p, 4k, or <width>x<height>
-cargo demo --seconds 30 --no-overlay
+cargo demo --scale 64               # 4,037 draws and 64 submissions a frame
+cargo demo --seconds 30 --dump frames   # then save the last frame as frames/window.ppm
 cargo conformance --window 10 --resolution 1080p   # the whole suite, then 10 s of frames
 ```
 
