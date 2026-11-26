@@ -3424,6 +3424,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// them. A page only a valid list declared goes back whole.
     #[test]
     fn a_withheld_range_does_not_hold_back_a_valid_write_on_its_page() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
