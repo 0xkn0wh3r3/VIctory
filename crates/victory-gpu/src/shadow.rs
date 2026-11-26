@@ -1168,6 +1168,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let written = copy.copy_back_marked(page);
         #[cfg(feature = "diagnostics")]
         {
+            crate::heat::copied_back(copy.range(), written);
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
             crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
         }
