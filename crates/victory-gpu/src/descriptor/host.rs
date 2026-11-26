@@ -107,6 +107,14 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+#[cfg(test)]
+type EvictionCheckpoint = Box<dyn FnOnce(&[u32])>;
+#[cfg(test)]
+std::thread_local! {
+    // Only the thread that installs the checkpoint can stop at it.
+    pub(crate) static AFTER_EVICTION_SCAN: std::cell::Cell<Option<EvictionCheckpoint>> = const { std::cell::Cell::new(None) };
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -903,6 +911,10 @@ impl HostHeap {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             (0..kept.len() as u32).filter(|&i| gives_up(&kept[i as usize])).collect()
         };
+        #[cfg(test)]
+        if let Some(checkpoint) = AFTER_EVICTION_SCAN.take() {
+            checkpoint(&slots);
+        }
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         // A title slot made again since it was picked (a title thread wrote a
         // view there, which takes `made` too) views something else: it stays.

@@ -2810,6 +2810,90 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+    /// Eviction picks two views of A. A title write replaces the first with
+    /// B before eviction can take the slot lock. Only the second is nulled.
+    #[test]
+    fn eviction_keeps_a_title_slot_rewritten_after_candidate_selection() {
+        use crate::descriptor::host::AFTER_EVICTION_SCAN;
+        use std::{sync::mpsc, time::Duration};
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else { return };
+        let (guest_heap, title, heap) = view_heap(2);
+        // SAFETY: the increment for the same shader-visible view heap.
+        let step = unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        let slots = Slots(heap.heap.clone(), step);
+        let pool = crate::watch::tests::pool(2);
+        let pages = [(pool, [255u8, 0, 0, 255]), (pool + crate::watch::PAGE, [0, 255, 0, 255])];
+        let objects = pages.map(|(address, rgba)| {
+            // SAFETY: the first RGBA8 texel is inside its own committed page.
+            unsafe { (address as *mut [u8; 4]).write(rgba) };
+            texture_at_address(address as u64, &texture_words(64, 64, 28, 0x100, 0))
+        });
+        let [a, b] = objects;
+        let resources = objects.map(|obj| crate::resource::host_resource(obj).unwrap());
+        let [a_id, b_id] = resources.each_ref().map(|r| r.as_raw() as usize);
+        assert_ne!(a_id, b_id);
+        let desc = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        let put = |index: u32, texture| {
+            crate::descriptor::create_srv(std::ptr::null(), texture, &desc, title.start + u64::from(index) * 32);
+        };
+        put(0, a);
+        put(1, a);
+        let prepare = host.new_list().unwrap();
+        for object in objects {
+            readable(&prepare, &used(ResourceType::Srv), &View::Shader(object as usize, Some(desc)), false);
+        }
+        prepare.close();
+        host.execute(&[&prepare]);
+        drop(prepare);
+        let shader = compile_cs(READ);
+        let outputs: [_; 2] = std::array::from_fn(|_| host.shared_buffer(64 * 64 * 16).unwrap());
+        let read_slots = || {
+            let list = host.new_list().unwrap();
+            for (index, (out, ptr)) in outputs.iter().enumerate() {
+                // SAFETY: the previous dispatch has completed. A sentinel
+                // distinguishes a null SRV read from a dispatch that did not write.
+                unsafe { ptr.cast::<[f32; 4]>().write([0.25; 4]) };
+                run(&list, &slots, &shader, index as u32, Some(out), (1, 1));
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: each dispatch has written the first float4 and finished.
+            outputs.each_ref().map(|(_, ptr)| unsafe { ptr.cast::<[f32; 4]>().read() })
+        };
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let green = [0.0, 1.0, 0.0, 1.0];
+        assert_eq!(read_slots(), [red, red]);
+        let timeout = Duration::from_secs(10);
+        std::thread::scope(|scope| {
+            let (picked, selection) = mpsc::channel();
+            let (resume, rewritten) = mpsc::channel();
+            let eviction = scope.spawn(move || {
+                AFTER_EVICTION_SCAN.set(Some(Box::new(move |slots| {
+                    picked.send(slots.to_vec()).unwrap();
+                    rewritten.recv_timeout(timeout).expect("slot rewrite finished");
+                })));
+                heap.evict(&[a_id].into());
+            });
+            assert_eq!(selection.recv_timeout(timeout).expect("candidates picked"), [0, 1]);
+            put(0, b);
+            assert_eq!(heap.textures_at(&[0, 1]), [b_id, a_id]);
+            assert_eq!(read_slots(), [green, red]);
+            resume.send(()).unwrap();
+            eviction.join().unwrap();
+        });
+        // Bind the original heap slots directly: asking mirror to prepare a
+        // draw here could repair the descriptor before its contents are read.
+        let after = read_slots();
+        type Release = extern "system" fn(This) -> u32;
+        for object in [guest_heap, a, b] {
+            crate::object::slot::<Release>(object, 0x10)(object);
+        }
+        crate::watch::tests::free(pool);
+        assert_eq!(after, [green, [0.0; 4]]);
+    }
+
     /// One texture memory written through an unordered view of a resource
     /// object in one format and read through a placed view in another: a
     /// castable pair shares one host texture (no copy), a pair of other
