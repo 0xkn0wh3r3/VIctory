@@ -751,10 +751,18 @@ pub(crate) mod tests {
         assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
         // No submission takes the marks meanwhile.
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let past = victory_shader::emit::HEAP_VIEWS - 1;
-        assert!(crate::descriptor::view_slots() <= past, "no view heap reaches the last slot");
-        crate::shadow::tests::mark_read(false, past);
-        assert!(!crate::shadow::take_reads().contains(&past), "past every heap's slots");
+        // The scans stop at the end of the word holding the bound, so the
+        // mark is put in the word after it. Another test's heap can have
+        // reached the last word (a paged heap's dynamic slots end two short
+        // of it): then there is no such word.
+        let past = crate::descriptor::view_slots().div_ceil(32) * 32;
+        if past < victory_shader::emit::HEAP_VIEWS {
+            crate::shadow::tests::mark_read(false, past);
+            assert!(!crate::shadow::take_reads().contains(&past), "past every heap's slots");
+            // Cleared, so a larger heap a later test makes finds no read of it.
+            crate::shadow::forget_read(past);
+            crate::shadow::take_reads();
+        }
         let (plain, memory) = (62, 63);
         // A dynamic slot (a table made afresh), past the title's 64.
         let host_heap = crate::descriptor::heap(heap).host().expect("a host view heap");
