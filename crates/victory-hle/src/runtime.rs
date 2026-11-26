@@ -138,11 +138,66 @@ fn field_text(rest: &str) -> String {
     out.trim().to_owned()
 }
 
+/// The executables a title's manifest lists, in order: the `Name` of each
+/// `Game/ExecutableList/Executable` element, entities decoded. Read as
+/// [`Title::from_manifest`] reads the rest: entries inside comments or
+/// CDATA sections, and elements elsewhere, are not among them.
+pub fn manifest_executables(text: &str) -> Vec<String> {
+    tags(text)
+        .into_iter()
+        .filter(|(path, _, _)| path == "Game/ExecutableList/Executable")
+        .filter_map(|(_, _, tag)| attribute(&tag, "Name"))
+        .collect()
+}
+
+/// The predefined XML entities decoded (`&amp;` last, so that `&amp;lt;`
+/// stays `&lt;`).
+fn decode(text: &str) -> String {
+    [
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&apos;", "'"),
+        ("&amp;", "&"),
+    ]
+    .iter()
+    .fold(text.to_owned(), |t, (entity, c)| t.replace(entity, c))
+}
+
+/// The value of attribute `name` in an element's tag text (`Executable
+/// Name="x" Id="Game"/`), entities decoded; only a whole attribute name
+/// matches, so `OverrideDisplayName` is not `Name`.
+fn attribute(tag: &str, name: &str) -> Option<String> {
+    // Past the element's own name.
+    let mut rest = tag.trim_end_matches('/').trim_start();
+    rest = rest.split_once(char::is_whitespace)?.1;
+    loop {
+        rest = rest.trim_start();
+        let at = rest.find(|c: char| c == '=' || c.is_whitespace())?;
+        let (key, after) = rest.split_at(at);
+        let after = after.trim_start().strip_prefix('=')?.trim_start();
+        let quote = after.chars().next().filter(|q| *q == '"' || *q == '\'')?;
+        let (value, next) = after[1..].split_once(quote)?;
+        if key == name {
+            return Some(decode(value));
+        }
+        rest = next;
+    }
+}
+
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
 /// and its trimmed text up to the first child, the predefined entities
 /// decoded; comments, CDATA sections, declarations and attributes are
 /// skipped.
 fn elements(text: &str) -> Vec<(String, String)> {
+    tags(text)
+        .into_iter()
+        .map(|(path, body, _)| (path, body))
+        .collect()
+}
+
+/// [`elements`], with each element's tag text (its name and attributes).
+fn tags(text: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     let mut path: Vec<&str> = Vec::new();
     let mut rest = text;
@@ -174,11 +229,8 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = field_text(rest);
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
-            .iter()
-            .fold(body, |b, (entity, c)| b.replace(entity, c));
-        out.push((path.join("/"), body));
+        let body = decode(&field_text(rest));
+        out.push((path.join("/"), body, tag.to_owned()));
         if closed {
             path.pop();
         }
@@ -250,6 +302,29 @@ pub fn use_console_timers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest's executables, by name: not an entry inside a comment
+    /// or elsewhere than its list, nor an attribute only ending in `Name`;
+    /// entities decoded, either quote.
+    #[test]
+    fn the_manifest_lists_its_executables() {
+        let manifest = r#"<?xml version="1.0"?>
+            <Game>
+              <!-- <ExecutableList><Executable Name="Old.exe"/></ExecutableList> -->
+              <ExecutableList>
+                <!-- <Executable Name="Crash.exe" Id="Game"/> -->
+                <Executable OverrideDisplayName="x" Name="A&amp;B.exe" Id="Game"/>
+                <Executable Name = 'Other.exe' Id="Tool"></Executable>
+              </ExecutableList>
+              <Executable Name="Stray.exe"/>
+              <ShellVisuals DefaultDisplayName="Title"/>
+            </Game>"#;
+        assert_eq!(manifest_executables(manifest), ["A&B.exe", "Other.exe"]);
+        assert!(manifest_executables("").is_empty());
+        assert!(manifest_executables("<Game><ExecutableList/></Game>").is_empty());
+        let unnamed = r#"<Game><ExecutableList><Executable Id="Game"/></ExecutableList></Game>"#;
+        assert!(manifest_executables(unnamed).is_empty());
+    }
 
     #[test]
     fn a_quoted_angle_bracket_does_not_end_its_tag() {
