@@ -1502,9 +1502,11 @@ impl Residency {
 /// device at the next submission too).
 pub(crate) fn keep_resident(object: &impl Interface, residency: Residency) {
     #[cfg(test)]
-    KEPT.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(object.as_raw() as usize, residency);
+    if let Ok(o) = object.cast::<ID3D12Object>() {
+        let k = residency as u8;
+        // SAFETY: one byte of ours, which the call copies.
+        let _ = unsafe { o.SetPrivateData(&KEPT, 1, Some(std::ptr::from_ref(&k).cast())) };
+    }
     // The priority every allocation starts with: no call.
     if residency.priority() == D3D12_RESIDENCY_PRIORITY_NORMAL {
         return;
@@ -1524,19 +1526,22 @@ pub(crate) fn keep_resident(object: &impl Interface, residency: Residency) {
     }
 }
 
-/// What [`keep_resident`] was asked for each object, by pointer (tests: the
-/// device has no getter for priorities).
+/// The private data [`keep_resident`] leaves on each object (tests: the
+/// device has no getter for priorities). Kept on the object, not by its
+/// address: an object made later at the address of one released (tests
+/// running alongside) starts with none.
 #[cfg(test)]
-static KEPT: Mutex<std::collections::BTreeMap<usize, Residency>> =
-    Mutex::new(std::collections::BTreeMap::new());
+const KEPT: windows::core::GUID =
+    windows::core::GUID::from_u128(0x6b1f0c52_8e4d_4f3a_9c27_5d0e8a1b7f34);
 
 /// What [`keep_resident`] was last asked for `object` (tests).
 #[cfg(test)]
 pub(crate) fn kept(object: &impl Interface) -> Option<Residency> {
-    KEPT.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&(object.as_raw() as usize))
-        .copied()
+    let o = object.cast::<ID3D12Object>().ok()?;
+    let (mut k, mut size) = (0u8, 1u32);
+    // SAFETY: one byte to fill, of the size given.
+    unsafe { o.GetPrivateData(&KEPT, &mut size, Some(std::ptr::from_mut(&mut k).cast())) }.ok()?;
+    [Residency::Frame, Residency::Streamed].into_iter().find(|r| *r as u8 == k)
 }
 
 /// The id of the next host list (see [`HostList::is_node`]).
