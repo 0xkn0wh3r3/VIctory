@@ -3334,6 +3334,32 @@ Out ps() { Out o; o.a = float4(1, 0, 0, 1); o.b = float4(0, 1, 0, 1); return o; 
         }
     }
 
+    /// One list reads a texture through a view of level 3 on, then through
+    /// a view of level 0 on: its submission uploads the texture whole.
+    #[test]
+    fn a_list_reading_an_earlier_level_later_uploads_it_whole() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let words = crate::resource::texture_words(256, 256, 28, 9);
+        let p = crate::watch::tests::pool(8);
+        let object = texture_at_address(p as u64, &words);
+        let view = |most_detailed: u32| {
+            let mut desc = [0u32; 10];
+            desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, most_detailed, 9 - most_detailed]);
+            View::Shader(object as usize, Some(desc))
+        };
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Srv), &view(3), false);
+        assert_eq!(crate::texture::staged_from(object).map(|s| s.0), Some(3));
+        readable(&list, &used(ResourceType::Srv), &view(0), false);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(crate::texture::staged_from(object).map(|s| s.0), Some(0), "staged from level 0");
+        assert_eq!(crate::texture::uploads(object), 1, "uploaded once");
+        assert_eq!(crate::texture::copied(object), 9, "every level copied");
+    }
+
     /// A list recorded before another whose host copy writes a texture it
     /// reads, but run after it, reads the host's texels: whether its upload
     /// from title memory is still due is decided when its submission is
