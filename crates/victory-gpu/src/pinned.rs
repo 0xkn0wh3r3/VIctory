@@ -20,11 +20,18 @@
 //! `ERROR_INVALID_PARAMETER` after a release is tried again, for up to
 //! [`SETTLE`].
 //!
+//! A pin counts as held until its release has returned: another thread
+//! changing an overlapping range meanwhile waits for that release, then
+//! retries as above, instead of meeting the memory still locked.
+//!
+//! Never change title memory through here from the guard handler or under
+//! `crate::watch`'s lock: a release may wait for a submission to finish.
+//!
 //! Cost without pins: one atomic load per change.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
@@ -67,14 +74,20 @@ struct Pins {
     /// The longest range ever registered: how far before a range's start a
     /// pin overlapping it may begin.
     longest: usize,
+    /// Pins whose release is running, by id: (start, end, the thread
+    /// running it).
+    releasing: BTreeMap<u64, (usize, usize, std::thread::ThreadId)>,
 }
 
 static REGISTRY: Mutex<Option<Pins>> = Mutex::new(None);
-/// Pins registered now (the fast path's test).
+/// Signalled when releases return.
+static RELEASED: Condvar = Condvar::new();
+/// Pins registered now, those being released among them (the fast path's
+/// test).
 static PINS: AtomicUsize = AtomicUsize::new(0);
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
-struct Guard(std::sync::MutexGuard<'static, Option<Pins>>);
+struct Guard(MutexGuard<'static, Option<Pins>>);
 
 impl std::ops::Deref for Guard {
     type Target = Pins;
@@ -146,14 +159,29 @@ pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i3
     worked
 }
 
-/// Lets every holder of part of `[at, at + len)` go; how many there were.
+/// Lets every holder of part of `[at, at + len)` go, after waiting for
+/// other threads' releases there to return; how many holders there were,
+/// those waited for among them.
 fn release(at: usize, len: usize) -> usize {
     if PINS.load(Ordering::Relaxed) == 0 || len == 0 {
         return 0;
     }
     let end = at.saturating_add(len);
-    let released: Vec<Release> = {
-        let mut pins = pins();
+    let me = std::thread::current().id();
+    let overlaps = |&(s, e, _): &(usize, usize, std::thread::ThreadId)| s < end && e > at;
+    let (released, waited): (Vec<(u64, Release)>, usize) = {
+        let mut g = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(Pins::default);
+        // Releases running on other threads there: wait for them (a release
+        // running on this thread is the caller's own).
+        let mut waited = 0;
+        while let Some(pins) = g.as_ref()
+            && pins.releasing.values().any(|r| overlaps(r) && r.2 != me)
+        {
+            waited = 1;
+            g = RELEASED.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        let pins = g.as_mut().expect("made above");
         let from = at.saturating_sub(pins.longest);
         let hit: Vec<(usize, u64)> = pins
             .ranges
@@ -161,19 +189,33 @@ fn release(at: usize, len: usize) -> usize {
             .filter(|(_, (pin_end, _))| *pin_end > at)
             .map(|(key, _)| *key)
             .collect();
-        hit.into_iter()
+        let released = hit
+            .into_iter()
             .filter_map(|key| {
                 pins.by_id.remove(&key.1);
-                pins.ranges.remove(&key).map(|(_, release)| release)
+                let (pin_end, release) = pins.ranges.remove(&key)?;
+                pins.releasing.insert(key.1, (key.0, pin_end, me));
+                Some((key.1, release))
             })
-            .collect()
+            .collect();
+        (released, waited)
     };
-    PINS.fetch_sub(released.len(), Ordering::Relaxed);
     let n = released.len();
-    for release in released {
+    let ids: Vec<u64> = released.iter().map(|(id, _)| *id).collect();
+    for (_, release) in released {
         release();
     }
     if n > 0 {
+        let mut g = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pins) = g.as_mut() {
+            for id in &ids {
+                pins.releasing.remove(id);
+            }
+        }
+        // Held until here: a change on another thread sees them.
+        PINS.fetch_sub(n, Ordering::Relaxed);
+        drop(g);
+        RELEASED.notify_all();
         tracing::debug!(
             at = format_args!("{at:#x}"),
             len,
@@ -181,7 +223,7 @@ fn release(at: usize, len: usize) -> usize {
             "title memory let go before the runtime changes it"
         );
     }
-    n
+    n + waited
 }
 
 #[cfg(test)]
@@ -271,6 +313,38 @@ mod tests {
         assert_eq!(title_memory_change(base, 0x1000, denied), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(n.load(Ordering::Relaxed), 2);
+    }
+
+    /// A second thread changing the range while the first is still
+    /// releasing waits for that release to return.
+    #[test]
+    fn a_change_waits_for_a_release_running_on_another_thread() {
+        let base = 0x7300_0000_0000;
+        let (started, done) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (s, d) = (started.clone(), done.clone());
+        let _p = pin(
+            base,
+            0x1_0000,
+            Box::new(move || {
+                s.store(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                d.store(1, Ordering::SeqCst);
+            }),
+        );
+        let first = std::thread::spawn(move || release(base, 0x1000));
+        while started.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        assert!(title_memory_held(), "held until the release returns");
+        // Overlapping, not the same range.
+        let waited = release(base + 0x8000, 0x1_0000);
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            1,
+            "the change came after the release"
+        );
+        assert_eq!(waited, 1);
+        assert_eq!(first.join().unwrap(), 1);
     }
 
     /// What the registry is for: memory a heap is opened over cannot be
