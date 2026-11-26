@@ -10,7 +10,8 @@
 //! shortcut: a submission whose completion writes title memory (copy-backs,
 //! write marks, bottom-of-pipe writes) completes before the next one is
 //! prepared, whose refreshes read title memory: only submissions without
-//! such writes overlap. Per-submission snapshots and bitmaps would lift it.
+//! such writes overlap (marks of views read are taken by any). Snapshots
+//! and bitmaps per submission would lift it.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -1080,8 +1081,10 @@ struct InFlight {
     /// submission with uploads records again.
     uploads: bool,
     /// Its shaders mark in the views' bitmaps: its completion takes the
-    /// marks.
+    /// read marks, and if it is heavy (or waited for) the write marks.
     marks: bool,
+    /// It is waited for at once (`Host::execute`): nothing runs after it.
+    sync: bool,
     /// When it was handed to the host GPU.
     prepared: Instant,
     /// What its preparing used, released after it.
@@ -1434,7 +1437,9 @@ impl Host {
             .map(|r| r.value)
         {
             drop(submitted);
+            let waiting = std::time::Instant::now();
             wait_unlocked(&self.fence, last);
+            SUBMISSION_US[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             submitted = self.lock_submitted();
             // SAFETY: a plain query.
             let reached = unsafe { self.fence.GetCompletedValue() };
@@ -1714,6 +1719,7 @@ impl Host {
             // Out of overlap nothing else is in flight: the bitmaps are this
             // submission's whatever marked them (tests bind them directly).
             marks: !overlap || all.iter().any(|l| l.marks.load(Ordering::Relaxed)),
+            sync: !overlap,
             prepared,
             batch,
             heaps,
@@ -1819,14 +1825,18 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
-        // The bitmaps hold the marks of this submission's shaders only if
-        // it bound them (a later one in flight may be marking).
-        if record.marks {
+        // Write marks are this submission's alone if it is heavy (the next
+        // waits for it) or waited for: those of a later one still running
+        // would go back early and be lost to it.
+        if record.marks && (record.heavy || record.sync) {
             // Pages shaders marked first: the copy-backs below end what the
             // copies keep for them.
             crate::shadow::copy_back_marks(&withheld, withholding);
-            // Texture views left null that shaders read: made for what
-            // follows.
+        }
+        // Texture views left null that shaders read: made for what follows
+        // (a later submission's marks taken with them only make its views
+        // early).
+        if record.marks {
             let read = crate::shadow::take_reads();
             if !read.is_empty() {
                 crate::descriptor::make_read(&read);
@@ -2342,14 +2352,17 @@ impl HostList {
     }
 
     /// Whether completing a submission of the list writes title memory or
-    /// reads what its shaders marked: copy-backs of title buffers' copies
-    /// its shaders write, marks, title memory through page tables, work
-    /// after it or bottom-of-pipe writes. The next submission's refreshes
-    /// and copies read title memory, so it is prepared only once such a
-    /// submission has completed.
+    /// takes what its shaders marked as written: copy-backs of title
+    /// buffers' copies its shaders write (declared, or marked through the
+    /// heap's views), title memory through page tables, work after it or
+    /// bottom-of-pipe writes. The next submission's refreshes and copies
+    /// read title memory, and its shaders mark in the same bitmaps, so it is
+    /// prepared only once such a submission has completed. Marks of views
+    /// read alone (tables, root views) do not count: taken early, they make
+    /// views early.
     fn heavy(&self) -> bool {
         let d = self.deferred();
-        self.marks.load(Ordering::Relaxed)
+        self.marks.load(Ordering::Relaxed) && d.copies.iter().any(|s| matches!(s, Step::Heap(_)))
             || !d.after.is_empty()
             || !d.writes.is_empty()
             || !d.missed.is_empty()
@@ -3253,7 +3266,10 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+/// Swap chain buffers: one shown, one queued to be, and one the next frame
+/// is drawn into while the GPU runs on (a present does not wait for its
+/// frame; with two, the queue stalled until the shown one was let go).
+const BUFFERS: u32 = 3;
 /// Present lists in turn ([`Presenter::copies`]).
 const PRESENT_LISTS: usize = 3;
 const MAX_PLANES: u32 = 8;
