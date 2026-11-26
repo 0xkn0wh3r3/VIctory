@@ -1,6 +1,6 @@
-# VIctory, 101Leafy build
+# victory-leafy
 
-A build of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
+101Leafy's build of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
 This branch brings together the forks and open pull requests below, with fixes
 for NVIDIA cards, Intel CPUs, and Windows 10 on top. It is early work.
@@ -178,8 +178,8 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone -b full-build https://github.com/101Leafy/VIctory
-cd VIctory
+git clone https://github.com/101Leafy/victory-leafy
+cd victory-leafy
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable>
