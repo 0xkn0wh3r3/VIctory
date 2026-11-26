@@ -57,11 +57,12 @@ struct Shown {
     #[arg(long, default_value = "1440p", value_parser = resolution)]
     resolution: (u32, u32),
     /// Stress VIctory's translation layer: each step past 1 adds 64 draws
-    /// to a frame, each with its constants written into title memory and
-    /// its view made in the heap that frame, and one more submission
-    /// (1: the checked frame's work).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1024))]
-    scale: u32,
+    /// (spinning shapes beside the highway) to a frame, each with its
+    /// constants written into title memory and its view made in the heap
+    /// that frame, and one more submission. 4 for `demo`, 1 for
+    /// `conformance --window` unless given.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1024))]
+    scale: Option<u32>,
     /// Leave VIctory's overlay (frame rate and frame times) hidden in the
     /// window; Alt+Z still shows it.
     #[arg(long)]
@@ -78,7 +79,7 @@ struct Shown {
 
 pub fn conformance(root: &Path, args: Conformance) -> Result<()> {
     let window = args.window.map(|s| s.to_string());
-    run(root, window.as_deref(), &args.shown, args.test_args)
+    run(root, window.as_deref(), &args.shown, 1, args.test_args)
 }
 
 pub fn demo(root: &Path, args: Demo) -> Result<()> {
@@ -86,18 +87,26 @@ pub fn demo(root: &Path, args: Demo) -> Result<()> {
         .seconds
         .map_or("until-closed".into(), |s| s.to_string());
     let test_args = vec![GPU_TEST.into(), "--exact".into()];
-    run(root, Some(&window), &args.shown, test_args)
+    run(root, Some(&window), &args.shown, 4, test_args)
 }
 
 /// Runs the conformance test, showing the GPU frame in a window for
-/// `window` (seconds, or `until-closed`) if asked.
-fn run(root: &Path, window: Option<&str>, shown: &Shown, mut test_args: Vec<String>) -> Result<()> {
+/// `window` (seconds, or `until-closed`) if asked, at `--scale` or else
+/// `default_scale`.
+fn run(
+    root: &Path,
+    window: Option<&str>,
+    shown: &Shown,
+    default_scale: u32,
+    mut test_args: Vec<String>,
+) -> Result<()> {
     let mut env: Vec<(&str, String)> = vec![];
     if let Some(window) = window {
         let (width, height) = shown.resolution;
         env.push(("VICTORY_CONFORMANCE_WINDOW", window.into()));
         env.push(("VICTORY_CONFORMANCE_SIZE", format!("{width}x{height}")));
-        env.push(("VICTORY_CONFORMANCE_SCALE", shown.scale.to_string()));
+        let scale = shown.scale.unwrap_or(default_scale);
+        env.push(("VICTORY_CONFORMANCE_SCALE", scale.to_string()));
         env.push((
             "VICTORY_OVERLAY",
             if shown.no_overlay { "0" } else { "1" }.into(),

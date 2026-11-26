@@ -146,16 +146,23 @@ fn frame_bytes(width: u32, height: u32) -> u64 {
 
 /// Draws, and one submission, each step of the demo's stress scale adds.
 pub const DRAWS_A_STEP: usize = 64;
-/// Views the checked frame's heap holds; the stress scale's come after.
-const VIEWS: u64 = 16;
-/// In the demo's window only: the terrain's constants (slot 5), the sky
-/// texture, and the backdrop's constants (slot 6).
+/// The heap's views before the stress scale's: the checked frame's (0-8),
+/// and in the demo's window the terrain's constants (slot 5), the sky
+/// texture, the backdrop's constants (slot 6), and from [`MAIN_VIEW`] its
+/// main draws' (from slot [`MAIN_SLOT`]).
+const VIEWS: u64 = 32;
 const TERRAIN_VIEW: u64 = 9;
 const SKY_VIEW: u64 = 10;
 const BACKDROP_VIEW: u64 = 11;
+const MAIN_VIEW: u64 = 16;
+/// The window's main draws (`scene::window_frame`): their first constant
+/// slot, and how many there can be.
+const MAIN_SLOT: usize = 8;
+const MAIN_MAX: usize = 16;
 /// Constant slots before the stress scale's: the scene, the checked
-/// frame's 4 draws, the terrain, the backdrop.
-const SLOTS: usize = 7;
+/// frame's 4 draws, the terrain, the backdrop, one spare, the window's main
+/// draws.
+const SLOTS: usize = MAIN_SLOT + MAIN_MAX;
 
 /// The draws the stress scale adds to the checked frame's four.
 pub fn extra_draws(scale: u32) -> usize {
@@ -1106,6 +1113,16 @@ fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Opt
             let desc = [constants + 256 * slot, 256];
             call!(device, 0x88, fn(*const [u64; 2], u64), &desc, view(at));
         }
+        for n in 0..MAIN_MAX as u64 {
+            let desc = [constants + 256 * (MAIN_SLOT as u64 + n), 256];
+            call!(
+                device,
+                0x88,
+                fn(*const [u64; 2], u64),
+                &desc,
+                view(MAIN_VIEW + n)
+            );
+        }
         let srv = [RGBA8, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
         call!(
             device,
@@ -1260,20 +1277,23 @@ impl Gpu {
         unsafe {
             let base = self.constants_cpu;
             std::ptr::copy_nonoverlapping((&raw const scene).cast::<u8>(), base, 256);
+            // The window's main draws from MAIN_SLOT, the checked frame's from 1.
+            let first = if self.scenery { MAIN_SLOT } else { 1 };
+            assert!(draws.len() <= MAIN_MAX, "the window's main draws fit");
             for (n, (_, mesh)) in draws.iter().enumerate() {
                 std::ptr::copy_nonoverlapping(
                     (&raw const *mesh).cast::<u8>(),
-                    base.add(256 * (n + 1)),
+                    base.add(256 * (first + n)),
                     256,
                 );
             }
-            let terrain = scene::terrain();
+            let terrain = scene::terrain(at);
             std::ptr::copy_nonoverlapping(
                 (&raw const terrain).cast::<u8>(),
                 base.add(256 * 5),
                 256,
             );
-            let backdrop = scene::backdrop();
+            let backdrop = scene::backdrop(at);
             std::ptr::copy_nonoverlapping(
                 (&raw const backdrop).cast::<u8>(),
                 base.add(256 * 6),
@@ -1388,9 +1408,10 @@ impl Gpu {
             );
             call!(list, 0x120, fn(u32, u64), 2, table(5));
         }
+        let first_view = if self.scenery { MAIN_VIEW } else { 1 };
         for (n, &(mesh, _)) in draws.iter().enumerate() {
             let m = self.geometry.meshes[mesh];
-            call!(list, 0x120, fn(u32, u64), 1, table(n as u64 + 1));
+            call!(list, 0x120, fn(u32, u64), 1, table(first_view + n as u64));
             call!(
                 list,
                 0x68,
@@ -1651,7 +1672,12 @@ pub fn run(
         let started = std::time::Instant::now();
         let mut shown = 0u64;
         let mut presented = S_OK;
-        let draws = 4 + 2 * usize::from(g.scenery) + extra_draws(g.scale);
+        let main = if g.scenery {
+            scene::window_frame(0.0).1.len() + 2
+        } else {
+            4
+        };
+        let draws = main + extra_draws(g.scale);
         let submissions = 1 + extra_draws(g.scale) / DRAWS_A_STEP;
         let per_frame = format!(
             "{}x{}, scale {}: {draws} draws and {submissions} submissions a frame",
@@ -1675,7 +1701,11 @@ pub fn run(
             let before = Instant::now();
             let token = g.begin();
             let begun = Instant::now();
-            g.frame(started.elapsed().as_secs_f32(), fresh && shown == 0, true);
+            g.frame(
+                scene::demo_time(started.elapsed()),
+                fresh && shown == 0,
+                true,
+            );
             let framed = Instant::now();
             let hr = g.present(token);
             g.costs.wait += begun - before;
@@ -1688,7 +1718,11 @@ pub fn run(
         }
         // The last frame once more, read back (`VICTORY_CONFORMANCE_DUMP`).
         g.begin();
-        g.frame(started.elapsed().as_secs_f32(), fresh && shown == 0, false);
+        g.frame(
+            scene::demo_time(started.elapsed()),
+            fresh && shown == 0,
+            false,
+        );
         window_image = g.read();
         t.eq(
             presented,
