@@ -405,8 +405,11 @@ impl Panel {
         if page_switched {
             CURRENT_PAGE.fetch_xor(1, Ordering::Relaxed);
         }
-        if pressed_f5() {
-            IS_FROZEN.fetch_xor(true, Ordering::Relaxed);
+        if pressed_f5() && IS_FROZEN.fetch_xor(true, Ordering::Relaxed) {
+            // Released: the time held is not a frame.
+            let now = Instant::now();
+            (self.since, self.last, self.worst, self.before) = (now, now, 0.0, Counters::now());
+            self.frames = 0;
         }
         let frozen = IS_FROZEN.load(Ordering::Relaxed);
         if frozen && !page_switched {
