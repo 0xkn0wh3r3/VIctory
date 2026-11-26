@@ -641,12 +641,16 @@ pub(crate) mod tests {
             assert!(heap_host.mirror(s, at(s), true).is_some());
             assert!(heap_host.kept(s), "slot {s} made for the draw");
         }
+        let strides = slots.map(|s| heap_host.stride_entry(s));
+        assert!(strides[1] != 0 && strides[2] != 0, "buffer views' strides entered");
         let mut t = std::time::Instant::now();
         take_back_all(heap_host, &mut t);
         assert_eq!(heap_host.host_page_of(cbv), Some(0), "taken back");
         for s in slots {
             assert!(!heap_host.kept(s), "slot {s} holds nothing");
             assert!(heap_host.made_from(s, at(s)), "slot {s}'s record stays noted");
+            // Shaders reading it through the heap take the null buffer views.
+            assert_eq!(heap_host.stride_entry(s), 0, "slot {s} has no stride");
         }
         // A shader reads the page: placed again, its views made again.
         crate::shadow::tests::mark_page_read(false, 1);
@@ -655,6 +659,7 @@ pub(crate) mod tests {
         for s in slots {
             assert!(heap_host.kept(s), "slot {s} made again");
         }
+        assert_eq!(slots.map(|s| heap_host.stride_entry(s)), strides, "strides entered again");
         // Taken back again: a draw binding the constant buffer places it.
         take_back_all(heap_host, &mut t);
         assert_eq!(heap_host.host_page_of(cbv), Some(0), "taken back again");
@@ -691,10 +696,12 @@ pub(crate) mod tests {
         assert_eq!(heap_host.host_page_of(slot), Some(0), "no room for its page");
         assert!(heap_host.made_from(slot, at), "its record noted");
         assert!(!heap_host.kept(slot), "made in the scratch page: the slot holds nothing");
+        assert_eq!(heap_host.stride_entry(slot), 0, "no stride where shaders find no view");
         crate::shadow::tests::mark_page_read(false, 1);
         crate::descriptor::turn_pages(&crate::shadow::take_page_reads(), std::time::Instant::now());
         assert_ne!(heap_host.host_page_of(slot), Some(0), "placed");
         assert!(heap_host.kept(slot), "made in its page");
+        assert_ne!(heap_host.stride_entry(slot), 0, "its stride entered");
     }
 
     /// The textures shaders read through the heap since the last eviction

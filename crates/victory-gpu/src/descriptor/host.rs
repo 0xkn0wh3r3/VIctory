@@ -954,6 +954,8 @@ impl HostHeap {
         for &(page, host_page) in &taken {
             for index in page * PAGE..((page + 1) * PAGE).min(self.count) {
                 self.keep(index, None);
+                // Shaders now find the page of null (texture) views there.
+                self.write_stride(index, 0);
                 self.set_mark(index, None);
                 self.viewed.set(index, None, false);
                 // A shader's next read of it is taken (`make_read`).
@@ -1137,7 +1139,6 @@ impl HostHeap {
             }
         }
         {
-            self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             if later {
                 // Made once a shader reads it (`crate::shadow::take_reads`).
@@ -1151,6 +1152,13 @@ impl HostHeap {
                 let (kept, mark) = make_marked(&view, at);
                 (kept, mark, placed)
             };
+            // A view made in the scratch page is not where shaders read the
+            // slot, which still reads the page of null (texture) views.
+            if placed {
+                self.set_stride(index, Some(&view));
+            } else {
+                self.write_stride(index, 0);
+            }
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -1289,6 +1297,14 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn host_page_of(&self, index: u32) -> Option<u32> {
         self.pages.as_ref().map(|p| p.host_page(index / PAGE))
+    }
+
+    /// Slot `index`'s dword of the view-stride table (tests).
+    #[cfg(test)]
+    pub(crate) fn stride_entry(&self, index: u32) -> u32 {
+        let (_, data) = self.strides.as_ref().expect("a view heap");
+        // SAFETY: a dword of the mapped table.
+        unsafe { (*data as *const u32).add(index as usize).read_volatile() }
     }
 
     /// The page table's entry for page `page` of a paged heap (tests).
