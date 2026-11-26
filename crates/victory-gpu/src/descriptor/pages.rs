@@ -40,6 +40,24 @@ const MIN_AGE: Duration = Duration::from_secs(10);
 /// more than a frame's submissions, so pages read every frame stay.
 const PRESSED_AGE_SUBMISSIONS: u32 = 32;
 
+/// Diagnostics, `VICTORY_VIEW_PAGES_KEEP=1`: no page is taken back, so a
+/// write past the free pages is refused as before take-back. Asked once.
+fn keeps_pages() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *KEEP.get_or_init(|| {
+            let keep = crate::switch::on("VICTORY_VIEW_PAGES_KEEP");
+            if keep {
+                tracing::warn!("view heap pages are never taken back (VICTORY_VIEW_PAGES_KEEP)");
+            }
+            keep
+        })
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    false
+}
+
 /// A paged view heap's pages: the host page of each page of slots (0 for
 /// none: [`NULL_PAGE`]), entered in the page table shaders read, and when
 /// each was last used.
@@ -362,7 +380,7 @@ impl Pages {
             p.ended.pop_front();
         }
         let free = p.free.len() as u32 + (self.end - p.next);
-        if free >= p.low {
+        if free >= p.low || keeps_pages() {
             return Vec::new();
         }
         // A page stamped `s` was last used before submission `s + 1` ended.
