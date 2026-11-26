@@ -41,8 +41,13 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Builds the fixture into its own target dir (the outer cargo holds the
-/// lock on the main one while tests run).
+/// lock on the main one while tests run). `VICTORY_CONFORMANCE_DLL` names
+/// one built already instead: for a test binary run where cargo is not, such
+/// as a cross-compiled one under Wine.
 fn build_fixture() -> PathBuf {
+    if let Some(dll) = std::env::var_os("VICTORY_CONFORMANCE_DLL") {
+        return PathBuf::from(dll);
+    }
     let manifest = workspace_root().join("tests/fixtures/conformance/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("conformance");
     let status = Command::new(env!("CARGO"))
