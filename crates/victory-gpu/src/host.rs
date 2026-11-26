@@ -837,6 +837,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With commands timed: the host copies each command binds, as (its
+    /// note, copy, bytes bound) (`crate::heat`).
+    #[cfg(feature = "diagnostics")]
+    uses: Mutex<Vec<(u32, crate::heat::Key, u64)>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -1148,6 +1152,8 @@ impl Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                uses: Mutex::default(),
             })
         }
     }
@@ -1292,6 +1298,8 @@ impl Host {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
+                let uses = runs[i].uses.lock().unwrap_or_else(|e| e.into_inner());
+                crate::heat::commands(&runs[i].command_times(frequency), &uses);
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
@@ -1404,6 +1412,8 @@ impl Host {
             if *goes_back {
                 let written = shadow.copy_back(address, len);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::heat::copied_back(shadow.range(), written);
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
@@ -1712,8 +1722,24 @@ impl HostList {
     /// (milliseconds, text) (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+        let times = self.command_times(frequency);
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+        let mut times: Vec<(f64, String)> = times
+            .into_iter()
+            .zip(notes.iter())
+            .map(|(ms, note)| (ms, note.0.chars().take(300).collect()))
+            .collect();
+        times.sort_by(|a, b| b.0.total_cmp(&a.0));
+        times.truncate(n);
+        times
+    }
+
+    /// Each noted command's GPU time in milliseconds, in order
+    /// (diagnostics, timing on, after the list ran).
+    #[cfg(feature = "diagnostics")]
+    fn command_times(&self, frequency: u64) -> Vec<f64> {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let (Some((_, back)), count) = (self.stamps(), notes.min(STAMPS as usize - 1)) else {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
@@ -1727,15 +1753,22 @@ impl HostList {
             back.Unmap(0, None);
             s
         };
-        let mut times: Vec<(f64, String)> = (0..count)
+        (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                ticks as f64 * 1e3 / frequency.max(1) as f64
             })
-            .collect();
-        times.sort_by(|a, b| b.0.total_cmp(&a.0));
-        times.truncate(n);
-        times
+            .collect()
+    }
+
+    /// With commands timed: the next noted command binds `bytes` of `key`
+    /// (`crate::heat`).
+    #[cfg(feature = "diagnostics")]
+    fn note_use(&self, key: crate::heat::Key, bytes: u64) {
+        if dred_on() && timing() {
+            let next = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            self.uses.lock().unwrap_or_else(|e| e.into_inner()).push((next, key, bytes));
+        }
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
@@ -1787,6 +1820,8 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.uses.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -2075,6 +2110,8 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        #[cfg(feature = "diagnostics")]
+        self.note_use(shadow.range(), len as u64);
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
@@ -2104,6 +2141,8 @@ impl HostList {
     /// (`crate::bindless`): what the heap's views reach is brought up to
     /// date at submission (once until a title copy intervenes).
     pub(crate) fn defer_heap(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
+        #[cfg(feature = "diagnostics")]
+        self.note_use(crate::heat::HEAP, 0);
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
@@ -2114,6 +2153,8 @@ impl HostList {
     /// Shaders of the list read title memory through the page table of
     /// view heap `heap` (`crate::memory::prepare` at submission).
     pub(crate) fn defer_memory(&self, heap: usize) {
+        #[cfg(feature = "diagnostics")]
+        self.note_use(crate::heat::MEMORY, 0);
         self.deferred().copies.push(Step::Memory(heap));
     }
 
@@ -2448,6 +2489,8 @@ impl Batch {
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
+            #[cfg(feature = "diagnostics")]
+            crate::heat::copied_in(shadow.range(), copied);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
             total += copied;
@@ -3121,6 +3164,7 @@ impl Meter {
                 let drops = crate::pipeline::take_drops();
                 crate::frame::log();
                 log_gpu_times(report_frames);
+                crate::heat::log(report_frames);
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
