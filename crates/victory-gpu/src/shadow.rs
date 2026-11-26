@@ -818,6 +818,19 @@ pub(crate) fn view_writes(memory: bool) -> Option<u64> {
 /// clear at the next [`take_reads`].
 static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
 
+/// Visits the read marks below `end`. Only a partial last word needs a mask.
+fn read_words(words: &mut [u32], end: u32, mut visit: impl FnMut(usize, &mut u32, u32)) {
+    let end = (end as usize).min(words.len().saturating_mul(32));
+    let (full, tail) = words.split_at_mut(end / 32);
+    for (w, word) in full.iter_mut().enumerate() {
+        visit(w, word, u32::MAX);
+    }
+    let bits = end % 32;
+    if bits != 0 {
+        visit(full.len(), &mut tail[0], (1 << bits) - 1);
+    }
+}
+
 /// After a submission: the heap slots its shaders first read texture views
 /// at (`victory_shader::emit`, "Read marks"), each once until
 /// [`forget_read`]. Clears the slots forgotten since first.
@@ -847,16 +860,15 @@ pub(crate) fn take_reads() -> Vec<u32> {
     }
     // Slots past every view heap's are no heap's (`descriptor::view_slots`):
     // their marks are left for a larger heap to find.
-    let used = (crate::descriptor::view_slots().div_ceil(32) as usize).min(words);
     let mut new = Vec::new();
-    for (w, s) in seen[..used].iter_mut().enumerate() {
-        let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
+    read_words(seen, crate::descriptor::view_slots(), |w, s, mask| {
+        let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s & mask;
         *s |= fresh;
         while fresh != 0 {
             new.push(w as u32 * 32 + fresh.trailing_zeros());
             fresh &= fresh - 1;
         }
-    }
+    });
     new
 }
 
@@ -869,18 +881,19 @@ pub(crate) fn reads_since() -> Vec<u32> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     let mut slots = Vec::new();
+    let end = crate::descriptor::view_slots();
     for b in [false, true].into_iter().filter_map(bitmap) {
         // SAFETY: the mapped bitmap's read marks; no submission runs.
         let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
         // As in `take_reads`: no further than any view heap's slots.
-        let used = (crate::descriptor::view_slots().div_ceil(32) as usize).min(words);
-        for (w, word) in bits[..used].iter_mut().enumerate() {
-            let mut x = std::mem::take(word);
+        read_words(bits, end, |w, word, mask| {
+            let mut x = *word & mask;
+            *word &= !mask;
             while x != 0 {
                 slots.push(w as u32 * 32 + x.trailing_zeros());
                 x &= x - 1;
             }
-        }
+        });
     }
     slots.sort_unstable();
     slots.dedup();
