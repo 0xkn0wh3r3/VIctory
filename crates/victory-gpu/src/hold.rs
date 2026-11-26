@@ -5,7 +5,8 @@
 //! (`Write32/64BitValueBottomOfPipeX`): Grand Theft Auto VI's four compute
 //! queues start each list with a wait for the frame's value of a word that
 //! a graphics list writes, and some lists wait again after their first
-//! commands. Our submissions run to completion when the title makes them,
+//! commands. Our submissions all go to one host queue, which runs them in
+//! order, and the memory values a list writes land once it has completed,
 //! so a queue here is a FIFO of what the title submitted to it: segments of
 //! lists (a list is cut where it waits after commands, `crate::list`), its
 //! Signals and its fence Waits, in their order. The head of a queue runs
@@ -112,11 +113,12 @@ pub(crate) struct World<'a, S> {
     pub(crate) read: &'a dyn Fn(u64, u8) -> Option<u64>,
     /// A fence's value.
     pub(crate) fence: &'a dyn Fn(usize) -> u64,
-    /// Runs a piece (a queue, its segments in order) to completion, the
-    /// bottom-of-pipe writes included.
+    /// Runs a piece (a queue, its segments in order); it completes later,
+    /// its bottom-of-pipe writes then (the queue's Signals given to
+    /// `signal` meanwhile wait for it).
     pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
-    /// Signals a fence.
-    pub(crate) signal: &'a mut dyn FnMut(usize, u64),
+    /// Signals a fence behind a queue's work (queue, fence, value).
+    pub(crate) signal: &'a mut dyn FnMut(usize, usize, u64),
 }
 
 impl<S> Held<S> {
@@ -182,7 +184,7 @@ impl<S> Held<S> {
                             piece.push(s);
                             done.segments += 1;
                         }
-                        Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
+                        Some(Item::Signal(fence, value)) => (w.signal)(*queue, fence, value),
                         Some(Item::FenceWait(..)) | None => {}
                     }
                 }
@@ -275,7 +277,7 @@ mod tests {
             }
             f.log.push(format!("q{q}: {}", segments.join(" ")));
         };
-        let mut signal = |fence: usize, value: u64| {
+        let mut signal = |_: usize, fence: usize, value: u64| {
             let mut f = fake.borrow_mut();
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));

@@ -1,5 +1,6 @@
-//! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! Command queues. Submitted lists run on the host GPU and complete later
+//! (`crate::host::Host::submit`): a queue's fence Signal behind them moves
+//! the fence once they have.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -138,7 +139,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 }
 
 /// What ran held work: the title's submission, a queue's Signal or Wait, a
-/// CPU fence call, PresentX, or our timer.
+/// CPU fence call, PresentX, our timer, or a submission completing.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Why {
     Submission,
@@ -147,6 +148,7 @@ pub(crate) enum Why {
     Fence,
     Present,
     Timer,
+    Completed,
 }
 
 #[cfg(windows)]
@@ -204,18 +206,13 @@ fn pump(held: &mut Holding, why: Why) {
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
-    let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
+    let mut run = |queue: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
         let at = std::time::Instant::now();
-        host.execute(&lists);
+        host.submit(queue, segments);
         ran += at.elapsed();
-        drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
     };
-    let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
-        crate::fence::let_go(f as This);
-    };
+    // Behind the queue's work submitted before it, which may still run.
+    let mut signal = |queue: usize, f: usize, value: u64| host.signal_after(queue, f, value);
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
@@ -359,8 +356,8 @@ const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
-/// Signal with sync settings for the top and bottom of the pipe; our
-/// submissions are complete when they run, so it signals as Signal does.
+/// Signal with sync settings for the top and bottom of the pipe; the fence
+/// moves once the work before it has completed, as with Signal.
 extern "system" fn signal2_x(
     this: This,
     fence: This,
@@ -372,8 +369,9 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-/// At once, or behind the work the queue holds (its fence, and the memory
-/// the title reads it at, move only once that work has run).
+/// Behind the work the queue holds, or the work submitted so far (its
+/// fence, and the memory the title reads it at, move only once that work
+/// has completed).
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
@@ -384,6 +382,9 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
+        } else if let Some(host) = crate::host::host() {
+            crate::fence::keep(fence);
+            host.signal_after(this as usize, fence as usize, value);
         } else {
             crate::fence::set(fence, value);
         }
@@ -753,9 +754,33 @@ static FUNCTIONS: Table<36> = Table(queue_table(false));
 static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Held by tests that submit through title queues: their work stays in
+    /// flight after they submit, and a test holding the host GPU
+    /// ([`crate::host::Host::hold_gpu`]) must find none of another's there.
+    pub(crate) static TITLE_QUEUES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Waits as a title does until the work given to `queue` so far has
+    /// completed: a fence the queue signals behind it, waited for (a null
+    /// event blocks until the value is reached).
+    pub(crate) fn finish(queue: This) {
+        let null = std::ptr::null();
+        let mut fence = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+        let signal =
+            slot::<extern "system" fn(This, This, u64) -> HRESULT>(queue, signal_slot(queue));
+        assert_eq!(signal(queue, fence, 1), S_OK);
+        let wait =
+            slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> HRESULT>(fence, 0x48);
+        assert_eq!(wait(fence, 1, std::ptr::null_mut()), S_OK);
+        slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+    }
 
     /// Distinct title resources can name the same host texture. Presenting
     /// both planes must preserve that texture's original rendering state.
@@ -835,7 +860,7 @@ mod tests {
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's
     /// own table decides.
-    fn signal_slot(q: This) -> usize {
+    pub(crate) fn signal_slot(q: This) -> usize {
         // SAFETY: one of our queues; its first field is the table.
         let table = unsafe { *q.cast::<*const *const ()>() };
         if table == NEWER_FUNCTIONS.0.as_ptr() {
