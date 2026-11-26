@@ -1581,6 +1581,16 @@ fn evictable(t: &HostTexture) -> bool {
     t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The frame [`evict_unused`] last ran in.
+#[cfg(windows)]
+static EVICTED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether [`evict_unused`] has yet to run in this frame.
+#[cfg(windows)]
+pub(crate) fn eviction_due() -> bool {
+    EVICTED_AT.load(std::sync::atomic::Ordering::Relaxed) != crate::queue::presented()
+}
+
 /// Once per presented frame, before a submission is prepared (`Host::run`;
 /// those in flight keep what it gives up until they have run): gives up
 /// host textures fed from title memory that the title has not used for
@@ -1589,9 +1599,8 @@ fn evictable(t: &HostTexture) -> bool {
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     let frame = crate::queue::presented();
-    if LAST.swap(frame, Relaxed) == frame {
+    if EVICTED_AT.swap(frame, Relaxed) == frame {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
@@ -1613,10 +1622,10 @@ pub(crate) type Owned = (std::sync::Arc<HostTexture>, Vec<usize>);
 /// ([`give_up`]). Returns how many and their bytes.
 #[cfg(windows)]
 fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
-    // Submissions in flight may have marked reads their completion has not
-    // taken yet: their null views are made now, as it would (the pass below
-    // clears every mark).
-    let first = crate::shadow::take_reads();
+    // Submissions that completed with others marking in flight may have
+    // left reads untaken: their null views are made now, as the completion
+    // would (the pass below clears every mark; none marks in flight now).
+    let first = crate::shadow::take_reads(true);
     if !first.is_empty() {
         crate::descriptor::make_read(&first);
     }

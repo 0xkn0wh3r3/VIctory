@@ -1,17 +1,18 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! The title's submissions return once the host GPU has them and complete
-//! later, as on the console, so that the title records and simulates while
-//! the GPU runs (`docs/submission-overlap.md`): what shaders wrote goes back
-//! to title memory, and the fences signalled behind them move, when the
-//! completion thread sees them done ([`Host::submit`], [`Host::finish`]).
+//! The title's submissions are waited for, so CPU and GPU never overlap.
+//! With `VICTORY_GPU_OVERLAP=1` they return once the host GPU has them and
+//! complete later, as on the console, so that the title records and
+//! simulates while the GPU runs: what shaders wrote goes back to title
+//! memory, and the fences signalled behind them move, when the completion
+//! thread sees them done ([`Host::submit`], [`Host::finish`]).
 //!
-//! shortcut: a submission whose completion writes title memory (copy-backs,
-//! write marks, bottom-of-pipe writes) completes before the next one is
-//! prepared, whose refreshes read title memory: only submissions without
-//! such writes overlap (marks of views read are taken by any). Snapshots
-//! and bitmaps per submission would lift it.
+//! shortcut: overlapping, a submission whose completion writes title memory
+//! (copy-backs, write marks, bottom-of-pipe writes) completes before the
+//! next one is prepared, whose refreshes read title memory: only
+//! submissions without such writes overlap. Snapshots and bitmaps per
+//! submission would lift it.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -456,15 +457,21 @@ pub(crate) mod tests {
         let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
-        let taken = crate::shadow::take_reads();
+        let taken = crate::shadow::take_reads(true);
         assert!(taken.contains(&plain), "a plain shader's read");
         assert!(taken.contains(&memory), "a read by a shader that uses title memory");
-        let again = crate::shadow::take_reads();
+        let again = crate::shadow::take_reads(true);
         assert!(!again.contains(&plain) && !again.contains(&memory), "each once");
         crate::shadow::forget_read(memory);
-        assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its mark cleared");
+        assert!(
+            !crate::shadow::take_reads(true).contains(&memory),
+            "forgotten: its mark cleared"
+        );
         crate::shadow::tests::mark_read(true, memory);
-        assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
+        assert!(
+            crate::shadow::take_reads(true).contains(&memory),
+            "read again after it was forgotten"
+        );
     }
 
     /// The textures shaders read through the heap since the last eviction
@@ -1104,20 +1111,32 @@ struct InFlight {
 #[cfg(test)]
 static GATE: Mutex<Option<ID3D12Fence>> = Mutex::new(None);
 
-/// Whether the title's submissions complete after they return
-/// ([`Host::submit`]); off with `VICTORY_GPU_OVERLAP=0` (each waited for, as
-/// before) and while diagnostics time each list or list a frame, which
-/// read their results at once.
-pub(crate) fn overlap() -> bool {
+/// Whether the title's submissions may complete after they return
+/// ([`Host::submit`]): with `VICTORY_GPU_OVERLAP=1` (off by default: each
+/// is waited for). Tests run with it on unless it is set to 0: theirs are
+/// the paths it adds, and our own lists (`Host::execute`) take the other.
+fn overlap_switch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    let on = *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_GPU_OVERLAP").is_none_or(|v| v != "0");
-        tracing::info!(
-            on,
-            "the title's submissions complete after they return (VICTORY_GPU_OVERLAP)"
-        );
+    *ON.get_or_init(|| {
+        let on = if cfg!(test) {
+            std::env::var_os("VICTORY_GPU_OVERLAP").is_none_or(|v| v != "0")
+        } else {
+            crate::switch::on("VICTORY_GPU_OVERLAP")
+        };
+        if on {
+            tracing::info!(
+                "the title's submissions complete after they return (VICTORY_GPU_OVERLAP)"
+            );
+        }
         on
-    });
+    })
+}
+
+/// Whether the title's submissions complete after they return now
+/// ([`overlap_switch`]): not while diagnostics time each list or list a
+/// frame, which read their results at once.
+pub(crate) fn overlap() -> bool {
+    let on = overlap_switch();
     #[cfg(feature = "diagnostics")]
     return on && !timing() && !crate::capture::listed(crate::queue::presented() + 1);
     #[cfg(not(feature = "diagnostics"))]
@@ -1308,7 +1327,7 @@ impl Host {
         let record = self.run(&mut submitted, runs, false);
         #[cfg(feature = "diagnostics")]
         let (traced, sub) = (record.traced, record.value);
-        self.finish(record, runs);
+        self.finish(record, runs, true);
         drop(submitted);
         pump_after_completions();
         // A listed frame: what this submission's lists drew, as it is now
@@ -1350,12 +1369,14 @@ impl Host {
         // snapshot each); all of them before title copies and work that
         // write title memory on the CPU for the GPU's timeline (those before
         // may still read what they overwrite); the last upload list before
-        // another; and a host list's last run before it runs again (its
-        // prelude and steps run again).
+        // another; a host list's last run before it runs again (its
+        // prelude and steps run again); and, once a frame, those whose
+        // shaders mark reads, before the eviction pass clears the marks.
         let writes = runs.iter().any(|l| l.writes_at_submission());
         let uploading = runs.iter().any(|l| l.uploads_at_submission());
         let mut submitted = self.complete_while(self.lock_submitted(), |r| {
             r.heavy
+                || r.marks && crate::resource::eviction_due()
                 || writes
                 || uploading && r.uploads
                 || r.lists
@@ -1464,7 +1485,8 @@ impl Host {
             let reached = unsafe { self.fence.GetCompletedValue() };
             while submitted.flight.front().is_some_and(|r| r.value <= reached) {
                 let record = submitted.flight.pop_front().expect("a first");
-                self.complete(record);
+                let quiet = !submitted.flight.iter().any(|r| r.marks);
+                self.complete(record, quiet);
             }
         }
         submitted
@@ -1472,10 +1494,10 @@ impl Host {
 
     /// Waits for a submission in flight and completes it: its lists are
     /// recycled once it has.
-    fn complete(&self, mut record: InFlight) {
+    fn complete(&self, mut record: InFlight, quiet: bool) {
         let lists = std::mem::take(&mut record.lists);
         let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
-        self.finish(record, &runs);
+        self.finish(record, &runs, quiet);
         drop(runs);
         lists.into_iter().for_each(crate::list::recycle);
     }
@@ -1520,7 +1542,8 @@ impl Host {
             let mut completed = false;
             while submitted.flight.front().is_some_and(|r| r.value <= reached) {
                 let record = submitted.flight.pop_front().expect("a first");
-                self.complete(record);
+                let quiet = !submitted.flight.iter().any(|r| r.marks);
+                self.complete(record, quiet);
                 completed = true;
             }
             drop(submitted);
@@ -1563,7 +1586,13 @@ impl Host {
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first (kept alive until this
         // submission has run: one in flight may still read them).
-        crate::resource::evict_unused();
+        // Not while a submission that marks reads is in flight: the pass
+        // clears the read marks, which the GPU's ORs may race (it waits for
+        // the next submission; `Host::submit` completes those first once a
+        // frame).
+        if !submitted.flight.iter().any(|r| r.marks) {
+            crate::resource::evict_unused();
+        }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -1753,8 +1782,9 @@ impl Host {
     /// under the submission lock): what shaders wrote goes back to title
     /// memory, then the lists' work after them and bottom-of-pipe writes,
     /// then the title fences signalled behind it. `runs`: its lists, but
-    /// our upload list.
-    fn finish(&self, record: InFlight, runs: &[&HostList]) {
+    /// our upload list; `quiet`: no submission whose shaders mark reads is
+    /// in flight after it (`crate::shadow::take_reads`).
+    fn finish(&self, record: InFlight, runs: &[&HostList], quiet: bool) {
         COMPLETED.store(true, Ordering::Relaxed);
         let waiting = std::time::Instant::now();
         self.wait_for(record.value);
@@ -1857,7 +1887,7 @@ impl Host {
         // (a later submission's marks taken with them only make its views
         // early).
         if record.marks {
-            let read = crate::shadow::take_reads();
+            let read = crate::shadow::take_reads(quiet);
             if !read.is_empty() {
                 crate::descriptor::make_read(&read);
             }
@@ -3286,10 +3316,13 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-/// Swap chain buffers: one shown, one queued to be, and one the next frame
-/// is drawn into while the GPU runs on (a present does not wait for its
-/// frame; with two, the queue stalled until the shown one was let go).
-const BUFFERS: u32 = 3;
+/// Swap chain buffers: with overlap, one shown, one queued to be, and one
+/// the next frame is drawn into while the GPU runs on (a present does not
+/// wait for its frame; with two, the queue stalled until the shown one was
+/// let go).
+fn swap_buffers() -> u32 {
+    if overlap_switch() { 3 } else { 2 }
+}
 /// Present lists in turn ([`Presenter::copies`]).
 const PRESENT_LISTS: usize = 3;
 const MAX_PLANES: u32 = 8;
@@ -3783,7 +3816,7 @@ impl Host {
                 // SAFETY: no back buffer is held; every submission has completed.
                 unsafe {
                     p.swap_chain.ResizeBuffers(
-                        BUFFERS,
+                        swap_buffers(),
                         width,
                         height,
                         format,
@@ -4053,7 +4086,7 @@ impl Host {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
+                BufferCount: swap_buffers(),
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };

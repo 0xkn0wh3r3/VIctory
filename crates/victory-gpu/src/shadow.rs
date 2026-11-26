@@ -808,9 +808,13 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
         .as_ref()
 }
 
-/// The read marks of a bitmap, one bit per heap slot, as atomics: shaders
-/// of a submission still in flight may set more (atomic ORs) while the CPU
-/// takes them.
+/// The read marks of a bitmap, one bit per heap slot. Shaders of a
+/// submission still in flight may set more (atomic ORs) while the CPU reads
+/// them, which is harmless: what is not seen yet is seen by a later call.
+/// The GPU's ORs are not atomic with the CPU's operations, though, so marks
+/// are cleared only with no submission that marks reads in flight
+/// ([`take_reads`] with `clear`, [`reads_since`]); as atomics, the CPU's own
+/// accesses are not a data race.
 fn read_marks(b: &'static Bitmap) -> &'static [AtomicU32] {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
@@ -834,8 +838,10 @@ static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()))
 
 /// After a submission: the heap slots its shaders first read texture views
 /// at (`victory_shader::emit`, "Read marks"), each once until
-/// [`forget_read`]. Clears the slots forgotten since first.
-pub(crate) fn take_reads() -> Vec<u32> {
+/// [`forget_read`]. With `clear` (no submission that marks reads is in
+/// flight), first clears the slots forgotten since the last such call; else
+/// they wait for one.
+pub(crate) fn take_reads(clear: bool) -> Vec<u32> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     // Both bitmaps: shaders that use title memory mark their reads in theirs.
     let maps: Vec<&[AtomicU32]> = [false, true]
@@ -849,7 +855,12 @@ pub(crate) fn take_reads() -> Vec<u32> {
     let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
     let (seen, forgotten) = &mut *reads;
     seen.resize(words, 0);
-    for slot in forgotten.drain(..) {
+    let forgotten = if clear {
+        std::mem::take(forgotten)
+    } else {
+        Vec::new()
+    };
+    for slot in forgotten {
         let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
         if w < words {
             maps.iter().for_each(|bits| {
@@ -875,15 +886,14 @@ pub(crate) fn take_reads() -> Vec<u32> {
 
 /// The heap slots shaders read texture views at since the last call (both
 /// bitmaps), whose marks are cleared: what the title used (eviction stamps,
-/// `crate::resource::evict`). Between submissions, after [`take_reads`]
-/// has seen every mark: its own record of slots seen keeps a slot read
-/// again from being reported as new.
+/// `crate::resource::evict`). With no submission that marks reads in
+/// flight, after [`take_reads`] has seen every mark: its own record of
+/// slots seen keeps a slot read again from being reported as new.
 pub(crate) fn reads_since() -> Vec<u32> {
     let mut slots = Vec::new();
     for bits in [false, true].into_iter().filter_map(bitmap).map(read_marks) {
         for (w, word) in bits.iter().enumerate() {
-            // Taken whole (a mark the GPU sets meanwhile is either in it or
-            // left for the next call); most words are clear.
+            // Most words are clear (no submission marks meanwhile).
             if word.load(AtomicOrdering::Relaxed) == 0 {
                 continue;
             }
