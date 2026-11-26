@@ -3813,7 +3813,7 @@ const UPLOAD_POOL: crate::budget::Pool = crate::budget::Pool {
 /// under `budget`.
 fn upload_fits(budget: Option<&crate::budget::Budget>, own: u64, size: u64) -> bool {
     let limit = budget.map_or(UPLOAD_POOL.ceiling, |b| b.limit(&UPLOAD_POOL, own));
-    own + size <= limit
+    own.saturating_add(size) <= limit
 }
 
 /// Where host copies of title buffers go, from whether the host has GPU
