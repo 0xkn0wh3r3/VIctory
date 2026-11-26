@@ -13,7 +13,8 @@
 //! once its waits hold; consecutive heads that may run go to the host GPU
 //! together (a piece); after every piece the heads of all queues are tested
 //! again until none can move. Order within a queue never changes, only the
-//! interleaving across queues.
+//! interleaving across queues. A queue's PresentX behind held work is
+//! held too, as an action run in its place (`crate::queue`).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -71,6 +72,9 @@ pub(crate) enum Item<S> {
     Signal(usize, u64),
     /// A fence Wait: until the fence reaches the value.
     FenceWait(usize, u64),
+    /// Done once the work before it has been given to the host GPU (a
+    /// present of the frame it drew).
+    Then(Box<dyn FnOnce() + Send>),
 }
 
 /// What a pump did, for the frame's accounting.
@@ -158,9 +162,9 @@ impl<S> Held<S> {
                             }
                             ok
                         }
-                        // A Signal or Wait keeps its place: the piece before
-                        // it runs first.
-                        Some((Item::Signal(..), ..)) => {
+                        // A Signal, action or Wait keeps its place: the
+                        // piece before it runs first.
+                        Some((Item::Signal(..) | Item::Then(_), ..)) => {
                             if !piece.is_empty() {
                                 (w.run)(*queue, std::mem::take(&mut piece));
                                 done.pieces += 1;
@@ -185,6 +189,7 @@ impl<S> Held<S> {
                             done.segments += 1;
                         }
                         Some(Item::Signal(fence, value)) => (w.signal)(*queue, fence, value),
+                        Some(Item::Then(then)) => then(),
                         Some(Item::FenceWait(..)) | None => {}
                     }
                 }
@@ -386,6 +391,47 @@ mod tests {
         fake.borrow_mut().memory.insert(0x100, 1);
         pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: work", "signal 5 3", "q2: after"]);
+    }
+
+    /// An action behind held work (a present) is done once that work has
+    /// run, before the work behind it.
+    #[test]
+    fn an_action_waits_for_the_work_before_it() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let memory = RefCell::new(0);
+        let mut held = Held::default();
+        held.push(2, Item::Segment("frame", vec![ge(0x100, 1)]));
+        let shown = log.clone();
+        held.push(
+            2,
+            Item::Then(Box::new(move || {
+                shown.lock().unwrap().push("present".to_string())
+            })),
+        );
+        held.push(2, Item::Segment("next", vec![]));
+        let pump = |held: &mut Held<&'static str>| {
+            let read = |_, _| Some(*memory.borrow());
+            let mut run = |q: usize, segments: Vec<&'static str>| {
+                log.lock()
+                    .unwrap()
+                    .push(format!("q{q}: {}", segments.join(" ")))
+            };
+            held.pump(&mut World {
+                read: &read,
+                fence: &|_| 0,
+                run: &mut run,
+                signal: &mut |_, _, _| {},
+            })
+        };
+        pump(&mut held);
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the present waits for the frame"
+        );
+        *memory.borrow_mut() = 1;
+        pump(&mut held);
+        assert_eq!(*log.lock().unwrap(), ["q2: frame", "present", "q2: next"]);
+        assert!(!held.holds_work(2));
     }
 
     #[test]

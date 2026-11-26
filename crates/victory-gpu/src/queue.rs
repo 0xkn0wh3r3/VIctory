@@ -321,6 +321,8 @@ struct Account {
     unknown: u32,
     forced: u32,
     mappings: u32,
+    /// PresentX calls queued behind work their queue held.
+    presents_held: u32,
     /// Time in the pump outside host submissions.
     pump: std::time::Duration,
 }
@@ -339,7 +341,13 @@ fn account_frame(frame: u64) {
     let (fence_waits, fence_waited) = crate::fence::take_waited();
     let a = std::mem::take(&mut *account());
     let blocked = held().blocked(&read_value);
-    if a.released.is_empty() && blocked.is_empty() && a.forced == 0 && a.unknown == 0 && a.mappings == 0 {
+    if a.released.is_empty()
+        && blocked.is_empty()
+        && a.forced == 0
+        && a.unknown == 0
+        && a.mappings == 0
+        && a.presents_held == 0
+    {
         return;
     }
     let longest = a.released.iter().map(|r| r.1).max().unwrap_or_default();
@@ -356,9 +364,11 @@ fn account_frame(frame: u64) {
         pump_ms = a.pump.as_secs_f64() * 1e3,
         fence_waits,
         fence_wait_ms = fence_waited.as_secs_f64() * 1e3,
+        presents_held = a.presents_held,
         "held work this frame (submissions; host submissions, segments; lists cut at waits; lists reset or released \
          while held, each keeping its own host list; segments that waited, and how many each reason released \
-         {by:?}; time in the pump outside host submissions; events the          title waited on for fence values and their summed waits); held at the present: {}",
+         {by:?}; time in the pump outside host submissions; events the          title waited on for fence values and their summed waits; \
+         PresentX calls queued behind held work); held at the present: {}",
         blocked.len()
     );
     tracing::debug!(
@@ -529,16 +539,19 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first resource of each presented plane in our window.
+/// Shows the first resource of each presented plane in our window. With
+/// overlap ([`crate::host::overlap`]), behind the work the queue holds: the
+/// frame is shown once that has been given to the host GPU.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
     // What may run before the frame is shown does.
-    // shortcut: PresentX does not wait behind work the queue still holds (it
-    // shows the frame as far as it ran); the frame line names such work.
+    // shortcut: without overlap, PresentX does not wait behind work the
+    // queue still holds (it shows the frame as far as it ran), as before;
+    // the frame line names such work.
     pump_held(Why::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
@@ -613,24 +626,40 @@ extern "system" fn present(
             }
         }
         if !resources.is_empty() {
-            let sources: Vec<(&_, u32)> = resources
-                .iter()
-                .map(|(_, tex, state, _)| (tex, *state))
-                .collect();
-            let shown = host.present(&sources, frame);
+            // The states the frame leaves its planes in: the copy list moves
+            // them back to these (later work the queue holds runs after it).
             for &(resource, _, state, first) in &resources {
                 if first {
                     crate::resource::host_transition(resource, state);
                 }
             }
             #[cfg(feature = "diagnostics")]
-            blinks(frame, resources[0].0, resources[0].2, shown);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = shown;
+            let (first, first_state) = (resources[0].0 as usize, resources[0].2);
+            let planes: Vec<(ID3D12Resource, u32)> = resources
+                .into_iter()
+                .map(|(_, tex, state, _)| (tex, state))
+                .collect();
+            let show = move || {
+                let sources: Vec<(&_, u32)> =
+                    planes.iter().map(|(tex, state)| (tex, *state)).collect();
+                let shown = host.present(&sources, frame);
+                #[cfg(feature = "diagnostics")]
+                blinks(frame, first as This, first_state, shown);
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = shown;
+            };
+            let mut held = held();
+            if crate::host::overlap() && held.holds_work(this as usize) {
+                account().presents_held += 1;
+                held.push(this as usize, Item::Then(Box::new(show)));
+            } else {
+                drop(held);
+                show();
+            }
         }
     }
     #[cfg(not(windows))]
-    let _ = (planes, plane_parameters);
+    let _ = (this, planes, plane_parameters);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was
@@ -904,6 +933,96 @@ pub(crate) mod tests {
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(restored, TARGET, "the two planes share one rendering state");
+    }
+
+    /// With overlap, a PresentX on a queue that holds work is queued behind
+    /// it, and shown once that work has been released.
+    #[cfg(windows)]
+    #[test]
+    fn a_present_waits_behind_the_work_its_queue_holds() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !crate::host::overlap() {
+            return;
+        }
+        let _queues = TITLE_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+        let address = crate::watch::tests::pool(1);
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        let words = TextureWords([3, 0, 0, 0, 32, 0, 32, 1 | 1 << 16, 87, 1, 0, 1, 1, 0]);
+        let mut resource = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null,
+                address as u64,
+                words.0.as_ptr().cast(),
+                0,
+                null.cast(),
+                &iid,
+                &mut resource,
+            ),
+            S_OK
+        );
+        let texture = crate::resource::host_copy(resource).unwrap();
+        let state = texture.state.load(Ordering::Relaxed);
+        let holding = || {
+            held()
+                .blocked(&read_value)
+                .iter()
+                .find(|b| b.0 == q as usize)
+                .map(|b| b.1)
+        };
+
+        assert_eq!(wait(q, fence, 1), S_OK);
+        assert_eq!(holding(), Some(1), "the queue waits for the fence");
+        let plane = Plane {
+            token: 0,
+            count: 1,
+            resources: &raw const resource,
+            _rest: [0; 6],
+        };
+        assert_eq!(present(q, 1, &plane, null.cast()), S_OK);
+        assert_eq!(holding(), Some(2), "the present is queued behind the wait");
+        assert_eq!(
+            texture.state.load(Ordering::Relaxed),
+            state,
+            "the frame's state is kept meanwhile"
+        );
+        // The title releases what it presented: the queued present keeps it.
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(resource), 0);
+
+        crate::fence::set(fence, 1);
+        pump_held(Why::Fence);
+        assert_eq!(holding(), None, "the present ran once the fence moved");
+        host.complete_all();
+        drop(texture);
+        crate::watch::tests::free(address);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        release(fence);
+        assert_eq!(release(q), 0);
     }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
