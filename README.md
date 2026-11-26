@@ -143,8 +143,11 @@ under 1 MiB keep their copies (`VICTORY_IN_PLACE_MIN_KB`): shaders reach
 host memory over the bus, which costs most for small, often-touched
 buffers. Sparse
 allocations, and memory that is not one committed allocation (a buffer over
-many separately mapped pages, say), are still copied. Unset, nothing
-changes.
+many separately mapped pages, say), are still copied. Unset, it is on where
+the host GPU shares memory with the CPU (an APU or integrated GPU) and title
+memory passed a self-test at start (the log's `host GPU memory` line says
+which): there copies cost their refreshes and save no GPU time.
+`VICTORY_IN_PLACE=0` keeps the copies on every host.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:

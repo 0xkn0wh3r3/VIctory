@@ -1167,12 +1167,62 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
-/// `VICTORY_IN_PLACE=1` (experimental, #880): title buffers and loose
-/// windows are the title's memory itself, opened as a host heap, instead of
-/// copies.
+/// Title buffers and loose windows are the title's memory itself, opened as
+/// a host heap, instead of copies (#880): `VICTORY_IN_PLACE=1` on any host,
+/// another value never. Unset, on a host whose GPU shares memory with the
+/// CPU, where title memory opened in place passed the self-test
+/// (`crate::unified`): there shaders reach every placement at the same
+/// speed (an AMD APU measured all within noise of each other), so copies
+/// only cost their refreshes and copy-backs. Elsewhere, unset is off: on a
+/// discrete GPU in place reads cross the bus as the copies do, and that it
+/// gains in a title is not shown yet.
 fn in_place_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_IN_PLACE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_IN_PLACE") {
+        Some(v) => v == "1",
+        None => {
+            let unified = host().is_some_and(|h| h.memory.uma && h.memory.in_place.is_ok());
+            if unified {
+                tracing::info!(
+                    "title memory in place: the host GPU shares memory with the CPU \
+                     (VICTORY_IN_PLACE=0 keeps copies)"
+                );
+            }
+            unified
+        }
+    })
+}
+
+/// Registers title memory `[at, at + len)`, which `heap` holds in place,
+/// with `crate::pinned`: the title's frees, protections and remaps there,
+/// which fail while the heap lives, first let go of it (`release`: what is
+/// placed in it stops being handed out; lists still holding it keep it
+/// until they are reset). The registration goes with the heap.
+fn pin_heap(
+    heap: &windows::Win32::Graphics::Direct3D12::ID3D12Heap,
+    at: u64,
+    len: u64,
+    release: impl FnOnce() + Send + 'static,
+) {
+    use windows::Win32::Graphics::Direct3D::ID3DDestructionNotifier;
+    use windows::core::Interface;
+    extern "system" fn forget(data: *mut std::ffi::c_void) {
+        // SAFETY: the box registered below, given back once, when the heap
+        // is destroyed.
+        unsafe { Box::from_raw(data.cast::<crate::pinned::Pin>()) }.forget();
+    }
+    let pin = crate::pinned::pin(at as usize, len as usize, Box::new(release));
+    let Ok(notifier) = heap.cast::<ID3DDestructionNotifier>() else {
+        // Registered until the title changes the memory.
+        return;
+    };
+    let data = Box::into_raw(Box::new(pin));
+    // SAFETY: `forget` takes the box back when the heap goes.
+    if unsafe { notifier.RegisterDestructionCallback(Some(forget), data.cast()) }.is_err() {
+        // SAFETY: not registered: still ours. Dropped, it stays registered
+        // until the title changes the memory.
+        drop(unsafe { Box::from_raw(data) });
+    }
 }
 
 
@@ -1489,6 +1539,7 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64, HeapId)
         let opened = unsafe { dev13.OpenExistingHeapFromAddress1::<ID3D12Heap>(start as *const _, size) };
         if let Ok(heap) = opened {
             let id = next_heap_id();
+            pin_heap(&heap, start, size as u64, move || let_go_in_place(start, len));
             return place_in(&host.device, &heap, 0, len)
                 .map(|(buffer, gpu)| (buffer, gpu, id))
                 .or_else(|| refuse("placement refused"));
@@ -1525,7 +1576,9 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64, HeapId)
         // SAFETY: a plain query.
         let size = unsafe { heap.GetDesc() }.SizeInBytes;
         tracing::debug!(base = format_args!("{base:#x}"), size, "title allocation opened as a host heap");
-        Some((heap, size, next_heap_id()))
+        let id = next_heap_id();
+        pin_heap(&heap, base as u64, size, move || let_go_heap(id));
+        Some((heap, size, id))
     });
     let Some((heap, size, id)) = heap.clone() else {
         return refuse("heap refused");
@@ -2719,6 +2772,70 @@ pub(crate) mod tests {
                 .is_none_or(|h| !h.contains_key(&base))
         );
         // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Unset, `VICTORY_IN_PLACE` is on exactly where the host GPU shares
+    /// memory with the CPU and title memory passed the in-place self-test.
+    #[test]
+    fn title_memory_is_in_place_by_default_on_a_unified_host() {
+        let Some(host) = host() else { return };
+        if std::env::var_os("VICTORY_IN_PLACE").is_some() {
+            return;
+        }
+        let unified = host.memory.uma && host.memory.in_place.is_ok();
+        assert_eq!(in_place_enabled(), unified, "{}", host.memory);
+    }
+
+    /// The title freeing memory a window is in place over lets go of the
+    /// window first (title memory a heap holds refuses to be freed), and a
+    /// heap that goes by itself takes its registration along.
+    #[test]
+    fn the_title_frees_memory_a_window_is_in_place_over() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if host().is_none() {
+            return;
+        }
+        const LEN: u64 = 1 << 20;
+        let alloc = || {
+            // SAFETY: our own allocation.
+            let at = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    LEN as usize,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            } as u64;
+            assert_ne!(at, 0);
+            touch(at as usize, LEN as usize);
+            at
+        };
+        let base = alloc();
+        let Some((buffer, gpu, heap)) = in_place_buffer(base, LEN) else {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // the host refuses process memory as a heap
+        };
+        assert_eq!(crate::pinned::held_over(base as usize, LEN as usize), 1);
+        let window = Shadow::new_with(buffer, base as *mut u8, gpu, base, LEN, Some(heap));
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).insert((base, LEN), window);
+        // The title frees it: the window goes first, with its heap.
+        // SAFETY: our allocation.
+        let free = || unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        assert_ne!(crate::pinned::title_memory_change(base as usize, LEN as usize, free), 0);
+        assert!(!LOOSE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(base, LEN)));
+        assert_eq!(crate::pinned::held_over(base as usize, LEN as usize), 0);
+        // A heap that goes by itself takes its registration along.
+        let base = alloc();
+        let (buffer, _, _) = in_place_buffer(base, 64 << 10).expect("opened above");
+        assert_eq!(crate::pinned::held_over(base as usize, LEN as usize), 1);
+        drop(buffer);
+        assert_eq!(crate::pinned::held_over(base as usize, LEN as usize), 0);
+        // SAFETY: our allocation, no heap on it.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 

@@ -40,12 +40,8 @@ use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
 /// unlocks released pages within milliseconds.
 const SETTLE: Duration = Duration::from_millis(100);
 
-// Holders come with title memory in place (#2112, #2734): until then only
-// the tests here register pins.
-
 /// How a holder lets its range go; called once, outside the registry's
 /// lock, on the thread about to change the memory.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) type Release = Box<dyn FnOnce() + Send>;
 
 /// A registered range, given back with [`Pin::forget`] when its holder lets
@@ -53,7 +49,6 @@ pub(crate) type Release = Box<dyn FnOnce() + Send>;
 #[must_use = "a pin forgotten by dropping stays registered until released"]
 pub(crate) struct Pin(u64);
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Pin {
     /// The holder let its range go by itself: nothing to release any more.
     pub(crate) fn forget(self) {
@@ -109,7 +104,6 @@ fn pins() -> Guard {
 }
 
 /// Registers that `[at, at + len)` is held in place, and how to let it go.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn pin(at: usize, len: usize, release: Release) -> Pin {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let end = at.saturating_add(len);
@@ -224,6 +218,17 @@ fn release(at: usize, len: usize) -> usize {
         );
     }
     n + waited
+}
+
+/// Pins registered over part of `[at, at + len)` (tests elsewhere).
+#[cfg(test)]
+pub(crate) fn held_over(at: usize, len: usize) -> usize {
+    let end = at.saturating_add(len);
+    pins()
+        .ranges
+        .iter()
+        .filter(|((start, _), (pin_end, _))| *start < end && *pin_end > at)
+        .count()
 }
 
 #[cfg(test)]
