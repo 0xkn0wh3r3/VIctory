@@ -16,6 +16,7 @@ pub(crate) mod host;
 mod pages;
 
 /// Whether view heaps are paged on this host (`host::view_pages`).
+#[cfg(windows)]
 pub(crate) fn view_pages() -> bool {
     host::view_pages()
 }
@@ -72,6 +73,7 @@ pub(crate) struct Heap {
     written: Option<crate::watch::Tracked>,
 }
 
+#[cfg(windows)]
 pub(crate) use host::fallback_samplers;
 
 /// A title heap's host copy.
@@ -1119,6 +1121,7 @@ pub(crate) mod tests {
     /// A released view heap takes its title memory page table with it, also
     /// when no heap is made at its address afterwards (else the table, its
     /// 16.8 MiB mapping and the copies it names live on).
+    #[cfg(windows)]
     #[test]
     fn a_released_view_heap_drops_its_page_table() {
         let Some(host) = crate::host::host() else {

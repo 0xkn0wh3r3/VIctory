@@ -99,6 +99,7 @@ pub use copystat::CountingAlloc;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use host::{adapter_identity, set_caption_status};
+#[cfg(windows)]
 pub use pinned::{title_memory_change, title_memory_held};
 #[cfg(windows)]
 pub use watch::{
