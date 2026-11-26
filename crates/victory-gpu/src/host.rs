@@ -1370,13 +1370,15 @@ impl Host {
         // write title memory on the CPU for the GPU's timeline (those before
         // may still read what they overwrite); the last upload list before
         // another; a host list's last run before it runs again (its
-        // prelude and steps run again); and, once a frame, those whose
-        // shaders mark reads, before the eviction pass clears the marks.
+        // prelude and steps run again); and, once a frame, before the
+        // title's first submission, those whose shaders mark reads, for the
+        // eviction pass to clear the marks (not before a present's: it would
+        // wait for the frame it shows).
         let writes = runs.iter().any(|l| l.writes_at_submission());
         let uploading = runs.iter().any(|l| l.uploads_at_submission());
         let mut submitted = self.complete_while(self.lock_submitted(), |r| {
             r.heavy
-                || r.marks && crate::resource::eviction_due()
+                || queue != 0 && r.marks && crate::resource::eviction_due()
                 || writes
                 || uploading && r.uploads
                 || r.lists
