@@ -137,7 +137,23 @@ const COPY_SOURCE: u32 = 0x800;
 const GENERIC_READ: u32 = 0xAC3;
 
 /// Bytes the read-back buffer holds: four floats per pixel.
-const FRAME_BYTES: u64 = (WIDTH * HEIGHT * 16) as u64;
+/// The compute output's bytes for a `width` x `height` frame (four floats a
+/// pixel).
+fn frame_bytes(width: u32, height: u32) -> u64 {
+    u64::from(width) * u64::from(height) * 16
+}
+
+/// Draws, and one submission, each step of the demo's stress scale adds.
+pub const DRAWS_A_STEP: usize = 64;
+/// Views the checked frame's heap holds; the stress scale's come after.
+const VIEWS: u64 = 16;
+/// The terrain's view (constants slot 5), in the demo's window only.
+const TERRAIN_VIEW: u64 = 9;
+
+/// The draws the stress scale adds to the checked frame's four.
+pub fn extra_draws(scale: u32) -> usize {
+    DRAWS_A_STEP * (scale.max(1) as usize - 1)
+}
 
 #[repr(C)]
 struct HeapProperties {
@@ -283,13 +299,28 @@ fn pointer(p: *const u8, size: usize) -> Vec<u8> {
     out
 }
 
-/// What the run hands back: the frame read back (RGBA floats per pixel).
+/// What the run hands back: the checked frame read back (RGBA floats per
+/// pixel), and the window's last frame if it ran for a time (empty if not).
+#[derive(Default)]
 pub struct Run {
     pub image: Vec<f32>,
+    pub window_image: Vec<f32>,
 }
 
 /// Everything the frame uses.
 struct Gpu {
+    /// The frame's size in pixels.
+    width: u32,
+    height: u32,
+    /// The demo's stress scale (1: the checked frame's work).
+    scale: u32,
+    /// Whether the terrain is drawn (the demo's window; never the checked
+    /// frame, which the reference draws without it).
+    scenery: bool,
+    /// Whether the texture shown was last left in the state for presenting.
+    shown_common: bool,
+    /// Whether the copy list has been closed once (it starts open).
+    copy_closed: bool,
     device: Obj,
     queue: Obj,
     allocators: [Obj; 2],
@@ -545,7 +576,7 @@ fn texture(width: u32, height: u32, format: u32, flags: u32) -> ResourceDesc {
     }
 }
 
-fn setup(t: &mut Tap) -> Option<Gpu> {
+fn setup(t: &mut Tap, width: u32, height: u32, scale: u32, scenery: bool) -> Option<Gpu> {
     let mut parameters = [0u32; 32];
     parameters[0] = VERSION;
     let mut device = std::ptr::null_mut();
@@ -655,7 +686,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     let shaders = [
         crate::gfx10::vertex_container(),
         crate::gfx10::pixel_container(),
-        crate::gfx10::compute_container(),
+        crate::gfx10::compute_container(width),
     ];
     // The graphics pipeline, as a stream.
     let names = [c"POSITION", c"NORMAL", c"TEXCOORD"];
@@ -728,6 +759,12 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
 
     let null = std::ptr::null_mut();
     let mut g = Gpu {
+        width,
+        height,
+        scale,
+        scenery,
+        shown_common: false,
+        copy_closed: false,
         device,
         queue,
         allocators,
@@ -765,7 +802,13 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     // Descriptor heaps: views (0 scene constants, 1-4 the draws', 5 the
     // texture, 6 the frame, 7 the texture shown, 8 the read-back buffer),
     // one sampler, one render target, one depth buffer.
-    g.views = g.heap(t, 0, 16, true, "views");
+    g.views = g.heap(
+        t,
+        0,
+        VIEWS as u32 + extra_draws(scale) as u32,
+        true,
+        "views",
+    );
     g.samplers = g.heap(t, 1, 1, true, "samplers");
     g.targets = g.heap(t, 2, 1, false, "render targets");
     g.depths = g.heap(t, 3, 1, false, "depth");
@@ -812,7 +855,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.constants = g.resource(
         t,
         2,
-        buffer(256 * 5, 0),
+        buffer(256 * (6 + extra_draws(scale) as u64), 0),
         GENERIC_READ,
         None,
         "constant buffer",
@@ -838,7 +881,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.target = g.resource(
         t,
         1,
-        texture(WIDTH, HEIGHT, RGBA8, 1),
+        texture(width, height, RGBA8, 1),
         RENDER_TARGET,
         Some(ClearValue {
             format: RGBA8,
@@ -849,7 +892,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.depth = g.resource(
         t,
         1,
-        texture(WIDTH, HEIGHT, D32, 2),
+        texture(width, height, D32, 2),
         DEPTH_WRITE,
         Some(ClearValue {
             format: D32,
@@ -860,7 +903,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.shown = g.resource(
         t,
         1,
-        texture(WIDTH, HEIGHT, RGBA8, 4),
+        texture(width, height, RGBA8, 4),
         UNORDERED,
         None,
         "texture shown",
@@ -868,7 +911,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.output = g.resource(
         t,
         1,
-        buffer(FRAME_BYTES, 4),
+        buffer(frame_bytes(width, height), 4),
         UNORDERED,
         None,
         "compute output buffer",
@@ -876,7 +919,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
     g.readback = g.resource(
         t,
         3,
-        buffer(FRAME_BYTES, 0),
+        buffer(frame_bytes(width, height), 0),
         COPY_DEST,
         None,
         "read-back buffer",
@@ -936,6 +979,17 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
         let desc = [constants + 256 * n, 256];
         call!(device, 0x88, fn(*const [u64; 2], u64), &desc, view(n));
     }
+    // The terrain's constants (slot 5) at view 9, for the demo's window.
+    if scenery {
+        let desc = [constants + 256 * 5, 256];
+        call!(
+            device,
+            0x88,
+            fn(*const [u64; 2], u64),
+            &desc,
+            view(TERRAIN_VIEW)
+        );
+    }
     // Format, 2D, the default component mapping, then (from 16 bytes) the
     // most detailed level 0 and one level.
     let srv = [RGBA8, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
@@ -971,7 +1025,7 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
         1,
         0,
         0,
-        (FRAME_BYTES / 4) as u32,
+        (frame_bytes(width, height) / 4) as u32,
         0,
         0,
         0,
@@ -1017,13 +1071,61 @@ fn setup(t: &mut Tap) -> Option<Gpu> {
 }
 
 impl Gpu {
+    /// Binds what the frame's draws use on `list`: heaps, root signature,
+    /// targets, viewport, pipeline, vertex and index buffers, and the
+    /// tables every draw shares (the scene's constants, the texture, the
+    /// sampler).
+    fn bind_pass(&self, list: Obj) {
+        let heaps = [self.views, self.samplers];
+        call!(list, 0x100, fn(u32, *const Obj), 2, heaps.as_ptr());
+        call!(list, 0x110, fn(Obj), self.graphics_root);
+        call!(
+            list,
+            0x190,
+            fn(u32, *const u64, i32, *const u64),
+            1,
+            &self.target_cpu,
+            0,
+            &self.depth_cpu
+        );
+        let viewport = [0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0f32];
+        call!(list, 0xa8, fn(u32, *const [f32; 6]), 1, &viewport);
+        let scissor = [0, 0, self.width as i32, self.height as i32];
+        call!(list, 0xb0, fn(u32, *const [i32; 4]), 1, &scissor);
+        call!(list, 0xa0, fn(u32), 4); // triangle list
+        call!(list, 0xc8, fn(Obj), self.graphics);
+        let vertices = BufferView {
+            address: Gpu::address(self.vertices),
+            size: (self.geometry.vertices.len() * 32) as u32,
+            stride_or_format: scene::STRIDE,
+        };
+        call!(
+            list,
+            0x180,
+            fn(u32, u32, *const BufferView),
+            0,
+            1,
+            &vertices
+        );
+        let indices = BufferView {
+            address: Gpu::address(self.indices),
+            size: (self.geometry.indices.len() * 2) as u32,
+            stride_or_format: R16U,
+        };
+        call!(list, 0x178, fn(*const BufferView), &indices);
+        let table = |n: u64| self.view_gpu + n * VIEW_SIZE;
+        call!(list, 0x120, fn(u32, u64), 0, table(0));
+        call!(list, 0x120, fn(u32, u64), 2, table(5));
+        call!(list, 0x120, fn(u32, u64), 3, self.sampler_gpu);
+    }
+
     /// Records and runs one frame at time `at`: the draws, the compute pass
     /// (and the texture's upload if `first`); then copies the compute
     /// output to the read-back buffer, unless `present`, which leaves the
     /// texture shown in the state for presenting instead.
     fn frame(&mut self, at: f32, first: bool, present: bool) -> (Hresult, Hresult, bool) {
         let (scene, draws) = scene::frame(at);
-        // SAFETY: the constant buffer is mapped and 1,280 bytes long.
+        // SAFETY: the constant buffer is mapped and at least 1,536 bytes long.
         unsafe {
             let base = self.constants_cpu;
             std::ptr::copy_nonoverlapping((&raw const scene).cast::<u8>(), base, 256);
@@ -1034,6 +1136,12 @@ impl Gpu {
                     256,
                 );
             }
+            let terrain = scene::terrain();
+            std::ptr::copy_nonoverlapping(
+                (&raw const terrain).cast::<u8>(),
+                base.add(256 * 5),
+                256,
+            );
         }
         let list = self.lists[0];
         if !first {
@@ -1072,12 +1180,11 @@ impl Gpu {
                 std::ptr::null()
             );
             self.barrier(list, self.texture, COPY_DEST, PIXEL);
-        } else if present {
-            self.barrier(list, self.shown, COMMON, UNORDERED);
         }
-        let heaps = [self.views, self.samplers];
-        call!(list, 0x100, fn(u32, *const Obj), 2, heaps.as_ptr());
-        call!(list, 0x110, fn(Obj), self.graphics_root);
+        if self.shown_common {
+            self.barrier(list, self.shown, COMMON, UNORDERED);
+            self.shown_common = false;
+        }
         let clear = scene::CLEAR.map(|c| f32::from(c) / 255.0);
         call!(
             list,
@@ -1099,44 +1206,9 @@ impl Gpu {
             0,
             std::ptr::null()
         );
-        call!(
-            list,
-            0x190,
-            fn(u32, *const u64, i32, *const u64),
-            1,
-            &self.target_cpu,
-            0,
-            &self.depth_cpu
-        );
-        let viewport = [0.0, 0.0, WIDTH as f32, HEIGHT as f32, 0.0, 1.0f32];
-        call!(list, 0xa8, fn(u32, *const [f32; 6]), 1, &viewport);
-        let scissor = [0, 0, WIDTH as i32, HEIGHT as i32];
-        call!(list, 0xb0, fn(u32, *const [i32; 4]), 1, &scissor);
-        call!(list, 0xa0, fn(u32), 4); // triangle list
-        call!(list, 0xc8, fn(Obj), self.graphics);
-        let vertices = BufferView {
-            address: Gpu::address(self.vertices),
-            size: (self.geometry.vertices.len() * 32) as u32,
-            stride_or_format: scene::STRIDE,
-        };
-        call!(
-            list,
-            0x180,
-            fn(u32, u32, *const BufferView),
-            0,
-            1,
-            &vertices
-        );
-        let indices = BufferView {
-            address: Gpu::address(self.indices),
-            size: (self.geometry.indices.len() * 2) as u32,
-            stride_or_format: R16U,
-        };
-        call!(list, 0x178, fn(*const BufferView), &indices);
-        let table = |n: u64| self.view_gpu + n * VIEW_SIZE;
-        call!(list, 0x120, fn(u32, u64), 0, table(0));
-        call!(list, 0x120, fn(u32, u64), 2, table(5));
-        call!(list, 0x120, fn(u32, u64), 3, self.sampler_gpu);
+        self.bind_pass(list);
+        let view_gpu = self.view_gpu;
+        let table = move |n: u64| view_gpu + n * VIEW_SIZE;
         for (n, &(mesh, _)) in draws.iter().enumerate() {
             let m = self.geometry.meshes[mesh];
             call!(list, 0x120, fn(u32, u64), 1, table(n as u64 + 1));
@@ -1151,6 +1223,71 @@ impl Gpu {
                 0
             );
         }
+        if self.scenery {
+            let m = self.geometry.meshes[3];
+            call!(list, 0x120, fn(u32, u64), 1, table(TERRAIN_VIEW));
+            call!(
+                list,
+                0x68,
+                fn(u32, u32, u32, i32, u32),
+                m.indices,
+                1,
+                m.first_index,
+                m.base_vertex,
+                0
+            );
+        }
+        // The stress scale's objects (none in the checked frame): each a
+        // draw whose constants are written into title memory and whose view
+        // is made in the heap this frame, DRAWS_A_STEP to a submission, each
+        // submission binding the pass again as a title's lists do.
+        let crowd = scene::crowd(at, extra_draws(self.scale));
+        let mut closed = S_OK;
+        let mut done = true;
+        let constants = Gpu::address(self.constants);
+        for (k, chunk) in crowd.chunks(DRAWS_A_STEP).enumerate() {
+            let (hr, reached) = self.submit(0);
+            if hr != S_OK {
+                closed = hr;
+            }
+            done &= reached;
+            self.reset(0, std::ptr::null_mut());
+            self.bind_pass(list);
+            for (j, (mesh, mesh_constants)) in chunk.iter().enumerate() {
+                let n = k * DRAWS_A_STEP + j;
+                let slot = 6 + n;
+                let view = VIEWS + n as u64;
+                // SAFETY: the constant buffer is mapped, 256 bytes a slot
+                // for each of the scale's draws after the first 6.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (&raw const *mesh_constants).cast::<u8>(),
+                        self.constants_cpu.add(256 * slot),
+                        256,
+                    );
+                }
+                let desc = [constants + 256 * slot as u64, 256];
+                call!(
+                    self.device,
+                    0x88,
+                    fn(*const [u64; 2], u64),
+                    &desc,
+                    self.view_cpu + view * VIEW_SIZE
+                );
+                let m = self.geometry.meshes[*mesh];
+                call!(list, 0x120, fn(u32, u64), 1, table(view));
+                call!(
+                    list,
+                    0x68,
+                    fn(u32, u32, u32, i32, u32),
+                    m.indices,
+                    1,
+                    m.first_index,
+                    m.base_vertex,
+                    0
+                );
+            }
+        }
         // The compute pass reads the frame and writes the texture shown and
         // the buffer.
         self.barrier(list, self.target, RENDER_TARGET, NON_PIXEL);
@@ -1161,15 +1298,18 @@ impl Gpu {
             list,
             0x70,
             fn(u32, u32, u32),
-            WIDTH / scene::GROUP,
-            HEIGHT / scene::GROUP,
+            self.width / scene::GROUP,
+            self.height / scene::GROUP,
             1
         );
         self.barrier(list, self.target, NON_PIXEL, RENDER_TARGET);
         if present {
             self.barrier(list, self.shown, UNORDERED, COMMON);
+            self.shown_common = true;
         }
-        let (closed, done) = self.submit(0);
+        let (last, reached) = self.submit(0);
+        let closed = if last == S_OK { closed } else { last };
+        let done = done && reached;
         if present {
             return (closed, S_OK, done);
         }
@@ -1177,7 +1317,7 @@ impl Gpu {
         // The compute output to the read-back buffer (not while only
         // showing frames).
         let copy = self.lists[1];
-        if !first {
+        if self.copy_closed {
             self.reset(1, std::ptr::null_mut());
         }
         self.barrier(copy, self.output, UNORDERED, COPY_SOURCE);
@@ -1189,10 +1329,11 @@ impl Gpu {
             0,
             self.output,
             0,
-            FRAME_BYTES
+            frame_bytes(self.width, self.height)
         );
         self.barrier(copy, self.output, COPY_SOURCE, UNORDERED);
         let (copied, copy_done) = self.submit(1);
+        self.copy_closed = true;
         (closed, copied, done && copy_done)
     }
 
@@ -1201,11 +1342,10 @@ impl Gpu {
         if at.is_null() {
             return Vec::new();
         }
-        let mut out = vec![0f32; (FRAME_BYTES / 4) as usize];
+        let bytes = frame_bytes(self.width, self.height);
+        let mut out = vec![0f32; (bytes / 4) as usize];
         // SAFETY: the mapping holds the buffer's bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(at, out.as_mut_ptr().cast::<u8>(), FRAME_BYTES as usize)
-        };
+        unsafe { std::ptr::copy_nonoverlapping(at, out.as_mut_ptr().cast::<u8>(), bytes as usize) };
         out
     }
 
@@ -1249,10 +1389,21 @@ fn pixel(image: &[f32], x: u32, y: u32) -> [u8; 4] {
 }
 
 /// Runs the frame; `reference` is the WARP image (RGBA floats per pixel),
-/// `window_seconds` how long to keep presenting it, animated, afterwards.
-pub fn run(t: &mut Tap, reference: Option<&[f32]>, window_seconds: u32) -> Run {
-    let Some(mut g) = setup(t) else {
-        return Run { image: Vec::new() };
+/// `window_seconds` how long to keep presenting it, animated, afterwards,
+/// `window_size` the size it is drawn at there (each a multiple of
+/// [`scene::GROUP`]; the checks are of a [`WIDTH`] x [`HEIGHT`] frame) and
+/// `scale` how much work each frame there gives VIctory (1: the checked
+/// frame's; each step more [`DRAWS_A_STEP`] draws, as many views made and
+/// constants written, and a submission).
+pub fn run(
+    t: &mut Tap,
+    reference: Option<&[f32]>,
+    window_seconds: u32,
+    window_size: (u32, u32),
+    scale: u32,
+) -> Run {
+    let Some(mut g) = setup(t, WIDTH, HEIGHT, 1, false) else {
+        return Run::default();
     };
     // Host pipelines are made on first use, by workers; a draw whose
     // pipeline is not made within the frame's time is left out (VIctory's
@@ -1291,6 +1442,7 @@ pub fn run(t: &mut Tap, reference: Option<&[f32]>, window_seconds: u32) -> Run {
     );
     compare(t, &image, reference);
     exact(t, &image);
+    let mut window_image = Vec::new();
     if window_seconds == 0 {
         t.check(
             true,
@@ -1298,21 +1450,64 @@ pub fn run(t: &mut Tap, reference: Option<&[f32]>, window_seconds: u32) -> Run {
             String::new,
         );
     } else {
+        // The window's frames are drawn at its own size, with the terrain
+        // and the stress scale's work, by a second set of resources and
+        // pipelines (the compute pass knows its row width); their calls
+        // were checked above, so they go unreported.
+        let (width, height) = window_size;
+        let mut quiet = Tap::default();
+        let mut sized = setup(&mut quiet, width, height, scale, true);
+        // New resources need the texture uploaded on their first frame.
+        let fresh = sized.is_some();
+        let g = sized.as_mut().unwrap_or(&mut g);
         let started = std::time::Instant::now();
-        let mut shown = 0;
+        let mut shown = 0u64;
         let mut presented = S_OK;
+        let draws = 4 + usize::from(g.scenery) + extra_draws(g.scale);
+        let submissions = 1 + extra_draws(g.scale) / DRAWS_A_STEP;
+        let per_frame = format!(
+            "{}x{}, scale {}: {draws} draws and {submissions} submissions a frame",
+            g.width, g.height, g.scale
+        );
+        println!("demo: {per_frame}");
+        // A line every 5 seconds: frames shown and time per frame since the
+        // last (a run until the window closes never reaches the report).
+        let (mut mark, mut marked) = (std::time::Instant::now(), 0u64);
         while started.elapsed().as_secs() < u64::from(window_seconds) {
+            if mark.elapsed().as_secs() >= 5 {
+                let frames = shown - marked;
+                let ms = mark.elapsed().as_secs_f64() * 1000.0 / frames.max(1) as f64;
+                println!(
+                    "demo: {:.1} fps, {ms:.2} ms a frame ({per_frame})",
+                    1000.0 / ms
+                );
+                (mark, marked) = (std::time::Instant::now(), shown);
+            }
             let token = g.begin();
-            g.frame(started.elapsed().as_secs_f32(), false, true);
+            g.frame(started.elapsed().as_secs_f32(), fresh && shown == 0, true);
             let hr = g.present(token);
             if hr != S_OK {
                 presented = hr;
             }
             shown += 1;
         }
-        t.eq(presented, S_OK, &format!("gpu: PresentX ({shown} frames)"));
+        // The last frame once more, read back (`VICTORY_CONFORMANCE_DUMP`).
+        g.begin();
+        g.frame(started.elapsed().as_secs_f32(), fresh && shown == 0, false);
+        window_image = g.read();
+        t.eq(
+            presented,
+            S_OK,
+            &format!(
+                "gpu: PresentX ({shown} frames, {:.2} ms a frame, at {per_frame})",
+                started.elapsed().as_secs_f64() * 1000.0 / shown.max(1) as f64
+            ),
+        );
     }
-    Run { image }
+    Run {
+        image,
+        window_image,
+    }
 }
 
 /// The frame against the WARP reference: channels within 4/255, except

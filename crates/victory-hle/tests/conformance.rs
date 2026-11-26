@@ -41,8 +41,13 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Builds the fixture into its own target dir (the outer cargo holds the
-/// lock on the main one while tests run).
+/// lock on the main one while tests run). `VICTORY_CONFORMANCE_DLL` names
+/// one built already instead: for a test binary run where cargo is not, such
+/// as a cross-compiled one under Wine.
 fn build_fixture() -> PathBuf {
+    if let Some(dll) = std::env::var_os("VICTORY_CONFORMANCE_DLL") {
+        return PathBuf::from(dll);
+    }
     let manifest = workspace_root().join("tests/fixtures/conformance/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("conformance");
     let status = Command::new(env!("CARGO"))
@@ -153,21 +158,36 @@ struct GpuRun {
     reference: *const f32,
     reference_len: usize,
     window_seconds: u32,
+    window_width: u32,
+    window_height: u32,
+    window_scale: u32,
     image: *const f32,
     image_len: usize,
+    window_image: *const f32,
+    window_image_len: usize,
 }
 
 /// Runs the title's GPU frame against `reference`: its TAP report and the
 /// frame it read back.
-fn call_gpu(reference: Option<&[f32]>, window_seconds: u32) -> (String, Vec<f32>) {
+fn call_gpu(
+    reference: Option<&[f32]>,
+    window_seconds: u32,
+    (window_width, window_height): (u32, u32),
+    window_scale: u32,
+) -> (String, Vec<f32>, Vec<f32>) {
     let e = exports();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut run = GpuRun {
         reference: reference.map_or(std::ptr::null(), <[f32]>::as_ptr),
         reference_len: reference.map_or(0, <[f32]>::len),
         window_seconds,
+        window_width,
+        window_height,
+        window_scale,
         image: std::ptr::null(),
         image_len: 0,
+        window_image: std::ptr::null(),
+        window_image_len: 0,
     };
     // SAFETY: the export's signature in the fixture; the report and image
     // stay valid until the next call, which the lock holds off.
@@ -182,7 +202,12 @@ fn call_gpu(reference: Option<&[f32]>, window_seconds: u32) -> (String, Vec<f32>
         } else {
             std::slice::from_raw_parts(run.image, run.image_len).to_vec()
         };
-        (report, image)
+        let window_image = if run.window_image.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(run.window_image, run.window_image_len).to_vec()
+        };
+        (report, image, window_image)
     }
 }
 
@@ -190,8 +215,12 @@ fn call_gpu(reference: Option<&[f32]>, window_seconds: u32) -> (String, Vec<f32>
 /// through VIctory's console D3D12 with hand-assembled GFX10 shaders, and
 /// checks its frame against the same scene drawn natively on WARP.
 /// `VICTORY_CONFORMANCE_WINDOW=<seconds>` keeps presenting it, animated,
-/// in a window that long; `VICTORY_CONFORMANCE_DUMP=<folder>` saves both
-/// frames there as PPM images.
+/// in a window that long (`until-closed`: until the window is closed, which
+/// ends the process), drawn at `VICTORY_CONFORMANCE_SIZE=<width>x<height>`
+/// (2560x1440 unless set; multiples of 8), with `VICTORY_CONFORMANCE_SCALE`
+/// times the work a frame (1 unless set; up to 1024). `VICTORY_CONFORMANCE_DUMP=<folder>`
+/// saves the checked frames there as PPM images (and the
+/// window's last, `window.ppm`, after a timed window).
 #[test]
 fn the_gpu_frame_matches_warp() {
     let reference = match reference::render() {
@@ -201,18 +230,28 @@ fn the_gpu_frame_matches_warp() {
             None
         }
     };
-    let window = std::env::var("VICTORY_CONFORMANCE_WINDOW")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let (tap, image) = call_gpu(reference.as_deref(), window);
+    let window = match std::env::var("VICTORY_CONFORMANCE_WINDOW").ok().as_deref() {
+        Some("until-closed") => u32::MAX,
+        Some(seconds) => seconds.parse().unwrap_or(0),
+        None => 0,
+    };
+    if window > 0 {
+        end_when_the_window_closes();
+    }
+    let size = window_size();
+    let scale = window_scale();
+    let (tap, image, window_image) = call_gpu(reference.as_deref(), window, size, scale);
     println!("{tap}");
     if let Some(dir) = std::env::var_os("VICTORY_CONFORMANCE_DUMP") {
         let dir = PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
-        save_ppm(&dir.join("victory.ppm"), &image);
+        let checked = (scene::WIDTH, scene::HEIGHT);
+        save_ppm(&dir.join("victory.ppm"), &image, checked);
         if let Some(r) = &reference {
-            save_ppm(&dir.join("warp.ppm"), r);
+            save_ppm(&dir.join("warp.ppm"), r, checked);
+        }
+        if !window_image.is_empty() {
+            save_ppm(&dir.join("window.ppm"), &window_image, size);
         }
     }
     if let Err(why) = accept(&tap, &[]) {
@@ -220,9 +259,9 @@ fn the_gpu_frame_matches_warp() {
     }
 }
 
-/// An RGBA float frame as a binary PPM (RGB8).
-fn save_ppm(path: &Path, image: &[f32]) {
-    let mut out = format!("P6\n{} {}\n255\n", scene::WIDTH, scene::HEIGHT).into_bytes();
+/// An RGBA float frame of `width` x `height` as a binary PPM (RGB8).
+fn save_ppm(path: &Path, image: &[f32], (width, height): (u32, u32)) {
+    let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
     for p in image.chunks(4) {
         out.extend(
             p[..3]
@@ -370,4 +409,81 @@ fn reports_missing_or_cut_short_checks_are_refused() {
         accept("TAP version 13\n1..0\n", known).is_err(),
         "no checks"
     );
+}
+
+/// The size the window's frames are drawn at: `VICTORY_CONFORMANCE_SIZE`
+/// (`<width>x<height>`, each a multiple of the compute pass's 8-pixel
+/// groups), 2560x1440 unless set.
+fn window_size() -> (u32, u32) {
+    let Ok(asked) = std::env::var("VICTORY_CONFORMANCE_SIZE") else {
+        return (2560, 1440);
+    };
+    let size = asked
+        .split_once(['x', 'X'])
+        .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)));
+    match size {
+        Some((w, h)) if w > 0 && h > 0 && w % scene::GROUP == 0 && h % scene::GROUP == 0 => (w, h),
+        _ => panic!(
+            "VICTORY_CONFORMANCE_SIZE={asked}: <width>x<height>, multiples of {}",
+            scene::GROUP
+        ),
+    }
+}
+
+/// Ends the process once VIctory's window (class `VIctory`, in this
+/// process) has been shown and is gone: closing it destroys it, and the
+/// title would otherwise go on presenting to no window.
+fn end_when_the_window_closes() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
+    fn ours_is_open() -> bool {
+        let class: Vec<u16> = "VIctory\0".encode_utf16().collect();
+        let mut after = std::ptr::null_mut();
+        loop {
+            // SAFETY: a null-terminated class name; null parent and window
+            // name search every top-level window.
+            let hwnd = unsafe {
+                FindWindowExW(
+                    std::ptr::null_mut(),
+                    after,
+                    class.as_ptr(),
+                    std::ptr::null(),
+                )
+            };
+            if hwnd.is_null() {
+                return false;
+            }
+            let mut process = 0;
+            // SAFETY: a window handle FindWindowExW just returned.
+            unsafe { GetWindowThreadProcessId(hwnd, &mut process) };
+            if process == std::process::id() {
+                return true;
+            }
+            after = hwnd;
+        }
+    }
+    std::thread::spawn(|| {
+        let mut seen = false;
+        loop {
+            let open = ours_is_open();
+            if seen && !open {
+                println!("the window was closed");
+                std::process::exit(0);
+            }
+            seen |= open;
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
+}
+
+/// The window's stress scale: `VICTORY_CONFORMANCE_SCALE` (1 to 1024), 1
+/// unless set. Each step adds 64 draws to a frame, with as many views made
+/// and constants written, and a submission.
+fn window_scale() -> u32 {
+    let Ok(asked) = std::env::var("VICTORY_CONFORMANCE_SCALE") else {
+        return 1;
+    };
+    match asked.trim().parse() {
+        Ok(scale @ 1..=1024) => scale,
+        _ => panic!("VICTORY_CONFORMANCE_SCALE={asked}: 1 to 1024"),
+    }
 }

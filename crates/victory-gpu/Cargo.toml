@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
+xxhash-rust.workspace = true
 miniz_oxide.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
@@ -18,6 +19,8 @@ victory-shader = { workspace = true, features = ["host"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
 windows = { workspace = true, features = ["Win32_Graphics_Direct3D_Dxc"] }
 
 [features]

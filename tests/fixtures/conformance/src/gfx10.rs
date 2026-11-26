@@ -278,7 +278,7 @@ pub fn pixel() -> Vec<u32> {
 /// texture shown (UAV, at 32 bytes) and the read-back buffer (raw UAV, at
 /// 64 bytes; four floats per pixel, row after row). The group id arrives
 /// in s1-s2, the thread id in v0-v1. A neighbour past the edge reads 0.
-pub fn compute() -> Vec<u32> {
+pub fn compute(width: u32) -> Vec<u32> {
     let mut a = Asm::default();
     a.table(4, 0);
     a.smem(3, 8, 4, 0); // s_load_dwordx8 s[8:15]: the frame
@@ -305,7 +305,10 @@ pub fn compute() -> Vec<u32> {
         a.fmac(v(d), HALF, 8 + c);
     }
     a.image(8, 20, 2, 16, 0); // image_store v[20:23], v[2:3]
-    a.s_movk(30, crate::scene::WIDTH as u16);
+    a.s_movk(
+        30,
+        u16::try_from(width).expect("a frame at most 65,535 pixels wide"),
+    );
     a.vop3(0x143, 24, v(3), 30, v(2)); // v_mad_u32_u24 v24, y, width, x
     a.vop2(0x1a, v(24), 4 + 128, 24); // v_lshlrev_b32 v24, 4, v24
     a.store4(20, 24, 24);
@@ -553,7 +556,7 @@ pub fn pixel_container() -> Vec<u8> {
     container(0, &p, &[(b"ISG1", isg), (b"OSG1", osg)])
 }
 
-pub fn compute_container() -> Vec<u8> {
+pub fn compute_container(width: u32) -> Vec<u8> {
     let mut data = vec![0u8; 0x40];
     // COMPUTE_PGM_RSRC2: one user SGPR, group ids x and y, thread ids x
     // and y.
@@ -567,7 +570,7 @@ pub fn compute_container() -> Vec<u8> {
     }
     let p = Program {
         stage: CS,
-        code: compute(),
+        code: compute(width),
         vgprs: 32,
         sgprs: 32,
         layout: vec![(0, 0)],

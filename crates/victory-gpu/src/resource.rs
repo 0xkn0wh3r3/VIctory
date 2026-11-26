@@ -284,6 +284,7 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
@@ -1689,14 +1690,12 @@ fn now_ms() -> u64 {
 /// this long (and this many presented frames) is given up ([`evict`]).
 /// Two minutes: of the textures given up after 20 s, nine in ten were
 /// read again within a minute (run evict4).
-#[cfg(windows)]
 pub(crate) const IDLE_MS: u64 = 120_000;
 /// Frames as well as time: in slow runs (seconds a frame) 20 s alone cycled
 /// the textures of a cutscene's alternating shots (run evict2), and 30
 /// frames gave up what the menus and loading made (at 30 fps) before the
 /// world read it (run evict3). At 30 fps the idle time decides; slower, the
 /// card's budget does.
-#[cfg(windows)]
 pub(crate) const IDLE_FRAMES: u64 = 300;
 /// A use stamp's frame for "never" (tests).
 #[cfg(windows)]
@@ -4192,6 +4191,7 @@ mod tests {
     /// texture — the case that used to leave nothing at all — and it keeps
     /// the permissions and the state the title asked for.
     /// Run with `cargo test --release -p victory-gpu -- --ignored --nocapture texture_ladder`.
+    #[cfg(windows)]
     #[test]
     #[ignore = "needs the host GPU"]
     fn a_refused_description_still_leaves_a_texture() {
@@ -4289,6 +4289,7 @@ mod tests {
     /// and as a render target: it still has to leave a host texture, because
     /// the alternative is the reported crash — a draw with no target at all.
     /// Run with `cargo test --release -p victory-gpu -- --ignored --nocapture packed_target`.
+    #[cfg(windows)]
     #[test]
     #[ignore = "needs the host GPU"]
     fn the_packed_render_target_a_boot_asks_for_still_exists() {
@@ -4338,6 +4339,7 @@ mod tests {
     /// unordered-access (format 86, flags 5) and `B4G4R4A4_UNORM` with
     /// render-target (format 115, flags 1), both refused with `E_INVALIDARG`.
     /// Run with `cargo test --release -p victory-gpu -- --ignored --nocapture packed_formats`.
+    #[cfg(windows)]
     #[test]
     #[ignore = "needs the host GPU"]
     fn packed_formats_the_host_refuses() {

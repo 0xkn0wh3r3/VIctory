@@ -2179,6 +2179,7 @@ mod tests {
     /// between them, whole or of one subresource in place, is left out (the
     /// host refuses a copy of a texture onto itself); one between textures
     /// over two memories is recorded.
+    #[cfg(windows)]
     #[test]
     fn a_copy_between_textures_over_one_memory_is_left_out() {
         use std::sync::atomic::Ordering::Relaxed;

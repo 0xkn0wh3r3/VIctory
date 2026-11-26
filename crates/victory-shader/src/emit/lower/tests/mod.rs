@@ -661,6 +661,7 @@ fn a_descriptor_skipped_only_by_lanes_that_never_run_needs_no_source() {
     let layout = vec![root(RootType::Table, 0, 0)];
     let l = lower_with(&words, layout, used).unwrap();
     assert_eq!(l.nonuniform_handles, 0);
+    #[cfg(windows)]
     if let Ok(mut v) = super::super::validator::Validator::load(
         super::super::validator::Validator::default_path().as_deref(),
     ) {
@@ -714,6 +715,7 @@ fn descriptors_joined_by_nested_control_flow_lower_to_one_uniform_handle() {
     let l = lower_with(&words, layout, used).unwrap();
     // One image handle from the joins' heap index, the same in all lanes.
     assert_eq!(l.nonuniform_handles, 0);
+    #[cfg(windows)]
     if let Ok(mut v) = super::super::validator::Validator::load(
         super::super::validator::Validator::default_path().as_deref(),
     ) {
@@ -764,6 +766,7 @@ fn descriptors_reloaded_from_a_root_table_share_one_handle() {
     // One image handle made in the entry block for both loads, and the
     // UAV's.
     assert_eq!(l.heap_handles, 2);
+    #[cfg(windows)]
     if let Ok(mut v) = super::super::validator::Validator::load(
         super::super::validator::Validator::default_path().as_deref(),
     ) {

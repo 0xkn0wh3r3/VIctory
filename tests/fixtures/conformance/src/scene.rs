@@ -48,8 +48,9 @@ pub struct Draw {
 pub struct Geometry {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u16>,
-    /// Ground, cube, pyramid.
-    pub meshes: [Draw; 3],
+    /// Ground, cube, pyramid, and the terrain beyond the ground (drawn
+    /// only in the demo's window, never in the checked frame).
+    pub meshes: [Draw; 4],
 }
 
 type V3 = [f32; 3];
@@ -107,6 +108,50 @@ impl Geometry {
         self.indices.extend([0, 1, 2, 0, 2, 3].map(|i| base + i));
     }
 
+    /// Hills and mountains around the ground: a heightfield of Perlin
+    /// noise over x in -48..48 and z in -12..70, flat (just under the
+    /// ground) beneath and beside it, rising with distance from its edges
+    /// into a valley of ridges.
+    fn push_terrain(&mut self) {
+        const COLUMNS: u16 = 160;
+        const ROWS: u16 = 128;
+        let (x0, x1, z0, z1) = (-48.0f32, 48.0f32, -12.0f32, 70.0f32);
+        let noise = Perlin::new(0x5eed);
+        let height = |x: f32, z: f32| {
+            // How far beyond the 16 x 16 ground's far and side edges.
+            let away = (z - 8.0).max(x.abs() - 8.0).max(0.0);
+            let rise = smoothstep(0.0, 18.0, away);
+            let peaks = 2.0 + 11.0 * (away / 55.0).min(1.0);
+            -0.02 + rise * peaks * noise.ridged(x * 0.045, z * 0.045, 5).powf(1.6)
+        };
+        let base = self.vertices.len() as u16;
+        let (dx, dz) = ((x1 - x0) / COLUMNS as f32, (z1 - z0) / ROWS as f32);
+        for row in 0..=ROWS {
+            for column in 0..=COLUMNS {
+                let (x, z) = (x0 + column as f32 * dx, z0 + row as f32 * dz);
+                // The normal from the height's slope across one cell.
+                let sx = height(x + dx, z) - height(x - dx, z);
+                let sz = height(x, z + dz) - height(x, z - dz);
+                self.vertices.push(Vertex {
+                    position: [x, height(x, z), z],
+                    normal: normalize([-sx, 2.0 * dx.min(dz), -sz]),
+                    // One light texel: the terrain takes its albedo only.
+                    uv: [0.02, 0.02],
+                });
+            }
+        }
+        let at = |column: u16, row: u16| base + row * (COLUMNS + 1) + column;
+        for row in 0..ROWS {
+            for column in 0..COLUMNS {
+                // As the ground's quad: far left, far right, near right, near
+                // left (clockwise seen from above).
+                let (a, b) = (at(column, row + 1), at(column + 1, row + 1));
+                let (c, d) = (at(column + 1, row), at(column, row));
+                self.indices.extend([a, b, c, a, c, d]);
+            }
+        }
+    }
+
     fn mesh(&mut self, build: impl FnOnce(&mut Geometry)) -> Draw {
         let first_index = self.indices.len() as u32;
         let base_vertex = self.vertices.len() as i32;
@@ -134,7 +179,7 @@ impl Geometry {
         let mut g = Geometry {
             vertices: Vec::new(),
             indices: Vec::new(),
-            meshes: [none; 3],
+            meshes: [none; 4],
         };
         // A 16 x 16 ground, the texture repeated 4 times across it.
         let ground = g.mesh(|g| g.push_quad([0.0; 3], [0.0, 1.0, 0.0], 8.0, 4.0));
@@ -183,7 +228,8 @@ impl Geometry {
                 g.indices.extend([base, base + 1, base + 2]);
             }
         });
-        g.meshes = [ground, cube, pyramid];
+        let terrain = g.mesh(|g| g.push_terrain());
+        g.meshes = [ground, cube, pyramid, terrain];
         g
     }
 }
@@ -339,6 +385,129 @@ pub fn frame(t: f32) -> (SceneConstants, Vec<(usize, MeshConstants)>) {
         ),
     ];
     (scene, draws)
+}
+
+/// Objects the demo's stress scale adds to the frame (none in the checked
+/// frame): `count` small cubes and pyramids in a grid over the ground, each
+/// turning and bobbing at time `t`, each a draw with constants of its own.
+pub fn crowd(t: f32, count: usize) -> Vec<(usize, MeshConstants)> {
+    let side = (count as f32).sqrt().ceil().max(1.0) as usize;
+    let (x0, x1, z0, z1) = (-7.0f32, 7.0f32, -1.5f32, 7.5f32);
+    let (step_x, step_z) = ((x1 - x0) / side as f32, (z1 - z0) / side as f32);
+    let size = (step_x.min(step_z) * 0.55).min(0.35);
+    (0..count)
+        .map(|i| {
+            let (column, row) = ((i % side) as f32, (i / side) as f32);
+            let phase = i as f32 * 0.37;
+            let at = [
+                x0 + (column + 0.5) * step_x,
+                size * 0.5 + size * 0.3 * (t * 2.0 + phase).sin().abs(),
+                z0 + (row + 0.5) * step_z,
+            ];
+            let turn = phase + t * (0.4 + (i % 7) as f32 * 0.15);
+            let albedo = hue(i as f32 * 0.618_034 % 1.0);
+            let constants = MeshConstants {
+                world: world(at, size, turn),
+                albedo_shininess: [albedo[0], albedo[1], albedo[2], 24.0],
+                specular: [0.4, 0.4, 0.4, 0.0],
+                emissive: [0.0; 4],
+                _pad: [0.0; 36],
+            };
+            (1 + i % 2, constants)
+        })
+        .collect()
+}
+
+/// The terrain's constants: where it lies (as built) and its colour.
+pub fn terrain() -> MeshConstants {
+    MeshConstants {
+        world: world([0.0; 3], 1.0, 0.0),
+        albedo_shininess: [0.36, 0.5, 0.3, 6.0],
+        specular: [0.04, 0.04, 0.04, 0.0],
+        emissive: [0.0; 4],
+        _pad: [0.0; 36],
+    }
+}
+
+fn smoothstep(from: f32, to: f32, x: f32) -> f32 {
+    let t = ((x - from) / (to - from)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Ken Perlin's improved gradient noise in two dimensions, with its
+/// permutation shuffled from `seed` (the same terrain every run).
+struct Perlin {
+    p: [u8; 512],
+}
+
+impl Perlin {
+    fn new(seed: u64) -> Perlin {
+        let mut table: [u8; 256] = std::array::from_fn(|i| i as u8);
+        let mut state = seed;
+        for i in (1..256).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            table.swap(i, (state >> 33) as usize % (i + 1));
+        }
+        Perlin {
+            p: std::array::from_fn(|i| table[i % 256]),
+        }
+    }
+
+    /// Noise at (x, y), about -1 to 1.
+    fn noise(&self, x: f32, y: f32) -> f32 {
+        let (xf, yf) = (x.floor(), y.floor());
+        let (xi, yi) = ((xf as i32 & 255) as usize, (yf as i32 & 255) as usize);
+        let (x, y) = (x - xf, y - yf);
+        let fade = |t: f32| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+        let grad = |hash: u8, x: f32, y: f32| match hash & 7 {
+            0 => x + y,
+            1 => -x + y,
+            2 => x - y,
+            3 => -x - y,
+            4 => x,
+            5 => -x,
+            6 => y,
+            _ => -y,
+        };
+        let p = &self.p;
+        let corner = |dx: usize, dy: usize| p[p[xi + dx] as usize + yi + dy];
+        let (u, v) = (fade(x), fade(y));
+        let lerp = |a: f32, b: f32, t: f32| a + t * (b - a);
+        lerp(
+            lerp(grad(corner(0, 0), x, y), grad(corner(1, 0), x - 1.0, y), u),
+            lerp(
+                grad(corner(0, 1), x, y - 1.0),
+                grad(corner(1, 1), x - 1.0, y - 1.0),
+                u,
+            ),
+            v,
+        )
+    }
+
+    /// Ridged multifractal noise of `octaves` octaves, 0 to 1: sharp crests
+    /// where the noise crosses zero, as mountain ridges.
+    fn ridged(&self, x: f32, y: f32, octaves: u32) -> f32 {
+        let (mut sum, mut amplitude, mut frequency, mut total) = (0.0, 1.0, 1.0, 0.0);
+        for _ in 0..octaves {
+            let ridge = 1.0 - self.noise(x * frequency, y * frequency).abs();
+            sum += amplitude * ridge * ridge;
+            total += amplitude;
+            amplitude *= 0.5;
+            frequency *= 2.0;
+        }
+        sum / total
+    }
+}
+
+/// A saturated colour of hue `h` (0 to 1).
+fn hue(h: f32) -> V3 {
+    let channel = |offset: f32| {
+        let k = (h * 6.0 + offset) % 6.0;
+        0.9 - 0.6 * (k.min(4.0 - k).clamp(0.0, 1.0))
+    };
+    [channel(5.0), channel(3.0), channel(1.0)]
 }
 
 /// The texture's texels, rows of RGBA8: a checkerboard of 8-texel cells,
