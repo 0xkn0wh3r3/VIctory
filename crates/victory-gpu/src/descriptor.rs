@@ -858,6 +858,33 @@ pub(crate) mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
+    /// A small, shader-visible heap with the requested host cap on any adapter.
+    #[cfg(windows)]
+    pub(crate) fn capped_view_heap(title_slots: u32, host_slots: u32) -> This {
+        assert!(host_slots < title_slots);
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: title_slots,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address: 0,
+                    size: 0
+                },
+                &mut h
+            ),
+            S_OK
+        );
+        let host = host::HostHeap::new(false, host_slots).expect("a host view heap");
+        assert!(heap(h).host.set(Some(host)).is_ok());
+        h
+    }
+
     /// A released view heap takes its title memory page table with it, also
     /// when no heap is made at its address afterwards (else the table, its
     /// 16.8 MiB mapping and the copies it names live on).
