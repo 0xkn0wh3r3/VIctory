@@ -2737,8 +2737,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn host_textures_are_kept_resident_by_use() {
-        // No submission gives up host textures meanwhile (crate::resource::evict_unused).
-        let _quiet = crate::host::tests::no_submissions();
         use crate::host::{Residency, kept};
         const RENDER_TARGET: u32 = 0x1;
         if crate::host::host().is_none() {
