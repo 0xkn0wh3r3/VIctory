@@ -1,15 +1,12 @@
 # victory-leafy
 
-**Official Stream: https://youtube.com/live/da-WFG3W9ZI?feature=share**
+**This may not work for you. You may need to pull certain changes and combine
+them with your own build. It is here as a public resource that might help
+someone.**
 
-101Leafy's build of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This branch brings together the forks and open pull requests below, with fixes
-for NVIDIA cards, Intel CPUs, and Windows 10 on top. It is early work.
-
-**This repository contains no game files, code, or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+The cool_fox build people asked for, with codec_d's work, is on the
+[`cool-fox`](https://github.com/101Leafy/victory-leafy/tree/cool-fox) branch.
+On our NVIDIA machine it drew a grey scene, so it may not work either.
 
 ## Credits
 
@@ -80,6 +77,7 @@ delacor,
 [Diego](https://github.com/DiegoFR20),
 [divyeshganta](https://github.com/divyeshganta),
 [DocBlack89](https://github.com/DocBlack89),
+[DOT HEX](https://github.com/X13X),
 [DoubleD17](https://github.com/DoubleD17),
 [Duff](https://github.com/Dufftwt),
 [EatCodeSleep2](https://github.com/EatCodeSleep2),
@@ -146,6 +144,7 @@ Pedro Fortunato,
 [raffclar](https://github.com/raffclar),
 [Rivaldo Freitas de Carvalho](https://github.com/rivaldodev),
 [Saitken91](https://github.com/SAitken91),
+[salchipapa969-star](https://github.com/salchipapa969-star),
 [Shadow](https://github.com/UnkwnDev),
 Skyfrye,
 [SlopComp](https://github.com/SlopComp),
@@ -161,6 +160,17 @@ warmooff-ops,
 [Yaekai](https://github.com/Yaekai),
 [ZazaJr24](https://github.com/ZazaJr24),
 [给伊莉雅补魔](https://github.com/geiyiliyabumo).
+
+**Official Stream: https://youtube.com/live/da-WFG3W9ZI?feature=share**
+
+101Leafy's build of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
+that runs an Xbox Series title natively on Windows from files the user supplies.
+This branch brings together the forks and open pull requests above, with fixes
+for NVIDIA cards, Intel CPUs, and Windows 10 on top. It is early work.
+
+**This repository contains no game files, code, or assets.** You need your own
+copy of the game. It is not affiliated with or endorsed by the game's developer
+or publisher.
 
 ## Where it stands (2026-11-26)
 
