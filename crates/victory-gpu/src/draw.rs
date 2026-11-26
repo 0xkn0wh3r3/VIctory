@@ -219,6 +219,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
             // A host root descriptor: no heap view, so its writes are not
             // marked.
             shadow.gpu_writes(list, address, len, false);
+            shadow.may_write(list, address + len, shadow.left(address) - len);
         }
         return Some(gpu);
     }
@@ -910,6 +911,7 @@ impl State {
                         let len = shadow.left(*address).min(1 << 20);
                         shadow.refresh(list, *address, len);
                         shadow.gpu_writes(list, *address, len, false);
+                        shadow.may_write(list, *address + len, shadow.left(*address) - len);
                         map.precise(*address, len);
                     }
                 }
@@ -972,6 +974,7 @@ impl State {
             // copy; else declared for 1 MiB.
             let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
             shadow.gpu_writes(list, address, len, true);
+            shadow.may_write(list, address + len, shadow.left(address) - len);
         }
         let (key, host) = match self.heaps[0] {
             0 => (MEMORY_HEAP, crate::memory::heap()),

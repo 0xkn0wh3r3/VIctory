@@ -1925,6 +1925,13 @@ impl Host {
             }
         }
         crate::shadow::snapshots_done(&snapshots);
+        // What shaders may have written through the heaps' views of copies
+        // in video memory without marks: their mirrors are behind there.
+        if self.gpu_upload_writes() {
+            for viewed in &heaps {
+                crate::bindless::written_unseen(viewed);
+            }
+        }
         for list in runs {
             for work in &list.deferred().after {
                 work();
