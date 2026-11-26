@@ -158,7 +158,9 @@ impl Lower<'_> {
     /// operations whose `half` result is the console's: sums, differences
     /// and products (rounded once to nearest even either way), fused
     /// multiply-adds (rounded once where the host fuses), minima, maxima and
-    /// medians (exact). `None` for the others.
+    /// medians (exact). `None` for the others, and for an instruction with
+    /// an output modifier: that takes the f32 path, whatever it does with
+    /// the modifier (both paths then agree on what translates).
     pub(super) fn valu16_native(
         &mut self,
         inst: &Inst,
@@ -178,7 +180,10 @@ impl Lower<'_> {
             "v_min3_f16",
             "v_med3_f16",
         ];
-        if !self.native16() || !NATIVE.contains(&name) {
+        let Fields::Valu(v) = &inst.fields else {
+            return None;
+        };
+        if !self.native16() || !NATIVE.contains(&name) || v.omod != 0 {
             return None;
         }
         Some(self.valu16_native_op(inst, name, guard))
@@ -193,9 +198,6 @@ impl Lower<'_> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.omod != 0 {
-            return Err("an output modifier on a 16-bit operation");
-        }
         let (a, b) = (self.half_bits_src(inst, 0)?, self.half_bits_src(inst, 1)?);
         let r = match name {
             "v_add_f16" => self.half_bin(Bin::Add, a, b),

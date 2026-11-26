@@ -2525,6 +2525,28 @@ fn declares_native16(shader: &HostShader) -> bool {
     u64::from_le_bytes(sfi0.data[..8].try_into().expect("8 bytes")) & 0x4_0000 != 0
 }
 
+/// An f16 sum or product with an output modifier takes the f32 path with
+/// `native16`: both lowerings translate it alike or refuse it alike, and a
+/// translated one declares no native 16-bit operations.
+#[test]
+fn output_modifiers_on_f16_results_take_the_f32_path_natively() {
+    // v_add_f16 and v_mul_f16 as VOP3; mul:2, mul:4 and div:2.
+    for op in [0x132u16, 0x135] {
+        for omod in 1..=3 {
+            let body = vop3(op, 5, [v(1), v(2), 0], M { omod, ..NONE });
+            let what = disassembly(&body, false);
+            let words = program(&body, false);
+            let f32_path = lower_program(&words, false);
+            let native = lower_program(&words, true);
+            match (&f32_path, &native) {
+                (Ok(_), Ok(n)) => assert!(!declares_native16(n), "{what}"),
+                (Err(a), Err(b)) => assert_eq!(a, b, "{what}"),
+                (a, b) => panic!("{what}: f32 path {:?}, native {:?}", a.is_ok(), b.is_ok()),
+            }
+        }
+    }
+}
+
 /// Native 16-bit operations are declared exactly where `half` is used:
 /// with `native16`, for the f16 arithmetic, not for programs that round
 /// toward zero or only convert.
