@@ -52,9 +52,8 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// The dynamic slots taken (by lists not yet reset).
+    taken: Mutex<Taken>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -154,12 +153,13 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// (a capped heap, NVIDIA, paged or not): the title's slots keep their
+/// room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// Title slots of a paged view heap at most: its dynamic slots past them
 /// end below the null buffer views, among the slots shaders index.
-const PAGED_TITLE_VIEWS: u32 = victory_shader::emit::NULL_BUFFER_VIEW - 1 - DYNAMIC;
+const PAGED_TITLE_VIEWS: u32 = victory_shader::emit::NULL_BUFFER_VIEW - 1 - MIN_DYNAMIC;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -234,9 +234,10 @@ impl HostHeap {
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
         let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
         let (heap, count, extra) = if paged {
-            // Every slot is virtual: the host heap as large as it takes.
+            // Every slot is virtual: the host heap as large as it takes,
+            // its pages for the title's slots but the few dynamic ones.
             match make(PORTABLE_VIEWS) {
-                Ok(heap) => (heap, count, DYNAMIC),
+                Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) => {
                     tracing::warn!(error = %e, count, "no host descriptor heap");
                     return None;
@@ -356,7 +357,10 @@ impl HostHeap {
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             owners_seen: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            taken: Mutex::new(Taken {
+                slots: vec![false; extra as usize],
+                ..Default::default()
+            }),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < slots => null - 1,
@@ -472,6 +476,23 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
     .as_ref()
 }
 
+/// A view heap's dynamic slots: where the search for free ones starts,
+/// which are taken, how many, the most taken at once and the longest run
+/// asked for.
+#[derive(Default)]
+struct Taken {
+    next: u32,
+    slots: Vec<bool>,
+    now: u32,
+    peak: u32,
+    run: u32,
+}
+
+/// Whether `new` passes a power of two `old` was below.
+fn passes_power_of_two(old: u32, new: u32) -> bool {
+    new > old && new.leading_zeros() < old.leading_zeros()
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -479,8 +500,11 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
+        let mut guard = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        let old = (guard.peak, guard.run);
+        guard.run = guard.run.max(n);
+        let t = &mut *guard;
+        let (next, taken) = (&mut t.next, &mut t.slots);
         let n = n as usize;
         // Search from `next` on, then from the start (extending past cursor by
         // n - 1 so contiguous runs crossing the cursor are not missed).
@@ -504,6 +528,9 @@ impl HostHeap {
             }
         }
         let Some(first) = found else {
+            let new = (t.peak, t.run);
+            drop(guard);
+            self.log_dynamic(old, new);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             return None;
@@ -512,7 +539,25 @@ impl HostHeap {
         *next = ((first + n) % self.dynamic as usize) as u32;
         // Shaders read texture views there too: their marks are scanned.
         crate::descriptor::view_slots_reach(self.count + (first + n) as u32);
+        t.now += n as u32;
+        t.peak = t.peak.max(t.now);
+        let new = (t.peak, t.run);
+        drop(guard);
+        self.log_dynamic(old, new);
         Some(self.count + first as u32)
+    }
+
+    /// Logs the most dynamic slots taken at once and the longest run asked
+    /// for, where either passes a power of two.
+    fn log_dynamic(&self, (old_peak, old_run): (u32, u32), (peak, run): (u32, u32)) {
+        if passes_power_of_two(old_peak, peak) || passes_power_of_two(old_run, run) {
+            tracing::info!(
+                peak,
+                of = self.dynamic,
+                run,
+                "view heap dynamic slots in use"
+            );
+        }
     }
 
     /// Two consecutive slots (view heaps only) kept until
@@ -559,10 +604,12 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.taken.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
+        if let Some(slots) = guard.slots.get_mut(at as usize..end) {
+            let given = slots.iter().filter(|&&t| t).count() as u32;
             slots.fill(false);
+            guard.now -= given;
         }
     }
 
@@ -898,10 +945,11 @@ impl HostHeap {
     /// so no title thread makes a slot of such a page meanwhile.
     // shortcut: a handle `gpu` gave out for a slot of a page placed on a
     // write, recorded into a list kept unsubmitted for longer than pages
-    // are kept unused (10 s and 300 submissions), reads what the page's
-    // host page holds by then. Lists bind title slots through the page
-    // table, and `gpu` stamps the page; no list of ours bakes a title
-    // slot's handle today (the unordered access clear takes a dynamic one).
+    // are kept unused (10 s and 300 submissions; 32 submissions once a
+    // write found no room), reads what the page's host page holds by then.
+    // Lists bind title slots through the page table, and `gpu` stamps the
+    // page; no list of ours bakes a title slot's handle today (the
+    // unordered access clear takes a dynamic one).
     pub(crate) fn take_back_pages(&self, at: std::time::Instant) {
         let Some(p) = &self.pages else { return };
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -3177,6 +3225,45 @@ mod tests {
             let mut fmt = format;
             assert!(super::fits(&typed, &[], Some(&mut fmt), true));
         }
+    }
+
+    /// The peak is the most dynamic slots taken at once, and the run the
+    /// longest asked for.
+    #[test]
+    fn the_dynamic_peak_follows_takes_and_releases() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let counts = |heap: &HostHeap| {
+            let t = heap.taken.lock().unwrap();
+            (t.now, t.peak, t.run)
+        };
+        let _a = heap.dynamic(10).unwrap();
+        let b = heap.dynamic(30).unwrap();
+        let _c = heap.dynamic(20).unwrap();
+        assert_eq!(counts(&heap), (60, 60, 30));
+        heap.release(b, 30);
+        assert_eq!(counts(&heap), (30, 60, 30));
+        // Slots given back twice count once.
+        heap.release(b, 30);
+        assert_eq!(counts(&heap), (30, 60, 30));
+        heap.dynamic(25).unwrap();
+        assert_eq!(counts(&heap), (55, 60, 30));
+        heap.dynamic(15).unwrap();
+        assert_eq!(counts(&heap), (70, 70, 30));
+        // A run that does not fit still counts as asked for.
+        assert_eq!(heap.dynamic(heap.dynamic), None);
+        assert_eq!(counts(&heap), (70, 70, heap.dynamic));
+    }
+
+    #[test]
+    fn dynamic_powers_of_two_are_passed_once() {
+        assert!(passes_power_of_two(0, 1));
+        assert!(passes_power_of_two(3, 5));
+        assert!(passes_power_of_two(4, 8));
+        assert!(!passes_power_of_two(4, 7));
+        assert!(!passes_power_of_two(5, 5));
+        assert!(!passes_power_of_two(9, 3));
     }
 
     /// A paged heap of a title heap of every slot shaders index is capped:
