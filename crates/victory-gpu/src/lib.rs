@@ -88,8 +88,6 @@ mod tdr;
 mod texture;
 #[cfg(windows)]
 mod twin;
-#[cfg(all(windows, test))]
-mod uma_bench;
 #[cfg(windows)]
 mod unified;
 #[cfg(windows)]
