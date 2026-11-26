@@ -894,17 +894,22 @@ impl HostHeap {
     /// slots had its list searched each time; 62,000 slots a frame, run
     /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
+        let gives_up = |k: &Kept| {
+            k.as_ref().is_some_and(|k| {
+                k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+            })
+        };
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            (0..kept.len() as u32)
-                .filter(|&i| {
-                    kept[i as usize]
-                        .as_ref()
-                        .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
-                })
-                .collect()
+            (0..kept.len() as u32).filter(|&i| gives_up(&kept[i as usize])).collect()
         };
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // A title slot made again since it was picked (a title thread wrote a
+        // view there, which takes `made` too) views something else: it stays.
+        let slots: Vec<u32> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            slots.into_iter().filter(|&i| gives_up(&kept[i as usize])).collect()
+        };
         for index in slots {
             if let Some(ready) = self.ready.get(index as usize) {
                 ready.store(0, Ordering::Relaxed);
