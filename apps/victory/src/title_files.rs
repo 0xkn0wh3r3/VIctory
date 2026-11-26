@@ -42,7 +42,11 @@ pub(crate) fn run(game_dir: Option<PathBuf>, jobs: Option<usize>, pipelines: boo
 /// The files of the title in `game_dir` that hold its shaders: its shader
 /// archive (`shaders.rpf`, which holds the shader pack the pipelines come
 /// from), its executable (the first its manifest names that is there, else
-/// the folder's only `.exe`) and the DLLs beside it.
+/// the folder's only `.exe`) and the DLLs beside it. Every DLL there, not
+/// only those the executable imports: the title loads some at run time
+/// (`LoadLibrary`, `victory_hle::runtime::load_title_dll`), which no import
+/// table names, such as the FidelityFX upscaler its loader DLL opens. A DLL
+/// with no shaders costs one read.
 pub(crate) fn title_files(game_dir: &Path) -> Result<Vec<PathBuf>> {
     anyhow::ensure!(game_dir.is_dir(), "{} is not a folder", game_dir.display());
     let manifest =
@@ -148,8 +152,18 @@ mod tests {
     /// `.exe`; with two and no manifest, none.
     #[test]
     fn a_game_folder_gives_its_archive_executable_and_dlls() {
-        let dir = std::env::temp_dir().join(format!("victory-title-files-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        /// The folder, removed when the test ends, also when it fails.
+        struct Folder(PathBuf);
+        impl Drop for Folder {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let folder = Folder(
+            std::env::temp_dir().join(format!("victory-title-files-{}", std::process::id())),
+        );
+        let dir = &folder.0;
+        let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         for name in [
             "shaders.rpf",
@@ -170,20 +184,17 @@ mod tests {
                 .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
                 .collect()
         };
-        let files = title_files(&dir).unwrap();
+        let files = title_files(dir).unwrap();
         assert_eq!(names(files), ["shaders.rpf", "Title.exe", "A.DLL", "b.dll"]);
         std::fs::remove_file(dir.join("MicrosoftGame.config")).unwrap();
-        assert!(
-            title_files(&dir).is_err(),
-            "two executables and no manifest"
-        );
+        assert!(title_files(dir).is_err(), "two executables and no manifest");
         std::fs::remove_file(dir.join("Crash.exe")).unwrap();
         std::fs::remove_file(dir.join("shaders.rpf")).unwrap();
         assert_eq!(
-            names(title_files(&dir).unwrap()),
+            names(title_files(dir).unwrap()),
             ["Title.exe", "A.DLL", "b.dll"]
         );
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(title_files(&dir).is_err(), "no folder");
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(title_files(dir).is_err(), "no folder");
     }
 }
