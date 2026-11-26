@@ -27,6 +27,8 @@
 
 use std::ffi::OsStr;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -103,16 +105,33 @@ pub(crate) struct InPlace {
 /// host cannot open it as a heap (no `ID3D12Device13`, memory that is not
 /// committed read-write memory of one allocation) or place a buffer in it.
 pub(crate) fn open(start: u64, len: u64) -> Option<InPlace> {
+    if !OPENS.worth_asking() {
+        return None;
+    }
     let host = crate::host::host()?;
-    let device13 = host.device.cast::<ID3D12Device13>().ok()?;
+    let Ok(device13) = host.device.cast::<ID3D12Device13>() else {
+        OPENS.cannot();
+        return None;
+    };
     let from = start & !0xFFF;
     let offset = start - from;
     // Whole pages: a view rounded up to 256 bytes at the buffer's end fits.
     let size = (offset + len).next_multiple_of(4096);
     // SAFETY: title memory; the heap only holds its pages, and a range that
     // is not committed read-write memory is refused.
-    let heap: ID3D12Heap =
-        unsafe { device13.OpenExistingHeapFromAddress1(from as *const _, size as usize) }.ok()?;
+    let opened = unsafe { device13.OpenExistingHeapFromAddress1(from as *const _, size as usize) };
+    let heap: ID3D12Heap = match opened {
+        Ok(heap) => heap,
+        Err(e) if e.code() == windows::Win32::Foundation::E_NOTIMPL => {
+            OPENS.cannot();
+            return None;
+        }
+        Err(_) => {
+            OPENS.refused();
+            return None;
+        }
+    };
+    OPENS.opened();
     pin_heap(&heap, from, size);
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -157,6 +176,52 @@ pub(crate) fn open(start: u64, len: u64) -> Option<InPlace> {
     })
 }
 
+/// Whether opening title memory as a heap is worth asking again. One range
+/// can be refused (a read-only page, several allocations); a host that never
+/// opens any (a translation layer without the method, or one that fails it
+/// every time: D3DMetal returns `E_FAIL`) is not asked again, so each new
+/// buffer does not pay a failing call before its copy.
+struct Opens {
+    /// Refusals in a row, while none succeeded; [`GIVE_UP`] when the host
+    /// cannot open heaps at all.
+    refused: AtomicU32,
+    opened: AtomicBool,
+}
+
+/// Refusals in a row, none ever opened, after which the host is not asked.
+const GIVE_UP: u32 = 16;
+
+static OPENS: Opens = Opens {
+    refused: AtomicU32::new(0),
+    opened: AtomicBool::new(false),
+};
+
+impl Opens {
+    fn worth_asking(&self) -> bool {
+        self.opened.load(Relaxed) || self.refused.load(Relaxed) < GIVE_UP
+    }
+
+    fn opened(&self) {
+        self.opened.store(true, Relaxed);
+    }
+
+    /// One range refused.
+    fn refused(&self) {
+        if self.refused.fetch_add(1, Relaxed) + 1 == GIVE_UP && !self.opened.load(Relaxed) {
+            tracing::info!("title memory never opens as a heap here: title buffers keep copies");
+        }
+    }
+
+    /// The host has no way to open title memory as a heap.
+    fn cannot(&self) {
+        if self.refused.swap(GIVE_UP, Relaxed) < GIVE_UP {
+            tracing::info!(
+                "this host cannot open title memory as a heap: title buffers keep copies"
+            );
+        }
+    }
+}
+
 /// The private data by which a buffer in place holds its heap.
 const HOLDS_ITS_HEAP: windows::core::GUID =
     windows::core::GUID::from_u128(0x6f1d_2c3a_9b84_4e57_a0c2_51e8_7d93_b41f);
@@ -190,6 +255,36 @@ fn pin_heap(heap: &ID3D12Heap, at: u64, len: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh() -> Opens {
+        Opens {
+            refused: AtomicU32::new(0),
+            opened: AtomicBool::new(false),
+        }
+    }
+
+    /// A host that refuses every open is not asked after [`GIVE_UP`]
+    /// refusals, one without the method at once; one that opened any range
+    /// is always asked (other ranges may be refused for their own reasons).
+    #[test]
+    fn a_host_that_never_opens_heaps_is_not_asked_again() {
+        let never = fresh();
+        for _ in 0..GIVE_UP - 1 {
+            never.refused();
+        }
+        assert!(never.worth_asking());
+        never.refused();
+        assert!(!never.worth_asking());
+        let without = fresh();
+        without.cannot();
+        assert!(!without.worth_asking());
+        let some = fresh();
+        some.opened();
+        for _ in 0..2 * GIVE_UP {
+            some.refused();
+        }
+        assert!(some.worth_asking());
+    }
 
     #[test]
     fn the_switch_decides_and_unset_follows_the_host() {

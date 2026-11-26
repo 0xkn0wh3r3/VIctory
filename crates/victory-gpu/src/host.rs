@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -3958,6 +3958,11 @@ fn upload_placement(
     (read_only, read_only && written)
 }
 
+/// The host gives GPU upload buffers no destruction callback (a translation
+/// layer), so their budget charge could not go back: copies stay in system
+/// memory from the first one on ([`Host::gpu_upload_buffer`]).
+static NO_UPLOAD_CALLBACKS: AtomicBool = AtomicBool::new(false);
+
 /// The PCI vendor ID of NVIDIA's GPUs (`DXGI_ADAPTER_DESC1::VendorId`).
 const NVIDIA: u32 = 0x10DE;
 
@@ -4009,7 +4014,7 @@ impl Host {
     /// memory budget ([`UPLOAD_POOL`]). Kept resident before what the title
     /// streams ([`keep_resident`]).
     pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        if !self.gpu_upload() {
+        if !self.gpu_upload() || NO_UPLOAD_CALLBACKS.load(Ordering::Relaxed) {
             return None;
         }
         let size = size.max(1);
@@ -4040,9 +4045,11 @@ impl Host {
                 })
         };
         if watched.is_err() {
-            // Not given back when destroyed, it would count for good.
+            // Not given back when destroyed, it would count for good. The
+            // host has no such callbacks: no buffer is made again only to go.
             drop(buffer);
             UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            NO_UPLOAD_CALLBACKS.store(true, Ordering::Relaxed);
             static UNWATCHED: std::sync::Once = std::sync::Once::new();
             UNWATCHED.call_once(|| {
                 tracing::info!(
