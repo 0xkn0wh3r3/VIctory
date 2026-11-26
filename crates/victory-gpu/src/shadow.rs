@@ -1610,6 +1610,8 @@ pub(crate) mod tests {
     /// back to the pre-fault value.
     #[test]
     fn partial_refresh_under_marked_range_updates_saved_bytes() {
+        // No submission works through the copies meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
