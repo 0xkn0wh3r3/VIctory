@@ -153,6 +153,10 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Title slots of a paged view heap at most: its dynamic slots past them
+/// end below the null buffer views, among the slots shaders index.
+const PAGED_TITLE_VIEWS: u32 = victory_shader::emit::NULL_BUFFER_VIEW - 1 - DYNAMIC;
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -177,6 +181,17 @@ impl HostHeap {
         // heap, and dynamic ones): shaders read the table as a root view,
         // which has no bounds, at indices clamped below `HEAP_VIEWS`.
         let paged = !sampler && view_pages();
+        // shortcut: a paged heap's title slots past the virtual ones left
+        // for them are left out; a title that reaches them needs remapping.
+        let count = if paged && count > PAGED_TITLE_VIEWS {
+            tracing::warn!(
+                count,
+                "paged view heap capped at {PAGED_TITLE_VIEWS} title slots"
+            );
+            PAGED_TITLE_VIEWS
+        } else {
+            count
+        };
         let page_table = if paged {
             u64::from(victory_shader::emit::HEAP_VIEWS / PAGE) * 4
         } else {
@@ -2987,6 +3002,38 @@ mod tests {
             let mut fmt = format;
             assert!(super::fits(&typed, &[], Some(&mut fmt), true));
         }
+    }
+
+    /// A paged heap of a title heap of every slot shaders index is capped:
+    /// its dynamic slots and the null buffer views stay among them, and
+    /// have their pages placed in the page table.
+    #[test]
+    fn a_paged_heap_of_every_slot_shaders_index_is_capped() {
+        if !view_pages() {
+            return; // not paged on this host
+        }
+        let views = victory_shader::emit::HEAP_VIEWS;
+        let Some(heap) = HostHeap::new(false, views) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.count(), PAGED_TITLE_VIEWS);
+        let null = victory_shader::emit::NULL_BUFFER_VIEW;
+        let end = heap.count() + heap.dynamic;
+        assert!(end < null);
+        let pages = heap.pages.as_ref().unwrap();
+        let strides = heap.strides.as_ref().unwrap().1;
+        let table = strides + victory_shader::emit::VIEW_PAGE_TABLE as usize;
+        for index in [heap.count(), end - 1, null - 1, null] {
+            let page = index / PAGE;
+            assert!(page < views / PAGE);
+            // SAFETY: a dword of the mapped page table, one per page.
+            let entry = unsafe { (table as *const u32).add(page as usize).read_volatile() };
+            assert_ne!(entry, NULL_PAGE, "slot {index}'s page placed");
+            assert_eq!(pages.slot(index, false), Some(entry * PAGE + index % PAGE));
+        }
+        // Every dynamic slot can be taken; title slots past the cap have none.
+        assert_eq!(heap.dynamic(heap.dynamic), Some(heap.count()));
+        assert_eq!(heap.mirror(heap.count(), 0, false), None);
     }
 
     /// A texture view's size words are the console image descriptor's
