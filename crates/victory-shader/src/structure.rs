@@ -62,6 +62,28 @@ pub enum Atom {
     Constant(u64),
 }
 
+impl Atom {
+    /// The value whose compare gives this atom's bit (a lane's, or SCC's):
+    /// none for a joined or opaque mask, whose bit no one compare decides.
+    pub fn compare(self) -> Option<Value> {
+        match self {
+            Atom::Lane(v) | Atom::Uniform(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The values this atom's bit depends on: both dwords of a joined or
+    /// opaque mask.
+    pub fn values(self) -> impl Iterator<Item = Value> {
+        let (v, high) = match self {
+            Atom::Lane(v) | Atom::Uniform(v) | Atom::Quad(v) => (Some(v), None),
+            Atom::Phi(v, h) | Atom::Opaque(v, h) => (Some(v), Some(h)),
+            Atom::Constant(_) => (None, None),
+        };
+        v.into_iter().chain(high)
+    }
+}
+
 /// Reduced ordered binary decision diagrams over [`Atom`]s.
 #[derive(Debug, Clone)]
 pub struct Bools {
@@ -172,6 +194,34 @@ impl Bools {
     pub fn node(&self, b: Bool) -> Option<(Atom, Bool, Bool)> {
         let (v, lo, hi) = self.nodes[b.0 as usize];
         (v != TERMINAL).then(|| (self.atoms[v as usize], lo, hi))
+    }
+
+    /// Whether deciding `b` may test an atom `hit` accepts: from each node,
+    /// the branch `decide` gives for its atom, or both where it gives none.
+    pub fn reaches(
+        &self,
+        b: Bool,
+        decide: impl Fn(Atom) -> Option<bool>,
+        hit: impl Fn(Atom) -> bool,
+    ) -> bool {
+        let (mut seen, mut stack) = (Seen::default(), vec![b]);
+        while let Some(b) = stack.pop() {
+            let Some((atom, lo, hi)) = self.node(b) else {
+                continue;
+            };
+            if !seen.insert(b) {
+                continue;
+            }
+            if hit(atom) {
+                return true;
+            }
+            match decide(atom) {
+                Some(true) => stack.push(hi),
+                Some(false) => stack.push(lo),
+                None => stack.extend([lo, hi]),
+            }
+        }
+        false
     }
 
     /// The atoms `b` depends on, in variable order.
@@ -1935,6 +1985,32 @@ mod tests {
             }
         }
         f
+    }
+
+    /// The walk of the lowering's `touches`: with the compare writing `lo`
+    /// known true, a lane's bit of that compare is decided, so the branch
+    /// where it is clear (a tainted lane bit) is not searched. A joined or
+    /// opaque mask whose low dword is `lo` is not decided by it: its high
+    /// dword may clear lanes 32-63, so that branch is searched. Its high
+    /// dword alone, tainted, counts too.
+    #[test]
+    fn only_a_compare_s_own_bit_is_decided_by_the_compare() {
+        let (lo, hi, t) = (Value(1), Value(2), Value(3));
+        let decide = |a: Atom| a.compare().filter(|&v| v == lo).map(|_| true);
+        let tainted = |v: Value| move |a: Atom| a.values().any(|x| x == v);
+        for (first, searched) in [
+            (Atom::Lane(lo), false),
+            (Atom::Opaque(lo, hi), true),
+            (Atom::Phi(lo, hi), true),
+        ] {
+            let mut b = Bools::new();
+            let x = b.atom(first, 0);
+            let y = b.atom(Atom::Lane(t), 0);
+            let f = b.or(x, y);
+            assert_eq!(b.node(f).map(|n| n.0), Some(first));
+            assert_eq!(b.reaches(f, decide, tainted(t)), searched, "{first:?}");
+            assert_eq!(b.reaches(x, |_| None, tainted(hi)), first != Atom::Lane(lo));
+        }
     }
 
     /// Atoms `0..n` of a fresh [`Bools`], in variable order.

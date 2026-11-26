@@ -10400,33 +10400,12 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether deciding `b`, given the values in `env`, may test an atom
-    /// of a `tainted` value.
+    /// of a `tainted` value (either dword of a pair). Only a compare's own
+    /// bit is decided by its operands.
     fn touches(&self, b: Bool, env: &HashMap<Value, u32>, tainted: &HashSet<Value>) -> bool {
-        let mut stack = vec![b];
-        let mut seen = HashSet::new();
-        while let Some(b) = stack.pop() {
-            let Some((atom, lo, hi)) = self.x.st.bools.node(b) else {
-                continue;
-            };
-            if !seen.insert(b) {
-                continue;
-            }
-            // A wave64 pair's high dword counts as much as its low one.
-            let (v, high) = match atom {
-                Atom::Lane(v) | Atom::Uniform(v) | Atom::Quad(v) => (Some(v), None),
-                Atom::Phi(v, h) | Atom::Opaque(v, h) => (Some(v), Some(h)),
-                Atom::Constant(_) => (None, None),
-            };
-            if v.into_iter().chain(high).any(|v| tainted.contains(&v)) {
-                return true;
-            }
-            match v.and_then(|v| self.compared(env, v)) {
-                Some(true) => stack.push(hi),
-                Some(false) => stack.push(lo),
-                None => stack.extend([lo, hi]),
-            }
-        }
-        false
+        let decide = |a: Atom| a.compare().and_then(|v| self.compared(env, v));
+        let hit = |a: Atom| a.values().any(|v| tainted.contains(&v));
+        self.x.st.bools.reaches(b, decide, hit)
     }
 
     /// Whether `b` can be false, and true, given the values in `env`.
@@ -10443,11 +10422,7 @@ impl<'a> Lower<'a> {
             return r;
         }
         let (atom, lo, hi) = self.x.st.bools.node(b).expect("not a constant");
-        let v = match atom {
-            Atom::Lane(v) | Atom::Uniform(v) => Some(v),
-            _ => None,
-        };
-        let r = match v.and_then(|v| self.compared(env, v)) {
+        let r = match atom.compare().and_then(|v| self.compared(env, v)) {
             Some(true) => self.can_be(hi, env, memo),
             Some(false) => self.can_be(lo, env, memo),
             None => {
