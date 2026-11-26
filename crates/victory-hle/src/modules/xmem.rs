@@ -241,6 +241,34 @@ const ALLOC_32BIT: u64 = 1 << 33;
 const HEADER: usize = 2 * size_of::<usize>();
 /// The alignment the host heap gives without padding of its own.
 const HEAP_ALIGN: usize = 16;
+/// The allocator id (bits 16-23) of graphics memory: what committed
+/// resources ask for (`victory_gpu::resource`).
+const D3D_ALLOCATOR: u64 = 128;
+/// Graphics blocks from this size up get a write-watched reservation of
+/// their own ([`graphics_block`]): a page of the GPU side's write tracking.
+const WATCHED_FROM: usize = 64 << 10;
+/// The blocks [`graphics_block`] reserved, for [`XMemFreeDefault`].
+static WATCHED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Graphics memory of a page or more (committed resources): a reservation of
+/// its own from [`XMemVirtualAlloc`], write-watched as the runtime's memory
+/// is, so that the GPU side copies only the pages the title wrote since its
+/// last copy (decision 0007). From the host heap it was memory the GPU side
+/// cannot watch, copied whole at every submission that used it. `None` for
+/// other blocks, an alignment past what a reservation gives, or a refusal:
+/// they come from the host heap.
+fn graphics_block(size: usize, attributes: u64) -> Option<*mut c_void> {
+    let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
+    if attributes >> 16 & 0xff != D3D_ALLOCATOR || size < WATCHED_FROM || align > WATCHED_FROM {
+        return None;
+    }
+    let at = XMemVirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE | MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+    if at.is_null() {
+        return None;
+    }
+    WATCHED.lock().unwrap_or_else(|e| e.into_inner()).insert(at as usize);
+    Some(at)
+}
 
 /// The alignment `attributes` ask for (at least 16, which leaves room for
 /// the header), and the host block for `size` bytes at it: room for the
@@ -325,6 +353,9 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
             PAGE_READWRITE,
         );
     }
+    if let Some(block) = graphics_block(size, attributes) {
+        return block;
+    }
     let Some((align, layout)) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
@@ -358,7 +389,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // SAFETY: the address came from `XMemAlloc` with these attributes: a
     // whole reservation, or a header-prefixed block.
     unsafe {
-        if attributes & ALLOC_32BIT != 0 {
+        let watched = WATCHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&(address as usize));
+        if attributes & ALLOC_32BIT != 0 || watched {
             // The GPU side lets go of what it holds in place there first.
             super::memoryapi::change(address, 0, || VirtualFree(address, 0, MEM_RELEASE));
             return;
@@ -1292,6 +1324,39 @@ mod tests {
             let heap = unsafe { HeapSize(GetProcessHeap(), 0, p.cast::<u8>().sub(offset).cast()) };
             assert_eq!(heap, 1000 + align, "align {align}");
             XMemFreeDefault(p, attributes);
+        }
+    }
+
+    /// Graphics blocks of a page or more get a write-watched reservation of
+    /// their own (the GPU side copies only the pages written since its last
+    /// copy) and go back to the system when freed; smaller ones, and other
+    /// allocators' blocks, come from the host heap as before.
+    #[test]
+    fn large_graphics_blocks_are_write_watched() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_FREE, VirtualQuery};
+        let watched = |at: *mut c_void, len: usize| {
+            let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+            // SAFETY: room for one answer; no reset.
+            unsafe { GetWriteWatch(0, at, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
+        };
+        let graphics = D3D_ALLOCATOR << 16 | 0x10 << ALIGNMENT_SHIFT;
+        let len = 3 * WATCHED_FROM + 100;
+        let p = XMemAllocDefault(len, graphics);
+        assert!(!p.is_null());
+        assert_eq!(p as usize % WATCHED_FROM, 0, "64 KiB aligned");
+        assert!(watched(p, len), "write-watched");
+        // SAFETY: the bytes just allocated.
+        unsafe { p.cast::<u8>().add(len - 1).write_volatile(7) };
+        XMemFreeDefault(p, graphics);
+        // SAFETY: plain query of an address.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(p, &mut info, size_of_val(&info)) };
+        assert_eq!(info.State, MEM_FREE, "released");
+        for (size, attributes) in [(1000, graphics), (len, 0x10 << ALIGNMENT_SHIFT)] {
+            let q = XMemAllocDefault(size, attributes);
+            assert!(!q.is_null() && !watched(q, size), "{size} bytes, {attributes:#x}: from the heap");
+            XMemFreeDefault(q, attributes);
         }
     }
 
