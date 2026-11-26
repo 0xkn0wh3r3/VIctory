@@ -1175,7 +1175,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
-            for u in t.host.user_data.iter().filter(|u| !is_root_view(u)) {
+            // The dispatch part's first group is ours, not the title's.
+            let group_base = RootType::Other(victory_shader::emit::GROUP_BASE);
+            for u in t.host.user_data.iter().filter(|u| !is_root_view(u) && u.root != group_base) {
                 let v = self.user_value(compute, u.slot, u.root, u.dword);
                 let _ = write!(text, " u{}={v:#x}", u.index);
                 let index = if u.root == RootType::Table { v / 32 } else { v };
