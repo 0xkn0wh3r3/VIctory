@@ -1,5 +1,7 @@
 # victory-leafy
 
+**Official Stream: https://youtube.com/live/da-WFG3W9ZI?feature=share**
+
 101Leafy's build of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
 This branch brings together the forks and open pull requests below, with fixes
