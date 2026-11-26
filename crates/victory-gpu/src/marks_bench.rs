@@ -25,13 +25,17 @@
 //! one dispatch, on a queue of its own, with the bitmap clear (each page's
 //! first marks) and already set (later dispatches of the same submission).
 //!
-//! The shaders are compiled with the Windows SDK's `dxc.exe`; without it,
+//! The shaders are compiled in this process by the Windows SDK's
+//! `dxcompiler.dll` (shader model 6: wave operations); without it,
 //! or without a GPU, the tests do nothing. The benchmark is `#[ignore]`d:
 //! `cargo test -p victory-gpu --release --lib marks_bench -- --ignored
 //! --nocapture`. The other test checks that every variant sets the same
 //! bits as `main` (its marks are what copy-back copies).
 
-use std::path::PathBuf;
+use std::ffi::c_void;
+use std::path::{Path, PathBuf};
+
+use windows::core::{HRESULT, s};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -149,48 +153,79 @@ const BASE: u64 = 0x41 << 28;
 /// Bitmap bytes: a bit for each of the table's entries (two blocks).
 const BITMAP: u64 = 2 * 4096 / 8;
 
-/// The newest Windows SDK's `dxc.exe`.
+/// The newest Windows SDK's DXC folder (`bin\<version>\x64`, holding
+/// `dxcompiler.dll`).
 pub(crate) fn dxc() -> Option<PathBuf> {
     let bin = PathBuf::from(std::env::var_os("ProgramFiles(x86)")?).join(r"Windows Kits\10\bin");
     let mut versions: Vec<PathBuf> = std::fs::read_dir(bin)
         .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.join(r"x64\dxc.exe").is_file())
+        .filter_map(|e| e.ok().map(|e| e.path().join("x64")))
+        .filter(|p| p.join("dxcompiler.dll").is_file())
         .collect();
     versions.sort();
-    Some(versions.pop()?.join(r"x64\dxc.exe"))
+    versions.pop()
 }
 
 /// The shader of `variant`, compiled.
-fn compile(dxc: &PathBuf, variant: usize) -> Option<Vec<u8>> {
+fn compile(dxc: &Path, variant: usize) -> Option<Vec<u8>> {
     let define = format!("-DVARIANT={variant}");
-    let code = compile_hlsl(dxc, &format!("marks{variant}"), SOURCE, &[&define]);
+    let code = compile_hlsl(dxc, SOURCE, &[&define]);
     assert!(code.is_some(), "dxc failed for {}", VARIANTS[variant]);
     code
 }
 
-/// `source` compiled with `dxc` as a cs_6_6 program with `args` (None if it
-/// could not run); `name` names its files in the temporary folder.
-pub(crate) fn compile_hlsl(
-    dxc: &PathBuf,
-    name: &str,
-    source: &str,
-    args: &[&str],
-) -> Option<Vec<u8>> {
-    let dir = std::env::temp_dir().join(format!("victory-bench-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).ok()?;
-    let src = dir.join(format!("{name}.hlsl"));
-    let out = dir.join(format!("{name}.cso"));
-    std::fs::write(&src, source).ok()?;
-    let status = std::process::Command::new(dxc)
-        .args(["-nologo", "-T", "cs_6_6", "-E", "main", "-O3"])
-        .args(args)
-        .arg("-Fo")
-        .arg(&out)
-        .arg(&src)
-        .status()
-        .ok()?;
-    status.success().then(|| std::fs::read(out).ok()).flatten()
+/// `source` compiled as a cs_6_6 program with `args`, in this process by
+/// the SDK's `dxcompiler.dll` in `dir` (D3DCompile has no shader model 6:
+/// no wave operations, no 16-bit types), signed by its `dxil.dll` where
+/// the SDK has one (without, DXC marks the container for the runtime to
+/// take unsigned). None if the compiler cannot be loaded; compile errors
+/// panic.
+pub(crate) fn compile_hlsl(dir: &Path, source: &str, args: &[&str]) -> Option<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::Dxc::*;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::core::{GUID, HSTRING, Interface, PCWSTR};
+    type Create = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
+    // SAFETY: loading the SDK's DLLs and calling its documented entry point
+    // and interfaces; `dxil.dll` first, so the compiler finds it to sign.
+    unsafe {
+        let _ = LoadLibraryW(&HSTRING::from(dir.join("dxil.dll").as_os_str()));
+        let compiler = LoadLibraryW(&HSTRING::from(dir.join("dxcompiler.dll").as_os_str())).ok()?;
+        let create: Create =
+            std::mem::transmute(GetProcAddress(compiler, s!("DxcCreateInstance"))?);
+        let new = |clsid: &GUID, iid: &GUID| {
+            let mut out = std::ptr::null_mut();
+            create(clsid, iid, &mut out).ok().map(|()| out)
+        };
+        let c: IDxcCompiler3 =
+            IDxcCompiler3::from_raw(new(&CLSID_DxcCompiler, &IDxcCompiler3::IID).ok()?);
+        let mut words: Vec<HSTRING> = ["-T", "cs_6_6", "-E", "main", "-O3"]
+            .iter()
+            .map(|a| HSTRING::from(*a))
+            .collect();
+        words.extend(args.iter().map(|a| HSTRING::from(*a)));
+        let argv: Vec<PCWSTR> = words.iter().map(|w| PCWSTR(w.as_ptr())).collect();
+        let buffer = DxcBuffer {
+            Ptr: source.as_ptr().cast(),
+            Size: source.len(),
+            Encoding: DXC_CP_UTF8.0,
+        };
+        let result: IDxcResult = c.Compile(&buffer, Some(&argv), None).ok()?;
+        let status = result.GetStatus().ok()?;
+        if status.is_err() {
+            let errors = result.GetErrorBuffer().ok().map(|b| {
+                let bytes = std::slice::from_raw_parts(
+                    b.GetBufferPointer().cast::<u8>(),
+                    b.GetBufferSize(),
+                );
+                String::from_utf8_lossy(bytes).into_owned()
+            });
+            panic!("dxc: {status:?}: {}", errors.unwrap_or_default());
+        }
+        let blob = result.GetResult().ok()?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        Some(bytes.to_vec())
+    }
 }
 
 pub(crate) fn buffer(
@@ -489,6 +524,16 @@ impl Bench {
         }
     }
 
+    /// [`GROUPS`] groups of `variant` over `pattern`, 16 stores a thread,
+    /// as four submissions of a quarter each (the slowest variant takes
+    /// over a second for all of them, near the host's 2 s device reset);
+    /// their GPU times summed, in ms.
+    fn timed_quarters(&mut self, variant: usize, video: bool, pattern: u32) -> f64 {
+        (0..4)
+            .map(|_| self.dispatch(variant, video, pattern, 16, GROUPS / 4))
+            .sum()
+    }
+
     /// One dispatch of `variant` over `pattern`, `stores` a thread, `groups`
     /// groups; its GPU time in ms.
     fn dispatch(
@@ -530,7 +575,7 @@ impl Bench {
 #[test]
 fn every_variant_marks_the_pages_main_marks() {
     let Some(mut b) = Bench::new() else {
-        return; // no host GPU or no dxc.exe here
+        return; // no host GPU or no SDK compiler here
     };
     for pattern in 0..PATTERNS.len() as u32 {
         b.clear(false);
@@ -563,7 +608,7 @@ fn every_variant_marks_the_pages_main_marks() {
 #[ignore]
 fn marks_bench() {
     let Some(mut b) = Bench::new() else {
-        eprintln!("no host GPU or no dxc.exe: nothing measured");
+        eprintln!("no host GPU or no SDK compiler: nothing measured");
         return;
     };
     let median = |mut v: Vec<f64>| {
@@ -582,18 +627,18 @@ fn marks_bench() {
             }
             for pattern in 0..PATTERNS.len() as u32 {
                 b.clear(video);
-                b.dispatch(variant, video, pattern, 16, GROUPS); // warm-up
+                b.timed_quarters(variant, video, pattern); // warm-up
                 let clear = median(
                     (0..5)
                         .map(|_| {
                             b.clear(video);
-                            b.dispatch(variant, video, pattern, 16, GROUPS)
+                            b.timed_quarters(variant, video, pattern)
                         })
                         .collect(),
                 );
                 let set = median(
                     (0..5)
-                        .map(|_| b.dispatch(variant, video, pattern, 16, GROUPS))
+                        .map(|_| b.timed_quarters(variant, video, pattern))
                         .collect(),
                 );
                 println!(
