@@ -702,23 +702,26 @@ pub(crate) mod tests {
     }
 
     /// Copies go to GPU upload heaps by default where the host has them,
-    /// written buffers' too; `0` keeps them in system memory; a host
-    /// without the heaps keeps every copy there, whatever the switches say.
+    /// written buffers' on NVIDIA only; `0` keeps them in system memory and
+    /// `1` puts written ones in video memory on any GPU; a host without the
+    /// heaps keeps every copy there, whatever the switches say.
     #[test]
     fn copies_are_in_video_memory_by_default_where_the_host_can() {
         use std::ffi::OsStr;
         let (on, off) = (Some(OsStr::new("1")), Some(OsStr::new("0")));
-        for (supported, upload, writes, want) in [
-            (true, None, None, (true, true)),
-            (true, on, on, (true, true)),
-            (true, None, off, (true, false)),
-            (true, off, None, (false, false)),
-            (true, off, on, (false, false)),
-            (false, None, None, (false, false)),
-            (false, on, on, (false, false)),
+        for (supported, nvidia, upload, writes, want) in [
+            (true, true, None, None, (true, true)),
+            (true, false, None, None, (true, false)),
+            (true, false, None, on, (true, true)),
+            (true, true, on, on, (true, true)),
+            (true, true, None, off, (true, false)),
+            (true, true, off, None, (false, false)),
+            (true, false, off, on, (false, false)),
+            (false, true, None, None, (false, false)),
+            (false, false, on, on, (false, false)),
         ] {
-            let got = upload_placement(supported, upload, writes);
-            assert_eq!(got, want, "{supported} {upload:?} {writes:?}");
+            let got = upload_placement(supported, nvidia, upload, writes);
+            assert_eq!(got, want, "{supported} {nvidia} {upload:?} {writes:?}");
         }
     }
 
@@ -3817,23 +3820,34 @@ fn upload_fits(budget: Option<&crate::budget::Budget>, own: u64, size: u64) -> b
 }
 
 /// Where host copies of title buffers go, from whether the host has GPU
-/// upload heaps (`GPUUploadHeapSupported`, resizable BAR) and the values of
-/// `VICTORY_GPU_UPLOAD` and `VICTORY_GPU_UPLOAD_WRITES`: whether the copies
-/// of buffers shaders only read go to GPU upload heaps, and whether those of
-/// buffers shaders write go there too (with a mirror). Both by default where
-/// the host has the heaps: shaders read video memory 30 times as fast as
-/// system memory over PCI Express, and in a compute-heavy submission the
-/// GPU's time saved outweighs what the mirrors cost the CPU
-/// (`docs/gpu-memory.md`). `VICTORY_GPU_UPLOAD=0` keeps every copy in
-/// system memory, `VICTORY_GPU_UPLOAD_WRITES=0` those of written buffers.
+/// upload heaps (`GPUUploadHeapSupported`, resizable BAR), whether its GPU
+/// is NVIDIA's, and the values of `VICTORY_GPU_UPLOAD` and
+/// `VICTORY_GPU_UPLOAD_WRITES`: whether the copies of buffers shaders only
+/// read go to GPU upload heaps, and whether those of buffers shaders write
+/// go there too (with a mirror). Read-only copies by default where the host
+/// has the heaps: shaders read video memory 30 times as fast as system
+/// memory over PCI Express. Written copies by default on NVIDIA only, where
+/// the GPU's time saved outweighs what the mirrors cost the CPU; elsewhere
+/// the mirrors cost more than the reads save (`docs/gpu-memory.md`).
+/// `VICTORY_GPU_UPLOAD=0` keeps every copy in system memory;
+/// `VICTORY_GPU_UPLOAD_WRITES=0` keeps written copies there, and `1`
+/// puts them in video memory on any GPU.
 fn upload_placement(
     supported: bool,
+    nvidia: bool,
     upload: Option<&std::ffi::OsStr>,
     writes: Option<&std::ffi::OsStr>,
 ) -> (bool, bool) {
     let read_only = supported && crate::switch::on_unless_off(upload);
-    (read_only, read_only && crate::switch::on_unless_off(writes))
+    let written = match writes {
+        None => nvidia,
+        set => crate::switch::on_unless_off(set),
+    };
+    (read_only, read_only && written)
 }
+
+/// The PCI vendor ID of NVIDIA's GPUs (`DXGI_ADAPTER_DESC1::VendorId`).
+const NVIDIA: u32 = 0x10DE;
 
 impl Host {
     /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: [`Host::shared_buffer`]s
@@ -3960,13 +3974,22 @@ impl Host {
             }
             .is_ok();
             let supported = known && o.GPUUploadHeapSupported.as_bool();
+            // SAFETY: plain device and DXGI queries.
+            let vendor = unsafe {
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(self.device.GetAdapterLuid()))
+                    .and_then(|a| a.GetDesc1())
+                    .map_or(0, |d| d.VendorId)
+            };
             let (read_only, written) = upload_placement(
                 supported,
+                vendor == NVIDIA,
                 std::env::var_os("VICTORY_GPU_UPLOAD").as_deref(),
                 std::env::var_os("VICTORY_GPU_UPLOAD_WRITES").as_deref(),
             );
             tracing::info!(
                 supported,
+                vendor = format_args!("{vendor:#x}"),
                 read_only,
                 written,
                 "host copies of title buffers in GPU upload heaps (VICTORY_GPU_UPLOAD, _WRITES)"

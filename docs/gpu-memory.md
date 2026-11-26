@@ -106,14 +106,14 @@ xychart-beta
 
 So a copy shaders use heavily belongs in video memory, but the CPU must
 never read it there. Where the host has GPU upload heaps, every copy of a
-title buffer goes there **by default** (`host::upload_placement`, decided
-once per run), with a mirror for the copies shaders write. Two switches
-turn it off:
+title buffer shaders only read goes there **by default**
+(`host::upload_placement`, decided once per run), and on NVIDIA so does
+every copy shaders write, with a mirror. Two switches change it:
 
 | switch | default where the host has GPU upload heaps | copies in a GPU upload heap | what the CPU reads |
 |---|---|---|---|
 | `VICTORY_GPU_UPLOAD` | on; `0` keeps every copy in system memory | buffers made without unordered access (shaders only read them) | nothing: the CPU only writes these copies |
-| `VICTORY_GPU_UPLOAD_WRITES` | on (with the one above); `0` keeps these in system memory | buffers shaders may write | a **mirror** in system memory |
+| `VICTORY_GPU_UPLOAD_WRITES` | on NVIDIA (with the one above); `0` keeps these in system memory, `1` puts them in video memory on any GPU | buffers shaders may write | a **mirror** in system memory |
 
 Any value but `0` (`1`, say) leaves a switch on. On a host without GPU
 upload heaps (no Resizable BAR, older runtimes or drivers) every copy is
@@ -136,7 +136,7 @@ flowchart TD
   RO -- yes --> U1{"VICTORY_GPU_UPLOAD<br/>(on unless 0)"}
   U1 -- on --> UH["GPU upload heap<br/>(CPU writes only)"]
   U1 -- off --> SM
-  RO -- no --> U2{"VICTORY_GPU_UPLOAD +<br/>VICTORY_GPU_UPLOAD_WRITES<br/>(on unless 0)"}
+  RO -- no --> U2{"VICTORY_GPU_UPLOAD +<br/>VICTORY_GPU_UPLOAD_WRITES<br/>(unset: on for NVIDIA)"}
   U2 -- on --> VM["GPU upload heap<br/>+ mirror in system memory"]
   U2 -- off --> SM
 ```
@@ -309,9 +309,12 @@ shaders wrote, including bringing it back from video memory):
   [further steps](#further-steps)). Without that cost, written copies in
   video memory would gain with marks as they do with snapshots.
 
-So both switches are on by default where the host has GPU upload heaps:
-written copies in video memory were never slower beyond the runs'
-spread, faster with snapshots, and took less of the GPU. The synthetic world frame above shows the case where written copies in
+So on NVIDIA both switches are on by default where the host has GPU
+upload heaps: written copies in video memory were never slower beyond the
+runs' spread, faster with snapshots, and took less of the GPU. On an AMD
+RX 9070 XT they saved less GPU time in a world frame than their mirrors
+added to preparing and copying back, so elsewhere written copies stay in
+system memory unless `VICTORY_GPU_UPLOAD_WRITES=1`. The synthetic world frame above shows the case where written copies in
 video memory cost more CPU time than they save: a frame whose shaders
 write gigabytes of declared ranges without marks. Translated shaders
 mark their writes through views, so such ranges are rare; where a title
