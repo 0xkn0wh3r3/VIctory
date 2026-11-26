@@ -1,4 +1,4 @@
-//! The GPU frame's scene (docs/acceptance.md, "GPU frame"): a ground plane,
+//! The GPU frame's scene: a ground plane,
 //! two cubes and a glowing pyramid, lit by one directional light, textured
 //! from a generated checkerboard, then blurred by a compute pass. Plain
 //! data and arithmetic, shared by the conformance title (which draws it

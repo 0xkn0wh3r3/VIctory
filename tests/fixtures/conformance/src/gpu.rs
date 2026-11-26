@@ -1,4 +1,4 @@
-//! The GPU frame (docs/acceptance.md, step 3): the scene of [`crate::scene`]
+//! The GPU frame: the scene of [`crate::scene`]
 //! drawn as a title draws, through the console's D3D12 (`d3d12_xs.dll`):
 //! device, queue, allocators and lists, descriptor heaps, root signatures,
 //! a graphics pipeline from a stream and a compute pipeline (their shaders
