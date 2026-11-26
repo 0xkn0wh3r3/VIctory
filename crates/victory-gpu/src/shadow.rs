@@ -4175,6 +4175,56 @@ void main(uint3 id : SV_DispatchThreadID) {
         unregister(p, p as u64);
     }
 
+    /// A marked page that went back in part (a withheld range touched it)
+    /// stays changed, with no saved bytes. The next submission's refresh of
+    /// a marked range takes the page whole, so its shader writes, and a
+    /// title write during it, go back.
+    #[test]
+    fn a_page_that_went_back_in_part_takes_the_next_marked_writes_back() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let mark = || {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+        };
+        // SAFETY: bytes of our pool.
+        let title = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        copy.update(p, PAGE);
+        let declared = [(copy.clone(), p + 64, 4, true), (copy.clone(), p + 256, 4, false)];
+        for (_, a, n, _) in &declared {
+            copy.writing(*a, *n, true);
+        }
+        copy.write_host((p + 64) as u64, &[0x5a; 4]);
+        copy.write_host((p + 256) as u64, &[0xa5; 4]);
+        mark();
+        copy_back_marks(&declared, true);
+        copy.copy_back(p + 64, 4);
+        copy.keep_writes(p + 256, 4);
+        assert_eq!([title(64), title(256)], [0x5a, 0], "went back in part");
+        assert!(!copy.clean(), "the page stays changed");
+        // The next submission, as `crate::draw` refreshes a marked view.
+        let (at, n) = copy.page_range(p as u64 + 64, 4);
+        copy.update(at as usize, n as usize);
+        copy.writing(p + 64, 4, true);
+        copy.write_host((p + 64) as u64, &[0xc3; 4]);
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 2000) as *mut u8).write_volatile(0x11) };
+        mark();
+        copy_back_marks(&[(copy.clone(), p + 64, 4, true)], true);
+        copy.copy_back(p + 64, 4);
+        assert_eq!(
+            [title(64), title(67), title(2000)],
+            [0xc3, 0xc3, 0x11],
+            "the second submission's writes and the title's"
+        );
+        unregister(p, p as u64);
+    }
+
     #[test]
     fn subtract_cuts_ranges_and_joins_overlaps() {
         assert_eq!(
