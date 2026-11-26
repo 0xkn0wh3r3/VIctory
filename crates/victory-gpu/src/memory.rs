@@ -504,6 +504,10 @@ impl Shared {
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
+        // What shaders write through the table must be withheld from title
+        // memory when they miss: the table names copies, never title memory
+        // itself ([`crate::shadow::page_tables_in_use`]).
+        crate::shadow::page_tables_in_use();
         let copies = crate::shadow::all();
         let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|copy, &mut slot| {

@@ -1,10 +1,13 @@
 //! A compute-heavy submission through the copies' real paths ([`find`],
 //! [`Shadow::refresh`], [`Shadow::gpu_writes`], `HostList`,
 //! `Host::execute`), with the copies in system memory, the read-only ones in
-//! video memory, and all of them in video memory: what each costs the GPU
-//! and the CPU.
+//! video memory, all of them in video memory, and no copies (title memory
+//! in place, `crate::in_place`): what each costs the GPU and the CPU.
 //!
 //! `cargo test --release -p victory-gpu --lib compute_heavy -- --ignored --nocapture`
+//!
+//! `VICTORY_TEST_ADAPTER=<part of a GPU's name>` runs it on another GPU of
+//! the machine (an integrated one).
 
 use super::*;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -185,6 +188,8 @@ fn submit(
         let rw = &written[d % written.len()];
         let rw_at =
             rw.title + (d / written.len()) * 7 % (WRITTEN_PART / READ_WRITTEN) * READ_WRITTEN;
+        // A buffer in place has no marks: nothing to mark, nothing to copy back.
+        let marked = marked && rw.copy.marked();
         let tail_at =
             rw.title + WRITTEN_PART + (d / written.len()) % ((rw.len - WRITTEN_PART) / TAIL) * TAIL;
         // As a translated dispatch binds its views: what it reads brought up
@@ -194,7 +199,7 @@ fn submit(
         rw.copy.refresh(list, rw_at as u64, READ_WRITTEN as u64);
         rw.copy
             .gpu_writes(list, rw_at as u64, READ_WRITTEN as u64, marked);
-        let (base, phase) = rw.copy.mark_entry(rw_at as u64).expect("tracked memory");
+        let (base, phase) = rw.copy.mark_entry(rw_at as u64).unwrap_or((0, 0));
         // SAFETY: an open list, live objects.
         unsafe {
             let l = &list.list;
@@ -268,11 +273,12 @@ fn median(costs: &mut [Cost]) -> Cost {
 }
 
 /// The configurations, as (label, `VICTORY_GPU_UPLOAD`,
-/// `VICTORY_GPU_UPLOAD_WRITES`).
-const CONFIGS: [(&str, &str, &str); 3] = [
-    ("system memory", "0", "0"),
-    ("read-only copies in video memory", "1", "0"),
-    ("all copies in video memory", "1", "1"),
+/// `VICTORY_GPU_UPLOAD_WRITES`, `VICTORY_IN_PLACE`).
+const CONFIGS: [(&str, &str, &str, &str); 4] = [
+    ("system memory", "0", "0", "0"),
+    ("read-only copies in video memory", "1", "0", "0"),
+    ("all copies in video memory", "1", "1", "0"),
+    ("no copies: title memory in place", "0", "0", "1"),
 ];
 
 const CHILD: &str = "VICTORY_TEST_BENCH_CHILD";
@@ -290,7 +296,7 @@ fn compute_heavy_submissions_by_copy_placement() {
     const NAME: &str = "shadow::bench::compute_heavy_submissions_by_copy_placement";
     let Some(config) = std::env::var_os(CHILD) else {
         let mut rows = Vec::new();
-        for (i, (label, upload, writes)) in CONFIGS.iter().enumerate() {
+        for (i, (label, upload, writes, in_place)) in CONFIGS.iter().enumerate() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     NAME,
@@ -302,14 +308,15 @@ fn compute_heavy_submissions_by_copy_placement() {
                 .env(CHILD, i.to_string())
                 .env("VICTORY_GPU_UPLOAD", upload)
                 .env("VICTORY_GPU_UPLOAD_WRITES", writes)
+                .env("VICTORY_IN_PLACE", in_place)
                 .output()
                 .unwrap();
             let text = String::from_utf8_lossy(&out.stdout).into_owned()
                 + &String::from_utf8_lossy(&out.stderr);
             assert!(out.status.success(), "{label}:\n{text}");
-            if text.contains("SKIP") {
-                eprintln!("{label}: skipped:\n{text}");
-                return;
+            if let Some(why) = text.lines().find(|l| l.contains("SKIP")) {
+                eprintln!("{label}: {why}");
+                continue;
             }
             rows.extend(
                 text.lines()
@@ -325,15 +332,16 @@ fn compute_heavy_submissions_by_copy_placement() {
             TAIL >> 10
         );
         eprintln!(
-            "| copies | writes found by | title writes | total | prepare | GPU | copy-back |"
+            "| copies | writes found by | title writes | total | prepare | GPU | copy-back | \
+             making buffers | first submission |"
         );
-        eprintln!("|---|---|---|---|---|---|---|");
+        eprintln!("|---|---|---|---|---|---|---|---|---|");
         let mut sums: BTreeMap<String, String> = BTreeMap::new();
         for (label, row) in &rows {
             let f: Vec<&str> = row.split('|').collect();
             eprintln!(
-                "| {label} | {} | {} | {} | {} | {} | {} |",
-                f[0], f[1], f[2], f[3], f[4], f[5]
+                "| {label} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                f[0], f[1], f[2], f[3], f[4], f[5], f[7], f[8]
             );
             let key = format!("{} {}", f[0], f[1]);
             let sum = sums.entry(key.clone()).or_insert_with(|| f[6].to_string());
@@ -346,7 +354,9 @@ fn compute_heavy_submissions_by_copy_placement() {
         println!("SKIP: no host GPU");
         return;
     };
-    if (config > 0 && !host.gpu_upload()) || (config > 1 && !host.gpu_upload_writes()) {
+    let in_place = config == 3;
+    let upload = config == 1 || config == 2;
+    if (upload && !host.gpu_upload()) || (config == 2 && !host.gpu_upload_writes()) {
         println!("SKIP: no GPU upload heaps here");
         return;
     }
@@ -357,17 +367,21 @@ fn compute_heavy_submissions_by_copy_placement() {
     let pipeline = pipeline(&host.device);
     for (marked, mode) in [(true, "write marks"), (false, "snapshots")] {
         for changing in [false, true] {
+            let made = std::time::Instant::now();
             let read_only: Vec<Buffer> = READ_ONLY.iter().map(|&n| Buffer::new(n, true)).collect();
             let written: Vec<Buffer> = WRITTEN.iter().map(|&n| Buffer::new(n, false)).collect();
-            let video = |b: &Buffer| heap_type(&b.copy) == D3D12_HEAP_TYPE_GPU_UPLOAD;
-            assert!(
-                read_only.iter().all(|b| video(b) == (config > 0)),
-                "read-only placement"
-            );
-            assert!(
-                written.iter().all(|b| video(b) == (config > 1)),
-                "written placement"
-            );
+            let making = made.elapsed().as_secs_f64() * 1e3;
+            if in_place {
+                if !read_only.iter().chain(&written).all(|b| b.copy.is_in_place()) {
+                    println!("SKIP: title memory does not open in place here");
+                    return;
+                }
+            } else {
+                let video = |b: &Buffer| heap_type(&b.copy) == D3D12_HEAP_TYPE_GPU_UPLOAD;
+                assert!(read_only.iter().all(|b| video(b) == upload), "read-only placement");
+                assert!(written.iter().all(|b| video(b) == (config == 2)), "written placement");
+            }
+            let mut first = 0.0;
             let mut costs = Vec::new();
             for round in 0..7u32 {
                 let cost = submit(
@@ -378,6 +392,9 @@ fn compute_heavy_submissions_by_copy_placement() {
                     marked,
                     changing.then_some(round),
                 );
+                if round == 0 {
+                    first = cost.total;
+                }
                 if round >= 2 {
                     costs.push(cost);
                 }
@@ -394,7 +411,7 @@ fn compute_heavy_submissions_by_copy_placement() {
             }
             assert!(sum != 0, "the GPU's writes reached title memory");
             println!(
-                "BENCH|{mode}|{}|{:.1}|{:.1}|{:.1}|{:.1}|{sum:#x}",
+                "BENCH|{mode}|{}|{:.1}|{:.1}|{:.1}|{:.1}|{sum:#x}|{making:.1}|{first:.1}",
                 if changing {
                     "16 MiB per submission"
                 } else {

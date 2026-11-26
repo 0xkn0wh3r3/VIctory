@@ -40,6 +40,8 @@ mod hold;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod in_place;
+#[cfg(windows)]
 mod indirect;
 pub mod list;
 #[cfg(windows)]

@@ -203,6 +203,8 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(adapter) = test_adapter() {
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
@@ -302,6 +304,28 @@ fn process_memory() -> (u64, u64) {
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
+/// Tests (benchmarks on another GPU of the machine), `VICTORY_TEST_ADAPTER`:
+/// the first adapter whose name holds that text, ignoring case.
+#[cfg(test)]
+fn test_adapter() -> Option<IDXGIAdapter1> {
+    let wanted = std::env::var("VICTORY_TEST_ADAPTER").ok()?.to_lowercase();
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        (0..).map_while(|i| factory.EnumAdapters1(i).ok()).find(|a| {
+            a.GetDesc1().is_ok_and(|d| {
+                let n = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                String::from_utf16_lossy(&d.Description[..n]).to_lowercase().contains(&wanted)
+            })
+        })
+    }
+}
+
+#[cfg(not(test))]
+fn test_adapter() -> Option<IDXGIAdapter1> {
+    None
+}
+
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     // SAFETY: plain DXGI adapter queries.
     unsafe {
@@ -2157,6 +2181,12 @@ impl HostList {
         Reset(&self.memory_writer)
     }
 
+    /// Whether what the list's shaders write now is written by a program
+    /// using title memory ([`HostList::writer_uses_memory`]).
+    pub(crate) fn memory_writing(&self) -> bool {
+        self.memory_writer.load(Ordering::Relaxed)
+    }
+
     /// A copy of ours replaced the compute root signature and pipeline.
     pub(crate) fn need_rebind(&self) {
         self.rebind.store(true, Ordering::Relaxed);
@@ -2327,8 +2357,11 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        // A buffer in place is no copy: nothing to rank for video memory.
         #[cfg(feature = "diagnostics")]
-        self.note_use(shadow.range(), len as u64);
+        if !shadow.is_in_place() {
+            self.note_use(shadow.range(), len as u64);
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
@@ -2615,7 +2648,15 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len, marked, _) => {
+                Step::GpuWrite(shadow, address, len, marked, memory) => {
+                    // In place, only what a program using title memory
+                    // writes is kept, in case it is withheld.
+                    if shadow.is_in_place() {
+                        if *memory {
+                            shadow.withholdable(*address, *len);
+                        }
+                        continue;
+                    }
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
                     if !marked {
@@ -4547,6 +4588,52 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+
+    /// A program using title memory writing a buffer in place: the buffer
+    /// gets a copy from its next use on, and when that submission's writes
+    /// are withheld, title memory gets its bytes back.
+    #[test]
+    fn a_program_using_title_memory_moves_a_buffer_in_place_to_a_copy() {
+        use crate::watch::PAGE;
+        const NAME: &str =
+            "host::withholding::a_program_using_title_memory_moves_a_buffer_in_place_to_a_copy";
+        if !crate::shadow::tests::rerun_in_place(NAME) {
+            return;
+        }
+        let Some(host) = super::host() else { return };
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: our pool.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        if !copy.is_in_place() {
+            drop(copy);
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // the host cannot open title memory in place
+        }
+        let list = host.new_list().unwrap();
+        {
+            let _writer = list.writer_uses_memory(true);
+            let address = (p + 16) as u64;
+            copy.refresh(&list, address, 16);
+            copy.gpu_writes(&list, address, 16, false);
+            // The shader's write, after the step that keeps the range's bytes.
+            let copy = copy.clone();
+            list.defer_host(move || copy.write_host(address, &[0x33]));
+        }
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a byte of our pool.
+        let title = unsafe { ((p + 16) as *const u8).read_volatile() };
+        assert_eq!(title, 0x11, "withheld: title memory keeps its bytes");
+        let again = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        assert!(!again.is_in_place(), "a copy from now on");
+        drop((copy, again, list));
+        crate::shadow::unregister(p, p as u64);
+        crate::shadow::tests::free_once_let_go(p);
     }
 }
 

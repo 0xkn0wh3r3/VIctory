@@ -100,6 +100,10 @@ pub(crate) struct Shadow {
     /// what the CPU writes goes on into video memory ([`Shadow::push`]), what
     /// the GPU wrote comes back before the CPU reads it ([`pull`]).
     vram: Option<Vram>,
+    /// No copy: `buffer` is title memory itself (`crate::in_place`), and
+    /// `data` the title's address. Nothing is refreshed, kept or copied
+    /// back: the GPU and the title share the pages.
+    in_place: bool,
 }
 
 /// The video memory side of a mirrored copy.
@@ -257,6 +261,9 @@ impl Shadow {
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+        if self.in_place {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -332,12 +339,39 @@ impl Shadow {
             slice,
             upload: std::sync::atomic::AtomicBool::new(false),
             vram,
+            in_place: false,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
         COPY_BYTES.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
         shadow
+    }
+
+    /// The host buffer of title buffer `[start, start + len)` that is the
+    /// title's memory itself ([`crate::in_place::open`]).
+    fn in_place(p: crate::in_place::InPlace, start: u64, len: u64) -> Arc<Shadow> {
+        Arc::new(Shadow {
+            buffer: p.buffer,
+            data: start as *mut u8,
+            gpu: p.gpu,
+            start,
+            len,
+            tracked: None,
+            pending: Mutex::default(),
+            before: Mutex::default(),
+            marks: None,
+            base: p.offset,
+            slice: None,
+            upload: std::sync::atomic::AtomicBool::new(false),
+            vram: None,
+            in_place: true,
+        })
+    }
+
+    /// Whether it is title memory itself, no copy ([`crate::in_place`]).
+    pub(crate) fn is_in_place(&self) -> bool {
+        self.in_place
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -390,6 +424,13 @@ impl Shadow {
             });
         }
         let len = len.min(self.left(address));
+        if self.in_place && list.memory_writing() {
+            // What such a program writes may be withheld from title memory
+            // (`crate::memory::withholding`), which a buffer in place cannot
+            // do: the title buffer gets a copy from its next use on, and this
+            // submission's writes are undone if withheld.
+            copy_from_now_on(self);
+        }
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
 
@@ -404,7 +445,13 @@ impl Shadow {
     /// With `marked`, nothing is kept: the pages are armed instead, so that
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
+    ///
+    /// A buffer in place keeps nothing here: its shaders write title memory
+    /// itself ([`Shadow::withholdable`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+        if self.in_place {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -413,6 +460,27 @@ impl Shadow {
             t.arm(address, address + len);
             return;
         }
+        self.keep_before(address, len);
+    }
+
+    /// At submission, for a buffer in place: a program using title memory
+    /// writes `[address, address + len)` (`crate::memory::withholding`).
+    /// Its bytes are kept, so that if the submission's writes there are
+    /// withheld, title memory gets them back ([`Shadow::keep_writes`]).
+    pub(crate) fn withholdable(&self, address: usize, len: usize) {
+        if !self.in_place {
+            return;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((address, address + len));
+        self.keep_before(address, len);
+    }
+
+    /// Keeps the bytes of `[address, address + len)` as they are before the
+    /// submission runs, merged into the snapshot's segments.
+    fn keep_before(&self, address: usize, len: usize) {
         let (from, to) = self.inside(address, len);
         if from >= to {
             return;
@@ -493,7 +561,28 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+        if self.in_place {
+            // Title memory has the shaders' bytes already. Other copies of it
+            // see them at their next refresh: their trackers cannot guard
+            // pages a heap holds, so those pages stay changed and are copied
+            // at each use. Withheld, they leave title memory: its bytes from
+            // before the submission go back where they differ.
+            if !back
+                && from < to
+                && let Some((taken, before)) =
+                    segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+            {
+                let before = &before[from - taken..to - taken];
+                // SAFETY: title memory of the buffer, which the heap holds.
+                let now = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
+                if now != before {
+                    let _writing = crate::watch::writing(start + from, to - from);
+                    let at = (start + from) as *mut u8;
+                    crate::host::write_mapped(at, before.as_ptr(), to - from);
+                }
+            }
+        } else if let Some((taken, before)) =
+            segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
             && back
             && from < to
         {
@@ -637,7 +726,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        if self.clean() {
+        if self.in_place || self.clean() {
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -892,7 +981,9 @@ impl Drop for Shadow {
         if let Some(slice) = self.slice {
             arena().give_back(slice);
         }
-        COPY_BYTES.fetch_sub(self.len, std::sync::atomic::Ordering::Relaxed);
+        if !self.in_place {
+            COPY_BYTES.fetch_sub(self.len, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
@@ -1305,6 +1396,9 @@ struct Entry {
     /// The title made it without unordered access: shaders only read it,
     /// so its copy may be in a GPU upload heap ([`register_read_only`]).
     read_only: bool,
+    /// A program using title memory wrote it: copied, never in place
+    /// ([`copy_from_now_on`]).
+    copied: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -1347,6 +1441,7 @@ fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
             end: start + len,
             shadow: None,
             read_only,
+            copied: false,
         },
     );
 }
@@ -1354,6 +1449,46 @@ fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+        changed();
+    }
+}
+
+/// The title is about to free, protect or remap `[at, at + len)`
+/// (`crate::pinned`): title buffers in place over it are dropped from the
+/// map, so their heaps go once the lists still holding them are reset, and
+/// the next use makes them again (in place or copied, as the memory is
+/// then).
+pub(crate) fn let_go_in_place(at: u64, len: u64) {
+    let end = at.saturating_add(len);
+    let mut gone = false;
+    for e in buffers().values_mut() {
+        if e.shadow.as_ref().is_some_and(|s| s.in_place && s.start < end && at < s.start + s.len) {
+            e.shadow = None;
+            gone = true;
+        }
+    }
+    if gone {
+        changed();
+    }
+}
+
+/// The title buffer `shadow` is in place over gets a copy from its next use
+/// on, for good: a program using title memory writes it. The buffer in place
+/// lives on while lists hold it.
+fn copy_from_now_on(shadow: &Arc<Shadow>) {
+    let mut gone = false;
+    for e in buffers().values_mut() {
+        if e.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, shadow)) {
+            e.shadow = None;
+            e.copied = true;
+            gone = true;
+        }
+    }
+    if gone {
+        tracing::debug!(
+            start = format_args!("{:#x}", shadow.start),
+            "a program using title memory writes a buffer in place: copied from now on"
+        );
         changed();
     }
 }
@@ -1380,6 +1515,18 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         // Shaders write some buffers (unordered access): only the others'
         // copies may be in upload memory.
         let size = len.next_multiple_of(1 << 16);
+        if !entry.copied
+            && (entry.read_only || !PAGE_TABLES.load(std::sync::atomic::Ordering::Relaxed))
+            && crate::in_place::enabled()
+            && len >= crate::in_place::min_len()
+            && let Some(p) = crate::in_place::open(key.0, len)
+        {
+            crate::host::name(&p.buffer, || format!("title buffer {:#x}+{len:#x} in place", key.0));
+            tracing::debug!(start = format_args!("{:#x}", key.0), len, "buffer in place");
+            entry.shadow = Some(Shadow::in_place(p, key.0, len));
+            changed();
+            return entry.shadow.clone();
+        }
         let host = host()?;
         let upload = entry
             .read_only
@@ -1645,6 +1792,48 @@ impl Arena {
             n += m;
         }
         free.insert(at, n);
+    }
+}
+
+/// Whether a page table of title memory was made (`crate::memory`).
+static PAGE_TABLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A page table of title memory is about to name every host buffer
+/// (`crate::memory`): what programs using title memory write through it
+/// must be withheld from title memory when they miss
+/// (`crate::memory::withholding`), which a buffer in place cannot do. Title
+/// buffers shaders may write leave in place for good and get copies now, so
+/// that the table names those; buffers made without unordered access stay
+/// in place (shaders only read them).
+pub(crate) fn page_tables_in_use() {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Set before the scan, under the map's lock: a `find` that saw it unset
+    // made its buffer before the scan, which moves it.
+    if PAGE_TABLES.swap(true, Relaxed) {
+        return;
+    }
+    let moved: Vec<(u64, u64)> = {
+        let mut map = buffers();
+        let mut moved = Vec::new();
+        for (key, e) in map.iter_mut() {
+            if !e.read_only && e.shadow.as_ref().is_some_and(|s| s.in_place) {
+                e.shadow = None;
+                e.copied = true;
+                moved.push((key.0, e.end - key.0));
+            }
+        }
+        moved
+    };
+    if moved.is_empty() {
+        return;
+    }
+    tracing::info!(
+        buffers = moved.len(),
+        "title memory is read at computed addresses: buffers shaders write are copied, not in place"
+    );
+    changed();
+    for (start, len) in moved {
+        let _ = find(start, len);
     }
 }
 
@@ -2880,5 +3069,199 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// Runs test `name` again in a child process with `VICTORY_IN_PLACE=1`
+    /// (read once per process), and checks that it passed there: `true` in
+    /// the child, where the test goes on.
+    pub(crate) fn rerun_in_place(name: &str) -> bool {
+        const CHILD: &str = "VICTORY_TEST_IN_PLACE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .env("VICTORY_IN_PLACE", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{name} with VICTORY_IN_PLACE=1:\n{text}");
+        assert!(text.contains("1 passed"), "{name} did not run:\n{text}");
+        false
+    }
+
+    /// Releases the test's allocation at `base` once no heap holds it.
+    /// Windows may let go of the pages a little after the last heap over
+    /// them goes (up to 6 ms on NVIDIA, longer on WARP on CI), as
+    /// `crate::pinned::title_memory_change` allows for: retried for 1 s.
+    pub(crate) fn free_once_let_go(base: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        let start = std::time::Instant::now();
+        // SAFETY: the test's own allocation, released once.
+        while unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } == 0 {
+            let error = std::io::Error::last_os_error();
+            assert!(start.elapsed().as_secs() < 1, "still held after 1 s: {error}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// With `VICTORY_IN_PLACE=1`, a title buffer's host buffer is its memory
+    /// itself, also from an address inside a page: the GPU reads what the
+    /// title wrote with no refresh, and the title reads what the GPU wrote
+    /// with no copy-back. Other copies of the page take what the GPU wrote at
+    /// their next refresh.
+    #[test]
+    fn a_title_buffer_in_place_needs_no_copies() {
+        const NAME: &str = "shadow::tests::a_title_buffer_in_place_needs_no_copies";
+        if !rerun_in_place(NAME) {
+            return;
+        }
+        let Some(host) = host() else { return };
+        const PAGES: usize = 8;
+        let p = crate::watch::tests::pool(PAGES);
+        let (start, len) = (p + 0x100, PAGES * PAGE - 0x100);
+        register(p, start as u64, len as u64);
+        let copy = find(start as u64, len as u64).expect("a host buffer");
+        if !copy.is_in_place() {
+            // No `ID3D12Device13`, or the host refuses process memory.
+            drop(copy);
+            unregister(p, start as u64);
+            crate::watch::tests::free(p);
+            return;
+        }
+        assert_eq!(copy.offset(start as u64), 0x100, "placed from the page holding its start");
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) };
+        for (i, b) in title.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        assert_eq!(copy.update(start, len), 0, "nothing to refresh");
+        assert!(gpu_bytes(&copy, start, 8192) == title[..8192], "the GPU reads the title's bytes");
+        let at = start + 0x2000;
+        // Another copy's tracker of the page cannot guard it under the heap:
+        // the page stays changed, and that copy is refreshed at each use.
+        let other = crate::watch::track_copy(p, PAGE, true).expect("pool memory is tracked");
+        other.take(p, p + PAGE);
+        assert!(other.changed(p / PAGE), "not guarded under the heap");
+        let list = host.new_list().unwrap();
+        gpu_store(&list, &copy, at, &[7; 256]);
+        copy.gpu_writes(&list, at as u64, 256, false);
+        list.close();
+        host.execute(&[&list]);
+        assert!(title[0x2000..0x2100].iter().all(|&b| b == 7), "the title reads the GPU's bytes");
+        assert_eq!(copy.copy_back(at, 256), 0, "nothing to copy back");
+        assert!(other.changed(p / PAGE), "other copies take the GPU's bytes at their next refresh");
+        assert_eq!(other.take(at, at + 256), [(at, at + 256)]);
+        drop((copy, list, other));
+        unregister(p, start as u64);
+        free_once_let_go(p);
+    }
+
+    /// Once a page table of title memory is made, buffers shaders may write
+    /// leave in place for copies (what is written through the table must be
+    /// withheld when it misses), and new ones are copied; buffers made
+    /// without unordered access stay in place.
+    #[test]
+    fn page_tables_move_written_buffers_to_copies() {
+        const NAME: &str = "shadow::tests::page_tables_move_written_buffers_to_copies";
+        if !rerun_in_place(NAME) || host().is_none() {
+            return;
+        }
+        let pools = [(); 3].map(|()| crate::watch::tests::pool(2));
+        let len = (2 * PAGE) as u64;
+        register(pools[0], pools[0] as u64, len);
+        register_read_only(pools[1], pools[1] as u64, len);
+        let before: Vec<bool> = pools[..2]
+            .iter()
+            .map(|&p| find(p as u64, len).is_some_and(|c| c.is_in_place()))
+            .collect();
+        if before != [true, true] {
+            for &p in &pools[..2] {
+                unregister(p, p as u64);
+            }
+            return; // the host cannot open title memory in place
+        }
+        page_tables_in_use();
+        let in_place = |p: usize| find(p as u64, len).is_some_and(|c| c.is_in_place());
+        assert!(!in_place(pools[0]), "written: copied");
+        assert!(in_place(pools[1]), "read-only: still in place");
+        register(pools[2], pools[2] as u64, len);
+        assert!(!in_place(pools[2]), "a new written buffer: copied");
+        for p in pools {
+            unregister(p, p as u64);
+            free_once_let_go(p);
+        }
+    }
+
+    /// The title freeing memory a buffer is in place over (through
+    /// `crate::pinned`, as the HLE's `VirtualFree` does) lets go of the
+    /// buffer first: the free goes through, and the pin is gone.
+    #[test]
+    fn the_title_frees_memory_a_buffer_is_in_place_over() {
+        const NAME: &str = "shadow::tests::the_title_frees_memory_a_buffer_is_in_place_over";
+        if !rerun_in_place(NAME) || host().is_none() {
+            return;
+        }
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const LEN: usize = 1 << 20;
+        // SAFETY: our own allocation.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(base, 0);
+        register(base, base as u64, LEN as u64);
+        let in_place = find(base as u64, LEN as u64).is_some_and(|c| c.is_in_place());
+        if !in_place {
+            unregister(base, base as u64);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return;
+        }
+        assert_eq!(crate::pinned::held_over(base, LEN), 1);
+        // SAFETY: our allocation.
+        let free = || unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        assert_ne!(crate::pinned::title_memory_change(base, LEN, free), 0, "freed");
+        assert_eq!(crate::pinned::held_over(base, LEN), 0);
+        assert!(
+            buffers().get(&(base as u64, base)).is_some_and(|e| e.shadow.is_none()),
+            "the buffer was let go"
+        );
+        unregister(base, base as u64);
+    }
+
+    /// A buffer in place keeps its heap, and so the heap's pin, for as long
+    /// as the buffer lives, with nothing else holding the heap (vkd3d-proton
+    /// destroyed it once its own references went), and the pin goes with
+    /// the buffer.
+    #[test]
+    fn a_buffer_in_place_holds_its_heap_and_pin() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if host().is_none() {
+            return;
+        }
+        const LEN: usize = 1 << 20;
+        // SAFETY: our own allocation.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(base, 0);
+        let Some(p) = crate::in_place::open(base as u64, LEN as u64) else {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // the host refuses process memory as a heap
+        };
+        for _ in 0..3 {
+            assert_eq!(crate::pinned::held_over(base, LEN), 1);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(p);
+        assert_eq!(crate::pinned::held_over(base, LEN), 0);
+        free_once_let_go(base);
     }
 }
