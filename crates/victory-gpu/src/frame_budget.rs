@@ -368,7 +368,7 @@ fn cause(slow: &Slow, gpu: &Breakdown, timed: bool) -> (&'static str, String) {
 /// What the GPU's part of a frame was spent on.
 fn gpu_cause(b: &Breakdown, gpu: Duration, timed: bool) -> String {
     if !timed {
-        return "GPU work (commands are not timed with VICTORY_SLOW_PIPELINES=0)".to_owned();
+        return "GPU work (commands are timed with VICTORY_FRAME_TIMING=1)".to_owned();
     }
     let total = b.timed_ms();
     let wall = gpu.as_secs_f64() * 1e3;
@@ -732,7 +732,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (_, why) = cause(&frame, &Breakdown::default(), true);
         assert!(why.starts_with("GPU work that is not timed"), "{why}");
         let (_, why) = cause(&frame, &b, false);
-        assert!(why.contains("VICTORY_SLOW_PIPELINES=0"), "{why}");
+        assert!(why.contains("VICTORY_FRAME_TIMING=1"), "{why}");
     }
 
     /// A frame whose time is mostly not in submissions or waits is bound
