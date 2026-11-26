@@ -513,7 +513,7 @@ pub(crate) fn save(now: bool) {
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
-        let _locked = Timed(std::time::Instant::now(), &SAVES[2]);
+        let locked = std::time::Instant::now();
         // SAFETY: a plain query.
         let size = unsafe { l.library.GetSerializedSize() };
         // SAFETY: a buffer of the size the library asks for.
@@ -525,6 +525,7 @@ pub(crate) fn save(now: bool) {
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag, &l.prebuilt));
+                SAVES[2].fetch_add(locked.elapsed().as_micros() as u64, Ordering::Relaxed);
                 (size, prebuilt)
             }
             Err(e) if e.kind() == std::io::ErrorKind::OutOfMemory => {
@@ -679,15 +680,6 @@ fn write_library(
         let _ = std::fs::remove_file(&tmp);
     }
     res
-}
-
-/// Adds the time since `.0` to `.1`, in µs, when dropped.
-struct Timed<'a>(std::time::Instant, &'a AtomicU64);
-
-impl Drop for Timed<'_> {
-    fn drop(&mut self) {
-        self.1.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
-    }
 }
 
 /// `n` zero bytes, or `None` when the host has no memory for them. The
