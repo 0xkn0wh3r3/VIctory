@@ -5640,23 +5640,21 @@ impl<'a> Lower<'a> {
         match src {
             Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
             Source::Fetched { load, first } => self.fetched_index(*load, *first, sampler),
-            Source::Lanes { mask, args } | Source::Select { scc: mask, args } => {
+            Source::Lanes { args, .. } | Source::Select { args, .. } => {
                 let [a, b] = &args[..] else {
                     return Err("a descriptor chosen per lane");
                 };
-                let cond = if matches!(src, Source::Lanes { .. }) {
-                    let &m = self
-                        .x
-                        .st
-                        .masks
-                        .get(mask)
-                        .ok_or("a descriptor chosen per lane by an untracked mask")?;
-                    self.boolean(m, self.cur)?
-                } else {
-                    match self.get(*mask)? {
+                let cond = match *src {
+                    Source::Lanes { mask, high, .. } => {
+                        const UNTRACKED: Why = "a descriptor chosen per lane by an untracked mask";
+                        let m = self.x.st.mask_bits(mask, high).ok_or(UNTRACKED)?;
+                        self.boolean(m, self.cur)?
+                    }
+                    Source::Select { scc, .. } => match self.get(scc)? {
                         Val::Bit(x) => x,
                         _ => return Err("SCC without a value"),
-                    }
+                    },
+                    _ => unreachable!(),
                 };
                 let set = self.lane_heap_index(a, sampler)?;
                 let clear = self.lane_heap_index(b, sampler)?;
@@ -10413,15 +10411,13 @@ impl<'a> Lower<'a> {
             if !seen.insert(b) {
                 continue;
             }
-            let v = match atom {
-                Atom::Lane(v)
-                | Atom::Uniform(v)
-                | Atom::Phi(v, _)
-                | Atom::Quad(v)
-                | Atom::Opaque(v, _) => Some(v),
-                Atom::Constant(_) => None,
+            // A wave64 pair's high dword counts as much as its low one.
+            let (v, high) = match atom {
+                Atom::Lane(v) | Atom::Uniform(v) | Atom::Quad(v) => (Some(v), None),
+                Atom::Phi(v, h) | Atom::Opaque(v, h) => (Some(v), Some(h)),
+                Atom::Constant(_) => (None, None),
             };
-            if v.is_some_and(|v| tainted.contains(&v)) {
+            if v.into_iter().chain(high).any(|v| tainted.contains(&v)) {
                 return true;
             }
             match v.and_then(|v| self.compared(env, v)) {

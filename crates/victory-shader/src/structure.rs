@@ -984,6 +984,7 @@ impl<'a> Lanes<'a> {
                     (Some(at), Some(hi)) if at == hi => def(lo)
                         .and_then(|i| self.sop(i))
                         .and_then(|r| r.dst)
+                        .filter(|d| d.0 == k)
                         .map(|d| d.1),
                     _ => None,
                 };
@@ -1687,6 +1688,43 @@ mod tests {
             s.bools.support(m),
             [Atom::Opaque(lo.unwrap(), cleared.unwrap())]
         );
+    }
+
+    /// A wave64 compare copied to s[4:5], spilled to lanes 0 and 1 of v1
+    /// and read back into s[6:7]: in order it is the compare; with the
+    /// words swapped (s6 from lane 1, s7 from lane 0) it is not.
+    #[test]
+    fn a_wave64_mask_spilled_and_read_back_swapped_is_not_the_mask() {
+        for (lo, hi, same) in [
+            (0x0001_0101, 0x0001_0301, true),
+            (0x0001_0301, 0x0001_0101, false),
+        ] {
+            let p = build(
+                &[
+                    0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                    0xD761_0001,
+                    0x0001_0004, // v_writelane_b32 v1, s4, 0
+                    0xD761_0001,
+                    0x0001_0205, // v_writelane_b32 v1, s5, 1
+                    0xD760_0006,
+                    lo, // v_readlane_b32 s6, v1, 0 (or 1)
+                    0xD760_0007,
+                    hi, // v_readlane_b32 s7, v1, 1 (or 0)
+                    0xD501_0002,
+                    0x0019_0280, // v_cndmask_b32 v2, 0, 1, s[6:7]
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let insts = &p.blocks[0].insts;
+            let bits = |i: &Inst, r: u8| {
+                s.select_bits(i.read(Reg::S(r)).unwrap(), i.read(Reg::S(r + 1)))
+                    .unwrap()
+            };
+            assert_eq!(bits(&insts[1], VCC) == bits(&insts[6], 6), same);
+        }
     }
 
     #[test]
