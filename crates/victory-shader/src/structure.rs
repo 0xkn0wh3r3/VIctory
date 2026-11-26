@@ -890,6 +890,7 @@ impl<'a> Lanes<'a> {
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        self.join_args();
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
@@ -970,6 +971,31 @@ impl<'a> Lanes<'a> {
             guards,
             reach: cond.to_vec(),
         })
+    }
+
+    /// The pair each edge brings into a join left as a phi atom, resolved
+    /// as a mask (back edges are not followed where the join is met), so
+    /// that the join's lowering finds it by both dwords.
+    fn join_args(&mut self) {
+        let mut n = 0;
+        while n < self.b.atoms.len() {
+            if let Atom::Phi(lo, hi) = self.b.atoms[n]
+                && let Some(&(block, _)) = self.phis.get(&lo).or(self.phis.get(&hi))
+            {
+                let target = &self.p.blocks[block];
+                let arg = |v: Value, e: usize| match self.phis.get(&v) {
+                    Some(&(b, i)) if b == block => target.phis[i].args[e],
+                    _ => v,
+                };
+                let args: Vec<Key> = (0..target.preds.len())
+                    .map(|e| (arg(lo, e), arg(hi, e)))
+                    .collect();
+                for k in args {
+                    self.mask(k);
+                }
+            }
+            n += 1;
+        }
     }
 
     fn key(&self, value: impl Fn(Reg) -> Option<Value>, code: u8) -> Option<Key> {
@@ -1340,9 +1366,10 @@ impl<'a> Lanes<'a> {
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
                 };
-                // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
-                if name == "v_cndmask_b32"
+                // A select or carry-in reads a mask nothing else may: a join
+                // of compare results, or a pair of copies, is resolved here,
+                // as for EXEC.
+                if (name == "v_cndmask_b32" || name.contains("_co_ci_"))
                     && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)

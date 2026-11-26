@@ -3469,15 +3469,15 @@ pub(crate) mod tests {
     /// take the first descriptor), `change` right after the compare, and the
     /// waterfall loop of [`WATERFALL_FETCHED_WAVE64`]. The sample goes to the
     /// buffer at dword 16 of the table, at lane * 4.
-    pub(crate) fn picked_wave64(change: u32) -> Vec<u32> {
+    pub(crate) fn picked_wave64(change: &[u32]) -> Vec<u32> {
         let mut words = WATERFALL_PICKED_WAVE32[..12].to_vec();
         words.extend([
             0xF408_0A02,
             0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
             0x3420_0082, // v_lshlrev_b32 v16, 2, v0
             0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
-            change,
         ]);
+        words.extend(change);
         words.extend(&WATERFALL_PICKED_WAVE32[13..30]);
         let fetched = WATERFALL_FETCHED_WAVE64;
         words.extend(&fetched[14..fetched.len() - 3]);
@@ -3489,13 +3489,25 @@ pub(crate) mod tests {
         words
     }
 
-    /// A wave64 descriptor picked per lane by VCC after `s_mov_b32 vcc_hi,
-    /// 0`: the choice names VCC's new high dword, which holds no lane mask
-    /// the compare made.
+    /// After the compare: nothing, vcc_hi copied through s2 and back (the
+    /// same bits, a new value), or vcc_hi cleared.
+    pub(crate) const VCC_HI_KEPT: &[u32] = &[];
+    pub(crate) const VCC_HI_COPIED: &[u32] = &[
+        0xBE82_036B, // s_mov_b32 s2, vcc_hi
+        0xBEEB_0302, // s_mov_b32 vcc_hi, s2
+    ];
+    pub(crate) const VCC_HI_CLEARED: &[u32] = &[0xBEEB_0380]; // s_mov_b32 vcc_hi, 0
+
+    /// A wave64 descriptor picked per lane by VCC: after `s_mov_b32 vcc_hi,
+    /// 0` the choice names VCC's new high dword, which holds no lane mask
+    /// the compare made; copied through s2 and back, it is the compare's.
     #[test]
     fn a_wave64_descriptor_picked_after_the_high_dword_changes_names_the_new_one() {
-        for (change, same) in [(0xBF80_0000, true), (0xBEEB_0380, false)] {
-            // s_nop 0, or s_mov_b32 vcc_hi, 0
+        for (change, same) in [
+            (VCC_HI_KEPT, true),
+            (VCC_HI_COPIED, true),
+            (VCC_HI_CLEARED, false),
+        ] {
             let words = picked_wave64(change);
             let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             let p = crate::ir::build(&code, true, 256).unwrap();

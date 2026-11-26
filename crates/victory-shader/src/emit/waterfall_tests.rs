@@ -268,12 +268,22 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
 /// [`crate::resource::tests::picked_wave64`]: a descriptor picked per lane
 /// by VCC in Wave64. With `s_mov_b32 vcc_hi, 0` after the compare, the pick
 /// reads a pair that holds no tracked mask, and the lowering refuses it
-/// rather than choosing by the compare for lanes 32-63.
+/// rather than choosing by the compare for lanes 32-63. With vcc_hi copied
+/// through s2 and back, the pick is still by the compare.
 #[test]
 fn a_wave64_descriptor_picked_after_the_high_dword_changes_is_refused() {
-    use crate::resource::tests::picked_wave64;
-    lower_wave(&picked_wave64(0xBF80_0000), false, true).expect("lower"); // s_nop 0
-    let Err(e) = lower_wave(&picked_wave64(0xBEEB_0380), false, true) else {
+    use crate::resource::tests::{VCC_HI_CLEARED, VCC_HI_COPIED, VCC_HI_KEPT, picked_wave64};
+    let lowered = |change| lower_wave(&picked_wave64(change), false, true);
+    for kept in [VCC_HI_KEPT, VCC_HI_COPIED] {
+        let lowered = lowered(kept).expect("lower");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+    let Err(e) = lowered(VCC_HI_CLEARED) else {
         panic!("a pick on vcc_lo and a cleared vcc_hi took the compare's mask");
     };
     assert!(e.contains("chosen per lane by an untracked mask"), "{e}");
