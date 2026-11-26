@@ -6,9 +6,11 @@
 //! frames and the 1% low), the presenter's last second (draws per frame,
 //! time preparing submissions and waiting for the GPU), the process's CPU
 //! use and memory, video memory against its budget, and the controller as
-//! the title last read it. Keys 1-4, while it shows, leave kinds of GPU
-//! work out ([`skip`]), to see what draws what. While it shows the title
-//! gets no keyboard or controller input ([`captured`]).
+//! the title last read it. Alt+1-4, while it shows, leave kinds of GPU
+//! work out ([`skip`]), to see what draws what, and Alt+5 turns console
+//! shaders off ([`console_shaders_off`]): none is translated or compiled,
+//! and draws and dispatches that need one are left out. The title keeps
+//! its keyboard and controller input meanwhile.
 //!
 //! The panel is drawn on the CPU into upload memory in the back buffer's
 //! format, and copied into its top left corner after the frame, before the
@@ -31,8 +33,8 @@ use crate::host::Host;
 
 static VISIBLE: AtomicBool = AtomicBool::new(false);
 
-/// Whether the overlay shows: the title gets no input meanwhile.
-pub fn captured() -> bool {
+/// Whether the overlay shows.
+pub fn shown() -> bool {
     VISIBLE.load(Relaxed)
 }
 
@@ -47,16 +49,34 @@ pub(crate) enum Work {
 
 static SKIPPED: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
 const WORK: [&str; 4] = [
-    "COMPUTE DISPATCHES",
-    "MESH DRAWS",
-    "VERTEX DRAWS",
-    "INDIRECT EXECUTION",
+    "COMPUTE PASSES",
+    "MESH-SHADER DRAWS",
+    "VERTEX/INDEX DRAWS",
+    "GPU-DRIVEN DRAWS + DISPATCHES",
 ];
 
 /// Whether the toggles leave `work` out (one relaxed load).
 #[inline]
 pub(crate) fn skip(work: Work) -> bool {
     SKIPPED[work as usize].load(Relaxed)
+}
+
+static SHADERS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether console shaders are off: no title shader is translated and no
+/// host pipeline made, and draws and dispatches without one are left out
+/// (`crate::pipeline::make::ready`). Turned on again, the next use of a
+/// pipeline makes it.
+#[inline]
+pub(crate) fn console_shaders_off() -> bool {
+    SHADERS_OFF.load(Relaxed)
+}
+
+/// Turns console shaders off (or on again), as Alt+5 does.
+pub(crate) fn set_console_shaders_off(off: bool) {
+    if SHADERS_OFF.swap(off, Relaxed) != off {
+        tracing::warn!(off, "overlay toggle: console shaders");
+    }
 }
 
 /// A controller as the title reads it: GameInput's buttons, triggers and
@@ -215,7 +235,7 @@ pub(crate) fn time_lists(
     queue: &ID3D12CommandQueue,
     group: &[Option<ID3D12CommandList>],
 ) -> Option<Vec<Option<ID3D12CommandList>>> {
-    if !captured() {
+    if !shown() {
         return None;
     }
     let mut slot = TIMER.lock().unwrap_or_else(|e| e.into_inner());
@@ -273,7 +293,7 @@ fn epoch() -> Instant {
 /// The title reads its input (GameInput's current reading): the first read
 /// after a present starts the input-to-present time of the next frame.
 pub fn note_input_read() {
-    if captured() {
+    if shown() {
         let at = (Instant::now() - epoch()).as_nanos().max(1) as u64;
         let _ = FIRST_READ.compare_exchange(0, at, Relaxed, Relaxed);
     }
@@ -299,7 +319,7 @@ fn scale_for(height: u32) -> f32 {
 /// The presenter's overlay state.
 pub(crate) struct Overlay {
     enabled: bool,
-    /// Keys down at the last frame: Alt+Z, then 1-4 (only without the
+    /// Keys down at the last frame: Alt+Z, then Alt+1-5 (only without the
     /// key thread, [`watch_keys`]).
     down: u8,
     last: Option<Instant>,
@@ -378,9 +398,10 @@ fn watch_keys(hwnd: HWND) -> bool {
     KEY_THREAD.load(Relaxed)
 }
 
-/// Alt+Z shows and hides the panel; 1-4 toggle work while it shows. Only
-/// while `hwnd` has focus, when a key goes down: `before` is what was down
-/// at the last look, and the keys down now are returned for the next.
+/// Alt+Z shows and hides the panel; Alt+1-5 flip its checkboxes while it
+/// shows. Only while `hwnd` has focus, when a key goes down: `before` is
+/// what was down at the last look, and the keys down now are returned for
+/// the next. The keys still reach the title: it keeps its input.
 fn poll_keys(before: u8, hwnd: HWND) -> u8 {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     // SAFETY: a plain query.
@@ -391,11 +412,14 @@ fn poll_keys(before: u8, hwnd: HWND) -> u8 {
     down
 }
 
-/// The overlay's keys held, one bit each: Alt+Z, then 1-4.
+/// The overlay's keys held, one bit each: Alt+Z, then Alt+1-5.
 fn keys_down(held: impl Fn(i32) -> bool) -> u8 {
     const ALT: i32 = 0x12;
-    let mut down = u8::from(held(ALT) && held(i32::from(b'Z')));
-    for (k, key) in (b'1'..=b'4').enumerate() {
+    if !held(ALT) {
+        return 0;
+    }
+    let mut down = u8::from(held(i32::from(b'Z')));
+    for (k, key) in (b'1'..=b'5').enumerate() {
         down |= u8::from(held(i32::from(key))) << (k + 1);
     }
     down
@@ -407,13 +431,17 @@ fn toggle(pressed: u8) {
         let shown = !VISIBLE.fetch_xor(true, Relaxed);
         tracing::info!(shown, "overlay");
     }
-    if captured() {
+    if shown() {
         for (k, skipped) in SKIPPED.iter().enumerate() {
             if pressed >> (k + 1) & 1 != 0 {
                 let off = !skipped.fetch_xor(true, Relaxed);
                 tracing::warn!(work = WORK[k], left_out = off, "overlay toggle");
                 CHANGED.store(true, Relaxed);
             }
+        }
+        if pressed >> 5 & 1 != 0 {
+            set_console_shaders_off(!console_shaders_off());
+            CHANGED.store(true, Relaxed);
         }
     }
 }
@@ -459,7 +487,7 @@ impl Overlay {
                 self.times.pop_front();
             }
             self.times.push_back((now - last).as_secs_f32() * 1000.0);
-            let gpu = (captured() && gpu_ns > 0).then(|| gpu_ns as f32 / 1e6);
+            let gpu = (shown() && gpu_ns > 0).then(|| gpu_ns as f32 / 1e6);
             push(&mut self.gpu, gpu);
             let latency = (read > 0).then(|| {
                 let at = epoch() + Duration::from_nanos(read);
@@ -473,7 +501,7 @@ impl Overlay {
         if CHANGED.swap(false, Relaxed) {
             self.drawn = None;
         }
-        if !captured() {
+        if !shown() {
             self.drawn = None;
             return state;
         }
@@ -650,7 +678,11 @@ impl Overlay {
     fn panel(&self, scale: f32, system: &System) -> Image {
         let second = *SECOND.lock().unwrap_or_else(|e| e.into_inner());
         let pad = *PAD.lock().unwrap_or_else(|e| e.into_inner());
-        let skipped = std::array::from_fn(|k| SKIPPED[k].load(Relaxed));
+        let skipped = std::array::from_fn(|k| {
+            SKIPPED
+                .get(k)
+                .map_or_else(console_shaders_off, |s| s.load(Relaxed))
+        });
         let fonts = Fonts::new();
         draw_panel(
             &fonts,
@@ -678,7 +710,8 @@ struct Facts<'a> {
     second: Second,
     system: System,
     pad: Option<Pad>,
-    skipped: [bool; 4],
+    /// Alt+1-5: the four kinds of work, then console shaders.
+    skipped: [bool; 5],
 }
 
 /// Mean frame time, its rate, and the rate of the slowest 1% of frames.
@@ -1316,12 +1349,13 @@ fn draw_panel(fonts: &Fonts, scale: f32, f: &Facts) -> Image {
     y += p.px(8.0);
 
     // Toggles.
-    y = p.header(left, y, inner, "DRAW TOGGLES (KEYS 1-4)");
-    const NAMES: [&str; 4] = [
-        "Compute dispatches",
-        "Mesh draws",
-        "Vertex draws",
-        "Indirect execution",
+    y = p.header(left, y, inner, "CHECKBOXES (ALT+1-5)");
+    const NAMES: [&str; 5] = [
+        "Compute passes",
+        "Mesh-shader draws",
+        "Vertex/index draws",
+        "GPU-driven draws + dispatches",
+        "Title shaders (all drawing)",
     ];
     for (k, name) in NAMES.iter().enumerate() {
         let on = !f.skipped[k];
@@ -1347,9 +1381,9 @@ fn draw_panel(fonts: &Fonts, scale: f32, f: &Facts) -> Image {
             Align::Left,
         );
         let (state, c) = if on {
-            ("drawn", colour::GOOD)
+            ("runs", colour::GOOD)
         } else {
-            ("LEFT OUT", colour::BAD)
+            ("SKIPPED", colour::BAD)
         };
         p.text(right, y, state, (14.0, !on), c, Align::Right);
         y += p.px(19.0);
@@ -1736,14 +1770,16 @@ fn glyph(c: char) -> [u8; 7] {
 mod tests {
     use super::*;
 
-    /// Alt+Z is bit 0 only with Alt held; 1-4 are bits 1-4 alone.
+    /// Alt+Z is bit 0 and Alt+1-5 bits 1-5; nothing without Alt, so
+    /// plain number keys stay the title's.
     #[test]
     fn keys_map_to_their_bits() {
         let with = |keys: &'static [u8]| keys_down(move |vk| keys.contains(&(vk as u8)));
         assert_eq!(with(b"Z"), 0);
+        assert_eq!(with(b"1"), 0);
         assert_eq!(with(&[0x12, b'Z']), 1);
-        assert_eq!(with(b"1"), 0b10);
-        assert_eq!(with(b"4"), 0b1_0000);
+        assert_eq!(with(&[0x12, b'1']), 0b10);
+        assert_eq!(with(&[0x12, b'5']), 0b10_0000);
         assert_eq!(with(&[0x12, b'Z', b'2', b'3']), 0b1101);
     }
 
@@ -1787,7 +1823,7 @@ mod tests {
                 left: [0.0, 0.98],
                 right: [-0.25, 0.0],
             }),
-            skipped: [true, false, false, false],
+            skipped: [true, false, false, false, false],
         }
     }
 

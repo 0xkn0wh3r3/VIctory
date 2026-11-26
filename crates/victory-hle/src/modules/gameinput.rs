@@ -121,19 +121,18 @@ trait Source: Send {
 }
 
 /// The debug overlay (Alt+Z, `victory_gpu::overlay`) shows the pad the
-/// title reads (the first connected one, else the keyboard's stand-in);
-/// while it shows, the title reads neutral pads (still connected), no keys
-/// and no scripted keys.
-fn overlay(
-    mut pads: [Option<PadState>; PADS],
-    mut keys: Vec<KeyState>,
-    scripted: &mut &[KeyState],
-) -> ([Option<PadState>; PADS], Vec<KeyState>) {
+/// title reads (the first connected one, else the keyboard's stand-in).
+/// The title keeps its input while it shows.
+#[cfg_attr(
+    not(all(windows, any(test, feature = "diagnostics"))),
+    allow(unused_variables)
+)]
+fn overlay(pads: &[Option<PadState>; PADS], keys: &[KeyState], scripted: &[KeyState]) {
     #[cfg(windows)]
     {
-        use victory_gpu::overlay::{Pad, captured, show_pad};
+        use victory_gpu::overlay::{Pad, show_pad};
         let read = pads.iter().flatten().next().copied().unwrap_or_else(|| {
-            let base = fallback(&keys);
+            let base = fallback(keys);
             #[cfg(any(test, feature = "diagnostics"))]
             if !scripted.is_empty() {
                 return merge_pad(base, fallback(scripted));
@@ -146,17 +145,7 @@ fn overlay(
             left: [read.left_x, read.left_y],
             right: [read.right_x, read.right_y],
         }));
-        if captured() {
-            pads.iter_mut()
-                .flatten()
-                .for_each(|p| *p = PadState::default());
-            keys.clear();
-            *scripted = &[];
-        }
     }
-    #[cfg(not(windows))]
-    let _ = scripted;
-    (pads, keys)
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -529,7 +518,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        mut scripted: &[KeyState],
+        scripted: &[KeyState],
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -549,7 +538,7 @@ impl State {
         merge_scripted(&mut pads, scripted);
         #[cfg(not(any(test, feature = "diagnostics")))]
         let _ = (&mut pads, scripted);
-        let (pads, keys) = overlay(pads, keys, &mut scripted);
+        overlay(&pads, &keys, scripted);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
