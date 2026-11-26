@@ -132,6 +132,10 @@ pub(crate) struct HostHeap {
     size: u64,
     /// Which texture last held each piece, as of the lists submitted so far.
     held: Mutex<Pieces>,
+    /// Each first use judged at submission: the texture, whether another
+    /// texture held its memory, whether it was discarded (tests).
+    #[cfg(test)]
+    judged: Mutex<Vec<(u64, bool, bool)>>,
 }
 
 impl Drop for HostHeap {
@@ -190,6 +194,8 @@ impl HostHeaps {
             heap,
             size,
             held: Mutex::default(),
+            #[cfg(test)]
+            judged: Mutex::default(),
         });
         heaps[kind] = Some(h.clone());
         Some(h)
@@ -249,6 +255,11 @@ impl Placement {
     pub(crate) fn at(&self) -> (&Arc<HostHeap>, u64) {
         (&self.heap, self.start)
     }
+
+    /// Its own number in [`Pieces`].
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 impl Drop for Placement {
@@ -263,6 +274,11 @@ impl HostHeap {
     /// The host heap itself.
     pub(crate) fn heap(&self) -> &ID3D12Heap {
         &self.heap
+    }
+
+    /// The first uses judged at submission since the last call.
+    pub(crate) fn take_judged(&self) -> Vec<(u64, bool, bool)> {
+        std::mem::take(&mut *self.judged.lock().unwrap())
     }
 }
 
@@ -424,6 +440,42 @@ pub(crate) fn discard_state(copy: &HostTexture) -> Option<u32> {
     p.discard
 }
 
+/// Whether discard region `region` names only subresources host texture
+/// `copy` has: at least one, below its planes times mips times array
+/// slices.
+pub(crate) fn region_fits(copy: &HostTexture, region: &D3D12_DISCARD_REGION) -> bool {
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    // SAFETY: a live texture.
+    let desc = unsafe { copy.texture.GetDesc() };
+    let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+        Format: desc.Format,
+        PlaneCount: 0,
+    };
+    // SAFETY: the query writes its own structure of the given size.
+    let known = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_INFO,
+            (&raw mut info).cast(),
+            size_of_val(&info) as u32,
+        )
+    }
+    .is_ok();
+    let slices = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(desc.DepthOrArraySize)
+    };
+    let count = u32::from(info.PlaneCount) * u32::from(desc.MipLevels) * slices;
+    known
+        && region.NumSubresources > 0
+        && region
+            .FirstSubresource
+            .checked_add(region.NumSubresources)
+            .is_some_and(|end| end <= count)
+}
+
 /// Records, for a placed texture taking memory another alias held: an
 /// aliasing barrier if `barrier`, then its discard (render targets and
 /// depth textures) from state `now`, which it is left in.
@@ -529,9 +581,12 @@ pub(crate) fn at_submission(aliases: &ListAliases) -> (bool, Vec<Arc<HostTexture
         if !recorded {
             let (_, other, own) = look(&held, p.start, p.end, p.id);
             barrier |= other;
-            if (other || own < p.end - p.start) && discard_state(copy).is_some() {
+            let discard = (other || own < p.end - p.start) && discard_state(copy).is_some();
+            if discard {
                 discards.push(copy.clone());
             }
+            #[cfg(test)]
+            p.heap.judged.lock().unwrap().push((p.id, other, discard));
         }
         hold(&mut held, p.start, p.end, p.id);
     }

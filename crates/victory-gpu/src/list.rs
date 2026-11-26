@@ -592,22 +592,29 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 /// `DiscardResource(resource, region)`: a render target or depth texture
 /// in a host heap (`crate::alias`) is discarded on the host too, in the
 /// state that takes that, over the title's region (rectangles and
-/// subresources, laid out as the host's). Others keep their contents (the
+/// subresources, numbered as the host's). Others keep their contents (the
 /// host needs no discard to use them), and so does a texture not made yet
-/// (its first use discards it, `crate::alias`).
+/// (its first use discards it, `crate::alias`), and a texture whose region
+/// names subresources it does not have.
 extern "system" fn discard(this: This, resource: This, region: *const std::ffi::c_void) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(copy) = crate::resource::made_copy(resource)
         && let Some(state) = crate::alias::discard_state(&copy)
     {
+        use windows::Win32::Graphics::Direct3D12::D3D12_DISCARD_REGION;
+        // SAFETY: the title passes a whole region or none.
+        let region = unsafe { region.cast::<D3D12_DISCARD_REGION>().as_ref() };
+        if region.is_some_and(|r| !crate::alias::region_fits(&copy, r)) {
+            tracing::debug!(?resource, "a discard region outside its texture: not passed on");
+            return;
+        }
         ensure_state(list, resource, state);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("discard {resource:?}"));
-        let region = (!region.is_null()).then(|| region.cast());
         // SAFETY: an open list, a live texture in the state a discard takes;
-        // the title's region or none.
-        unsafe { list.list.DiscardResource(&copy.texture, region) };
+        // the title's region (inside the texture) or none.
+        unsafe { list.list.DiscardResource(&copy.texture, region.map(std::ptr::from_ref)) };
     }
     #[cfg(not(windows))]
     let _ = (this, resource, region);
