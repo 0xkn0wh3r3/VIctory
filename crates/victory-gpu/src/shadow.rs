@@ -2745,6 +2745,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// Releases the test's allocation at `base` once the heaps over it are
+    /// gone. Windows may let go of the pages a little after the last heap
+    /// (WARP on CI after the buffer holding it went, NVIDIA up to 6 ms), as
+    /// `crate::pinned::title_memory_change` allows for: retried for up to 1 s.
+    fn free_once_let_go(base: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        let start = std::time::Instant::now();
+        // SAFETY: the test's own allocation, released once.
+        while unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } == 0 {
+            let error = std::io::Error::last_os_error();
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(1),
+                "still held after 1 s: {error}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// Takes the whole-allocation path for the life of the guard.
     struct WholeAllocations;
     impl WholeAllocations {
@@ -2900,8 +2918,7 @@ pub(crate) mod tests {
             }
             drop(buffer);
             assert_eq!(crate::pinned::held_over(base, LEN), 0, "whole allocation: {whole}");
-            // SAFETY: our allocation, no heap on it.
-            assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
+            free_once_let_go(base);
         }
     }
 
@@ -2951,7 +2968,7 @@ pub(crate) mod tests {
         assert_eq!(unsafe { buffer.GetDesc() }.Width, 128 << 10);
         assert_eq!(cached(), before, "no whole-allocation heap opened");
         drop(buffer);
-        // SAFETY: our allocation; the heap went with the buffer.
-        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
+        // The heap went with the buffer.
+        free_once_let_go(base);
     }
 }
