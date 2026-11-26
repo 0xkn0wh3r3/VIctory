@@ -678,9 +678,8 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
 
 /// A wave64 compare copied word by word into s[2:3] and read by a select,
 /// then s3 written again and read by a second select. Copied from vcc_hi,
-/// the pair is still the compare; set to 0, it is a pair no lane mask was
-/// tracked as, and the second select is refused rather than read as the
-/// first one's compare.
+/// the pair is still the compare; set to 0, it is an opaque mask of s2 and
+/// the new s3, which needs console lanes, and not the first one's compare.
 #[test]
 fn a_wave64_select_after_its_high_word_changes_is_not_the_old_mask() {
     let program = |high: u32| {
@@ -717,7 +716,66 @@ fn a_wave64_select_after_its_high_word_changes_is_not_the_old_mask() {
     let Err(e) = program(0xBE83_0380) else {
         panic!("a select on s2 and a cleared s3 took the compare's mask");
     };
-    assert!(e.to_string().contains("untracked mask"), "{e}");
+    assert!(e.to_string().contains("an opaque lane mask"), "{e}");
+}
+
+/// Builds the wave64 program around `body`, which leaves its result in v3,
+/// with and without `change` (`s_nop` in its place).
+fn wave64_with_and_without(body: &[u32], change: u32) -> [Result<HostShader, String>; 2] {
+    [0xBF80_0000, change].map(|word| {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        ];
+        words.extend(body.iter().map(|&w| if w == CHANGE { word } else { w }));
+        words.extend([
+            0xE070_1000,
+            0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        build_wave(&words, true).map_err(|e| e.to_string())
+    })
+}
+
+/// Stands for the word [`wave64_with_and_without`] changes.
+const CHANGE: u32 = 0xFFFF_FFFF;
+
+/// A wave64 mask joined at a block entry, and a carry-in, whose high dword
+/// was written after the mask was made (`s_mov_b32 s3, 0`, `s_mov_b32
+/// vcc_hi, 0`): the join's incoming pair and the carry-in are read with
+/// both dwords, so neither takes the old mask of their low dword.
+#[test]
+fn wave64_joins_and_carry_ins_read_both_dwords_of_their_mask() {
+    let join = [
+        0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+        0xBE82_046A, // s_mov_b64 s[2:3], vcc
+        0xBF06_0100, // s_cmp_eq_u32 s0, s1
+        0xBF85_0003, // s_cbranch_scc1 join
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE82_046A, // s_mov_b64 s[2:3], vcc
+        CHANGE,      // s_mov_b32 s3, 0
+        0xD501_0003,
+        0x0009_0280, // join: v_cndmask_b32 v3, 0, 1, s[2:3]
+    ];
+    let [kept, changed] = wave64_with_and_without(&join, 0xBE83_0380);
+    kept.expect("lower");
+    let e = changed.expect_err("a join took the copied compare's high dword");
+    assert!(e.contains("lane-mask join of an untracked mask"), "{e}");
+
+    let carry = [
+        0xD70F_6A01,
+        0x0002_0100, // v_add_co_u32 v1, vcc, v0, v0
+        CHANGE,      // s_mov_b32 vcc_hi, 0
+        0x5006_0100, // v_add_co_ci_u32 v3, vcc, v0, v0, vcc
+    ];
+    let [kept, changed] = wave64_with_and_without(&carry, 0xBEEB_0380);
+    kept.expect("lower");
+    let e = changed.expect_err("a carry-in took the first carry's high dword");
+    assert!(e.contains("carry-in from an untracked mask"), "{e}");
 }
 
 /// A register array (v3-v14) indexed through M0 in waterfall loops, as

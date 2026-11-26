@@ -49,14 +49,15 @@ pub enum Atom {
     Lane(Value),
     /// An SCC value, the same in every lane.
     Uniform(Value),
-    /// A lane mask joined at a block entry, by its low dword's phi.
-    Phi(Value),
+    /// A lane mask joined at a block entry: its (low, high) dword pair, one
+    /// of them a phi there (in Wave32 the same value twice).
+    Phi(Value, Value),
     /// `s_wqm` result: some lane of the quad is in the source mask.
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
-    /// EXEC write it does not follow): the lane's bit of the register pair
-    /// this value is a dword of.
-    Opaque(Value),
+    /// EXEC write it does not follow): the lane's bit of this (low, high)
+    /// dword pair (in Wave32 the same value twice).
+    Opaque(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -491,7 +492,9 @@ impl Structured {
         match high {
             Some(high) => {
                 let k = (low, high);
-                self.paired_masks.get(&k).or_else(|| self.paired_other.get(&k))
+                self.paired_masks
+                    .get(&k)
+                    .or_else(|| self.paired_other.get(&k))
             }
             None => self.masks.get(&low).or_else(|| self.other.get(&low)),
         }
@@ -895,8 +898,16 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
-            paired_other: if self.p.wave64 { self.other } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
+            paired_other: if self.p.wave64 {
+                self.other
+            } else {
+                Map::default()
+            },
             active: self.active,
             restored: self.restored.into_iter().collect(),
             discards: self
@@ -984,8 +995,8 @@ impl<'a> Lanes<'a> {
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
                 let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    let born = self.born(k.0).max(self.born(k.1));
+                    self.b.atom(Atom::Opaque(k.0, k.1), born)
                 });
                 (m, derived)
             }
@@ -1072,7 +1083,7 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
-        Some((self.b.atom(Atom::Phi(id), born), derived))
+        Some((self.b.atom(Atom::Phi(k.0, k.1), born), derived))
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
@@ -1646,6 +1657,36 @@ mod tests {
             let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
             assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
         }
+    }
+
+    /// A wave64 mask pair whose high dword is cleared (`s_mov_b32 s3, 0`)
+    /// and then copied whole (`s_mov_b64 s[4:5], s[2:3]`): a select on the
+    /// copy reads s2 and the cleared s3, so lanes 32-63 see 0, not the
+    /// compare's high dword.
+    #[test]
+    fn a_wave64_pair_copied_after_its_high_dword_changes_keeps_the_new_one() {
+        let p = build(
+            &[
+                0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+                0xBE82_046A, // s_mov_b64 s[2:3], vcc
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBE84_0402, // s_mov_b64 s[4:5], s[2:3]
+                0xD501_0001,
+                0x0011_0280, // v_cndmask_b32 v1, 0, 1, s[4:5]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let insts = &p.blocks[0].insts;
+        let (lo, cleared) = (insts[1].write(Reg::S(2)), insts[2].write(Reg::S(3)));
+        let select = &insts[4];
+        let (copy_lo, copy_hi) = (select.read(Reg::S(4)), select.read(Reg::S(5)));
+        let m = s.select_bits(copy_lo.unwrap(), copy_hi).unwrap();
+        assert_eq!(
+            s.bools.support(m),
+            [Atom::Opaque(lo.unwrap(), cleared.unwrap())]
+        );
     }
 
     #[test]
