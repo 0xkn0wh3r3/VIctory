@@ -139,6 +139,113 @@ extern "C" fn detach_all() {
             )
         };
     }
+    end_by_termination();
+}
+
+/// After [`detach_all`], the process ends with `TerminateProcess` instead
+/// of `ExitProcess`: the CRT still runs the rest of its exit (the exit
+/// functions registered before ours, flushing and closing its streams),
+/// then its call of `ExitProcess`, with the exit code, comes here.
+///
+/// `ExitProcess` would next unload every system DLL. Some (dxgi and the
+/// network and graphics helpers it loads) unsubscribe from system
+/// notifications on unload and read state on the stack of a thread that
+/// [`end_other_threads`] ended, whose stack is gone: an access violation
+/// after the program finished, on some drivers (seen on Radeon). The title
+/// images have had their `DLL_PROCESS_DETACH` already, and the system
+/// DLLs' unload does no work that outlives the process: files are closed
+/// by the system either way.
+///
+/// The CRT's call goes through its import of `ExitProcess`, which is
+/// pointed here; if it cannot be (no import found), the process ends as
+/// before.
+fn end_by_termination() {
+    extern "system" fn terminate(code: u32) -> ! {
+        // SAFETY: ends this process with the code the CRT was given.
+        unsafe {
+            windows_sys::Win32::System::Threading::TerminateProcess(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                code,
+            )
+        };
+        // It does not return; were it refused, the process still ends.
+        // SAFETY: as above.
+        unsafe { windows_sys::Win32::System::Threading::ExitProcess(code) }
+    }
+    // SAFETY: the CRT's module stays loaded until the process ends; its
+    // import of `ExitProcess` is replaced with a function of the same
+    // signature.
+    unsafe {
+        let crt: Vec<u16> = "ucrtbase.dll\0".encode_utf16().collect();
+        let module = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(crt.as_ptr());
+        if module.is_null() {
+            return;
+        }
+        if let Some(slot) = import_slot(module as *const u8, b"ExitProcess") {
+            replace_import(slot, terminate as *const () as usize);
+        }
+    }
+}
+
+/// The import address table slot through which the loaded `module` calls
+/// the function it imports by `name`, from any DLL.
+///
+/// # Safety
+/// `module` is the base of a loaded 64-bit image.
+unsafe fn import_slot(module: *const u8, name: &[u8]) -> Option<*mut usize> {
+    // SAFETY: offsets within the headers and import tables of a loaded
+    // PE32+ image, which the caller vouches for.
+    unsafe {
+        let read32 = |at: usize| module.add(at).cast::<u32>().read_unaligned() as usize;
+        let nt = read32(0x3c);
+        // The import directory: optional header (at 24) + 112 + 8.
+        let imports = read32(nt + 24 + 120);
+        if imports == 0 {
+            return None;
+        }
+        for d in (imports..).step_by(20) {
+            let (names, slots) = (read32(d), read32(d + 16));
+            if read32(d + 12) == 0 {
+                return None;
+            }
+            if names == 0 {
+                continue;
+            }
+            for i in 0.. {
+                let thunk = module.add(names + i * 8).cast::<u64>().read_unaligned();
+                if thunk == 0 {
+                    break;
+                }
+                // By ordinal (top bit), or the RVA of a hint and a name.
+                if thunk >> 63 != 0 {
+                    continue;
+                }
+                let at = module.add(thunk as usize + 2);
+                if std::ffi::CStr::from_ptr(at.cast()).to_bytes() == name {
+                    return Some(module.add(slots + i * 8).cast::<usize>().cast_mut());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Writes `to` into an import address table slot, which is read-only once
+/// bound.
+///
+/// # Safety
+/// `slot` is an import slot of a loaded image, and `to` a function with
+/// the signature of the import.
+unsafe fn replace_import(slot: *mut usize, to: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let mut was = 0;
+    // SAFETY: the slot is in the image's mapped memory.
+    unsafe {
+        if VirtualProtect(slot.cast(), 8, PAGE_READWRITE, &mut was) != 0 {
+            slot.write_volatile(to);
+            VirtualProtect(slot.cast(), 8, was, &mut was);
+        }
+    }
 }
 
 /// Ends this process when the title images do not detach in time. It does
@@ -435,5 +542,42 @@ mod tests {
             out.status.success() && text.contains("ENDED KEPT"),
             "{text}"
         );
+    }
+
+    /// In a child process of the next test: the CRT's exit, after
+    /// `end_by_termination`, with what was written before it.
+    #[test]
+    fn terminate_child() {
+        if std::env::var_os("VICTORY_TERMINATE_CHILD").is_none() {
+            return;
+        }
+        let crt: Vec<u16> = "ucrtbase.dll\0".encode_utf16().collect();
+        // SAFETY: looks up the CRT's own module.
+        let module =
+            unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(crt.as_ptr()) };
+        // SAFETY: the loaded CRT.
+        let slot = unsafe { super::import_slot(module as *const u8, b"ExitProcess") };
+        // SAFETY: a slot of the loaded CRT's import table.
+        let read = |s: *mut usize| unsafe { s.read() };
+        let before = slot.map(read);
+        super::end_by_termination();
+        let after = slot.map(read);
+        let redirected = before.is_some() && before != after;
+        println!("{}", ["UNCHANGED", "REDIRECTED"][usize::from(redirected)]);
+        std::process::exit(23);
+    }
+
+    /// After `end_by_termination` the CRT's exit ends the process with
+    /// its code, its output written, by `TerminateProcess`.
+    #[test]
+    fn exit_by_termination_keeps_the_code_and_output() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "threads::tests::terminate_child", "--nocapture"])
+            .env("VICTORY_TERMINATE_CHILD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(23), "{text}");
+        assert!(text.contains("REDIRECTED"), "{text}");
     }
 }
